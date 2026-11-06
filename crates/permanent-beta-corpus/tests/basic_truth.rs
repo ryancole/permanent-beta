@@ -1,13 +1,16 @@
 //! Answer key for the `basic` fixture, built with /O2 /OPT:ICF. The map files in tests/data are real
 //! linker output from corpus/build-fixtures.ps1; regenerate them if the fixture sources change.
 
-use permanent_beta_corpus::{map, truth::GroundTruth};
+use permanent_beta_corpus::{
+    map,
+    truth::{GroundTruth, Scope},
+};
 use permanent_beta_model::Rva;
 
 fn truth() -> GroundTruth {
     let old = map::parse(include_str!("data/basic-o2-icf-v1.map")).unwrap();
     let new = map::parse(include_str!("data/basic-o2-icf-v2.map")).unwrap();
-    GroundTruth::from_maps(&old, &new, "fixture.obj")
+    GroundTruth::from_maps(&old, &new, &Scope::Object("fixture.obj".into()))
 }
 
 #[test]

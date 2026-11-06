@@ -1,7 +1,8 @@
-//! Run the real pipeline on one built fixture variant and score it.
+//! Run the real pipeline on one built variant and score it.
 //!
-//! A variant directory is `target/fixtures/<name>/<flags>/` with `v1/fixture.exe`, `v2/fixture.exe` and
-//! `truth.json`, as written by `corpus/build-fixtures.ps1`.
+//! A variant directory holds `v1/` and `v2/`, each with exactly one `.exe`, plus `truth.json`. Written by
+//! `corpus/build-fixtures.ps1` (`target/fixtures/<name>/<flags>/`) and `corpus/build-projects.ps1`
+//! (`target/corpus/<project>/<flags>__<old>__<new>/`).
 
 use crate::expected::{Evaluation, Expected};
 use crate::score::{Scorecard, score};
@@ -10,7 +11,7 @@ use anyhow::{Context, Result};
 use permanent_beta_analysis::{Analyzer, native::NativePeAnalyzer};
 use permanent_beta_engine::Engine;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct VariantScore {
     pub flags: String,
@@ -31,7 +32,7 @@ pub fn score_variant(dir: &Path, flags: &str, expected: &Expected) -> Result<Var
         .with_context(|| format!("parsing {}", truth_path.display()))?;
 
     let analyze = |v: &str| {
-        let exe = dir.join(v).join("fixture.exe");
+        let exe = single_exe(&dir.join(v))?;
         NativePeAnalyzer
             .analyze(&exe)
             .with_context(|| format!("analyzing {}", exe.display()))
@@ -47,13 +48,36 @@ pub fn score_variant(dir: &Path, flags: &str, expected: &Expected) -> Result<Var
     })
 }
 
+fn single_exe(dir: &Path) -> Result<PathBuf> {
+    let exes: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")))
+        .collect();
+    match exes.as_slice() {
+        [one] => Ok(one.clone()),
+        _ => anyhow::bail!(
+            "expected exactly one .exe in {}, found {}",
+            dir.display(),
+            exes.len()
+        ),
+    }
+}
+
 /// Human-readable scorecard for one variant.
 pub fn render(v: &VariantScore) -> String {
     let t = &v.card.totals;
+    // Functions that exist in both builds: the most a matcher could get right.
+    let in_both = v
+        .card
+        .functions
+        .iter()
+        .filter(|f| f.old.is_some() && !f.truth.is_empty())
+        .count();
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "[{}] correct {} (accepted {}, review {}), ambiguous {}, unmatched {}, WRONG {}",
+        "[{}] correct {}/{in_both} in both builds (accepted {}, review {}), ambiguous {}, unmatched {}, WRONG {}",
         v.flags,
         t.correct(),
         t.accepted,
@@ -80,6 +104,30 @@ pub fn render(v: &VariantScore) -> String {
     }
     for f in &v.evaluation.gate_failures {
         let _ = writeln!(out, "  gate: FAIL {f}");
+    }
+    out
+}
+
+/// Functions present in both builds that weren't matched correctly, one per line.
+pub fn render_misses(v: &VariantScore) -> String {
+    use crate::score::Outcome;
+    let mut out = String::new();
+    for f in &v.card.functions {
+        let missed = !f.truth.is_empty()
+            && matches!(
+                f.outcome,
+                Outcome::Ambiguous | Outcome::Unmatched | Outcome::Wrong
+            );
+        if missed {
+            let old = f.old.map(|r| r.to_string()).unwrap_or_else(|| "-".into());
+            let _ = writeln!(
+                out,
+                "    miss {:<10} {:<10} {}",
+                format!("{:?}", f.outcome).to_lowercase(),
+                old,
+                f.names.join(",")
+            );
+        }
     }
     out
 }

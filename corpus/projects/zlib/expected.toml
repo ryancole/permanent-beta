@@ -1,0 +1,21 @@
+# Gate for the zlib corpus. Scored by `pwsh corpus/build-projects.ps1 -Project zlib -Score`
+# (add `--misses` to `pbeta-corpus score` to list what wasn't matched).
+#
+#   - zero wrong matches, always (not configurable);
+#   - at least `min_correct` correct matches per variant (<flags>__<old>__<new>), counting every function from
+#     zlib's and minigzip's own object files. Raise these when matching improves.
+#
+# There are no per-scenario targets: real code isn't designed around scenarios.
+#
+# Baseline 2026-11-05 (first run): /O2 61 of 69 functions present in both builds, /Od 150 and 152 of 163.
+# Remaining /O2 misses are tiny wrappers: zcalloc, zcfree, _tr_init, _tr_align, inflateReset, gzopen
+# (unmatched) and adler32/crc32 (ambiguous: tail-call wrappers whose code is identical once the external
+# target is masked).
+
+[gate.min_correct]
+"o2__v1.2.13__v1.3" = 61
+"o2__v1.3__v1.3.1" = 61
+"o2-icf__v1.2.13__v1.3" = 61
+"o2-icf__v1.3__v1.3.1" = 61
+"od__v1.2.13__v1.3" = 150
+"od__v1.3__v1.3.1" = 152

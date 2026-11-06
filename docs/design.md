@@ -512,8 +512,14 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 - **CI gate:** any change to analysis, match or verify must not reduce accepted precision on the corpus.
   *Implemented for the purpose-built fixtures* (`pbeta-corpus score`, `corpus/fixtures/*/expected.toml`): zero
   wrong matches across every function in scope, and correct matches at or above a per-flag-set baseline that is
-  raised as matching improves. Per-scenario targets are reported as met or not yet. Real-world projects are still
-  planned.
+  raised as matching improves. Per-scenario targets are reported as met or not yet. *Real-world, first project:*
+  zlib v1.2.13 → v1.3 → v1.3.1 (`corpus/projects/zlib`), cloned and built in CI. First result: 0 wrong in all
+  six variants; /O2 61 of 69 functions in both builds matched correctly (53 accepted), /Od 150–152 of 163.
+  Remaining misses are tiny wrappers (allocator shims, tail-call wrappers), which points at a callee-based pass
+  next.
+- **Answer-key pitfall found by zlib:** joining by name must survive linkage changes (1.3.1 made minigzip's
+  helpers `static`) and functions moving between object files. Otherwise correct matches get scored as wrong
+  (`truth.rs`, two-stage join).
 - **Hook corpus:** a sample app plus a Detours hook DLL and recorded behavioral tests, rebuilt across versions, to
   test the full repair loop end to end.
 
