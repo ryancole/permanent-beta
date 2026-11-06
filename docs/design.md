@@ -253,18 +253,19 @@ Implemented as small `StructuralCheck`s returning `pass | fail | inconclusive` w
 
 | Check | Pass condition | Status |
 |---|---|---|
-| Parameter count | Equal when both signatures are known | Implemented |
+| Parameter count | Equal when both signatures are known (PDB or Ghidra) | Implemented |
+| Inferred register arguments | Same number of Win64 argument registers (rcx/rdx/r8/r9, xmm0–3) read before written, up to the first call. Works without symbols. A lower bound, so sanity-only: a mismatch sends to review (it caught fixture S4's added parameter), a match never counts | Implemented |
 | String references | Jaccard similarity ≥ 0.5 **[Guess]** at the threshold | Implemented |
 | Size ratio | New/old size within 0.5–2.0; fail outside 0.25–4.0 **[Guess]**. Sanity check only: can fail a candidate, never counts as support | Implemented |
 | Callers / callees | Of the old function's neighbours that have a candidate, ≥ 50% land on the new function's neighbours; fail below that with ≥ 2 mapped neighbours **[Guess]**. Uses this run's candidates, so it measures consistency, not truth | Implemented |
-| Constants and imports | Overlap of non-trivial immediates and imported APIs | Planned |
+| Constants, imports | Jaccard ≥ 0.5 passes; < 0.2 with ≥ 2 items on each side fails **[Guess]**. Constants are implied by a hash match, imports are not (IAT operands are masked). On zlib /Od this raised accepted matches from 130 to 133 | Implemented |
 | Calling convention / prologue | Compatible with the hook's prototype and trampoline needs (e.g. enough bytes before a branch target for Detours) | Planned |
-| Hookability | Detours can patch the entry: no jump into the first N bytes, not a thunk, etc. | Planned |
+| Hookability | Moved to repair (§7.2): it's a property of the hook target, not evidence of identity, so it doesn't affect matching scores | Implemented in repair |
 
 **Independence (implemented):** a check that measures what the candidate's evidence already established adds
 nothing, so its pass doesn't count (`CheckResult.counted = false`, visible to reviewers). Implied checks per
-evidence kind (`permanent_beta_verify::implied_checks`): normalized hash → string refs and size; strings → string
-refs; call sequence → callers. Failures always count, so evidence can't excuse a failing check.
+evidence kind (`permanent_beta_verify::implied_checks`): normalized hash → string refs, size, constants and inferred
+args; strings → string refs; call sequence → callers. Failures always count, so evidence can't excuse a failing check.
 
 ### 6.2 Behavioral checks
 
@@ -326,7 +327,7 @@ Each locator is bound to a specific `build`. A repaired manifest re-binds it to 
 |---|---|---|
 | `unchanged` | Verified, same RVA | Locator re-bound to the new build. |
 | `relocated` | Verified, new RVA | New RVA; planned: a regenerated, minimal-wildcard, uniqueness-checked AOB pattern. |
-| `needs_review` | Unmatched, ambiguous, verification failed, insufficient evidence, or signature changed | Review item; the locator stays bound to the old build. |
+| `needs_review` | Unmatched, ambiguous, verification failed, insufficient evidence, signature changed, or not hookable (the new function is under 5 bytes, a branch targets the patched bytes, or it is only a jump thunk) | Review item; the locator stays bound to the old build. |
 
 Planned generators (all output goes to review unless purely mechanical):
 

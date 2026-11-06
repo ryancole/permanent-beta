@@ -11,8 +11,11 @@
 //! from the function start, so control-flow changes still change the hash.
 
 use super::image::Image;
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
-use permanent_beta_model::{FunctionFeatures, Rva};
+use iced_x86::{
+    Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, OpAccess, OpKind,
+    Register,
+};
+use permanent_beta_model::{EntryInfo, FunctionFeatures, Rva};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -166,6 +169,7 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
     let mut constants = BTreeSet::new();
     let mut imports = BTreeSet::new();
     let mut leaders = BTreeSet::from([start_va]);
+    let mut internal_targets = BTreeSet::new();
 
     for (i, ins) in insns.iter().enumerate() {
         mh.update((ins.mnemonic() as u16).to_le_bytes());
@@ -182,6 +186,7 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
                         nh.update(b"i");
                         nh.update(((t - start_va) as u32).to_le_bytes());
                         leaders.insert(t);
+                        internal_targets.insert(t);
                     } else {
                         nh.update(b"x");
                         if let Some(rva) = image.va_to_rva(t).filter(|&r| image.is_executable(r)) {
@@ -269,7 +274,86 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
         constants: constants.into_iter().collect(),
         imports: imports.into_iter().collect(),
         signature: None,
+        inferred_args: (!insns.is_empty()).then(|| inferred_args(&insns)),
+        entry: (!insns.is_empty()).then(|| entry_info(&insns, start_va, &internal_targets)),
     }
+}
+
+/// What a 5-byte entry `jmp` would overwrite, and whether that's safe.
+fn entry_info(insns: &[Instruction], start_va: u64, internal_targets: &BTreeSet<u64>) -> EntryInfo {
+    let mut patch_len = 0usize;
+    for ins in insns {
+        if patch_len >= EntryInfo::PATCH_SIZE as usize {
+            break;
+        }
+        patch_len += ins.len();
+    }
+    let patch_end = start_va + patch_len as u64;
+    EntryInfo {
+        patch_len: patch_len.min(u8::MAX as usize) as u8,
+        branch_into_patch: internal_targets.range(start_va..patch_end).next().is_some(),
+        jump_thunk: matches!(
+            insns[0].flow_control(),
+            FlowControl::UnconditionalBranch | FlowControl::IndirectBranch
+        ),
+    }
+}
+
+/// Win64 argument registers by slot: (integer register, vector register).
+const ARG_SLOTS: [(Register, Register); 4] = [
+    (Register::RCX, Register::ZMM0),
+    (Register::RDX, Register::ZMM1),
+    (Register::R8, Register::ZMM2),
+    (Register::R9, Register::ZMM3),
+];
+
+/// 1 + the highest argument slot whose register is read before it's written, scanning in address order up to
+/// the first call or return. A heuristic lower bound: it ignores control flow, unused trailing parameters and
+/// stack arguments.
+fn inferred_args(insns: &[Instruction]) -> u8 {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Slot {
+        Unknown,
+        Arg,
+        Clobbered,
+    }
+    let mut slots = [Slot::Unknown; 4];
+    let mut factory = InstructionInfoFactory::new();
+    for ins in insns {
+        if matches!(ins.flow_control(), FlowControl::Call | FlowControl::Return) {
+            break;
+        }
+        let info = factory.info(ins);
+        // Reads first: `add rcx, rdx` reads rcx before writing it.
+        for pass_reads in [true, false] {
+            for used in info.used_registers() {
+                let full = used.register().full_register();
+                let Some(slot) = ARG_SLOTS.iter().position(|&(g, v)| g == full || v == full) else {
+                    continue;
+                };
+                if slots[slot] != Slot::Unknown {
+                    continue;
+                }
+                let reads = matches!(
+                    used.access(),
+                    OpAccess::Read
+                        | OpAccess::CondRead
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                );
+                let writes = used.access() == OpAccess::Write;
+                if pass_reads && reads {
+                    slots[slot] = Slot::Arg;
+                } else if !pass_reads && writes {
+                    slots[slot] = Slot::Clobbered;
+                }
+            }
+        }
+    }
+    slots
+        .iter()
+        .rposition(|&s| s == Slot::Arg)
+        .map_or(0, |i| i as u8 + 1)
 }
 
 #[cfg(test)]
@@ -365,5 +449,82 @@ mod tests {
 
         let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
         assert_eq!(starts, vec![0x1000, 0x1010]);
+    }
+
+    fn analyze(code: &[u8]) -> FunctionFeatures {
+        features(&image(code, &[]), range(0x1000, 0x1000 + code.len() as u32))
+    }
+
+    #[test]
+    fn infers_integer_register_arguments() {
+        // mov eax, ecx; add eax, edx; ret  → reads rcx and rdx
+        assert_eq!(
+            analyze(&[0x8b, 0xc1, 0x03, 0xc2, 0xc3]).inferred_args,
+            Some(2)
+        );
+        // mov eax, r8d; ret  → third slot used, so at least 3 parameters
+        assert_eq!(analyze(&[0x44, 0x89, 0xc0, 0xc3]).inferred_args, Some(3));
+    }
+
+    #[test]
+    fn infers_vector_register_arguments() {
+        // addss xmm0, xmm1; ret  → float parameters in slots 1 and 2
+        assert_eq!(
+            analyze(&[0xf3, 0x0f, 0x58, 0xc1, 0xc3]).inferred_args,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn register_written_before_read_is_not_an_argument() {
+        // mov ecx, 5; mov eax, ecx; ret
+        let f = analyze(&[0xb9, 0x05, 0x00, 0x00, 0x00, 0x8b, 0xc1, 0xc3]);
+        assert_eq!(f.inferred_args, Some(0));
+    }
+
+    #[test]
+    fn reads_after_a_call_are_not_arguments() {
+        // call +0; mov eax, ecx; ret  → rcx after a call is a clobbered value, not a parameter
+        let f = analyze(&[0xe8, 0x00, 0x00, 0x00, 0x00, 0x8b, 0xc1, 0xc3]);
+        assert_eq!(f.inferred_args, Some(0));
+    }
+
+    #[test]
+    fn ordinary_function_entry_is_hookable() {
+        // sub rsp, 0x28; mov eax, ecx; add rsp, 0x28; ret
+        let f = analyze(&[
+            0x48, 0x83, 0xec, 0x28, 0x8b, 0xc1, 0x48, 0x83, 0xc4, 0x28, 0xc3,
+        ]);
+        let e = f.entry.unwrap();
+        assert_eq!(
+            e.patch_len, 6,
+            "two whole instructions cover the 5-byte patch"
+        );
+        assert!(e.hazards().is_empty(), "{:?}", e.hazards());
+    }
+
+    #[test]
+    fn too_short_function_is_not_hookable() {
+        // xor eax, eax; ret  (3 bytes)
+        let e = analyze(&[0x33, 0xc0, 0xc3]).entry.unwrap();
+        assert_eq!(e.patch_len, 3);
+        assert_eq!(e.hazards().len(), 1);
+    }
+
+    #[test]
+    fn loop_back_to_entry_is_not_hookable() {
+        // 0x1000: dec ecx; jnz 0x1000; ret; nop; nop  → the loop jumps into the patched bytes
+        let e = analyze(&[0xff, 0xc9, 0x75, 0xfc, 0xc3, 0x90, 0x90])
+            .entry
+            .unwrap();
+        assert!(e.branch_into_patch);
+        assert!(!e.hazards().is_empty());
+    }
+
+    #[test]
+    fn jump_thunk_is_flagged() {
+        // jmp rel32
+        let e = analyze(&[0xe9, 0x10, 0x00, 0x00, 0x00]).entry.unwrap();
+        assert!(e.jump_thunk);
     }
 }

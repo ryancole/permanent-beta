@@ -570,6 +570,8 @@ mod tests {
             name_source: None,
             normalized_hash: hash.map(str::to_owned),
             mnemonic_hash: None,
+            inferred_args: None,
+            entry: None,
             basic_blocks: None,
             edges: None,
             callees: vec![],

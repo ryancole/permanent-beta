@@ -138,6 +138,20 @@ pub fn decide(
             }
         }
         Verdict::Accepted => {
+            // Same function, but can the hook actually be placed there? Unknown entry info (e.g. a hand-written
+            // or Ghidra export without it) is not treated as a hazard.
+            let hazards = new_fn.entry.map(|e| e.hazards()).unwrap_or_default();
+            if !hazards.is_empty() {
+                return review(
+                    ReviewReason::NotHookable,
+                    format!(
+                        "matched {}, but it can't be patched safely: {}",
+                        new_fn.rva,
+                        hazards.join("; ")
+                    ),
+                    Some(report),
+                );
+            }
             let action = if old_fn.rva == new_fn.rva {
                 RepairAction::Unchanged { rva: new_fn.rva }
             } else {
@@ -251,6 +265,8 @@ mod tests {
             name_source: None,
             normalized_hash: None,
             mnemonic_hash: None,
+            inferred_args: None,
+            entry: None,
             basic_blocks: None,
             edges: None,
             callees: vec![],
@@ -364,5 +380,50 @@ mod tests {
         let items = review_items(&[r], &BuildId("old".into()), &BuildId("new".into()));
         assert_eq!(items[0].reason, ReviewReason::Ambiguous);
         assert_eq!(items[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn verified_match_onto_an_unpatchable_function_needs_review() {
+        use permanent_beta_model::EntryInfo;
+        let mut new = func(0x20, 1);
+        new.entry = Some(EntryInfo {
+            patch_len: 3,
+            branch_into_patch: false,
+            jump_thunk: false,
+        });
+        let r = decide(
+            &hook(),
+            Some(&func(0x10, 1)),
+            Some(report(Verdict::Accepted)),
+            Some(&new),
+            vec![],
+        );
+        assert!(!r.is_resolved());
+        assert!(matches!(
+            r.action,
+            RepairAction::NeedsReview {
+                reason: ReviewReason::NotHookable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn patchable_function_is_relocated() {
+        use permanent_beta_model::EntryInfo;
+        let mut new = func(0x20, 1);
+        new.entry = Some(EntryInfo {
+            patch_len: 6,
+            branch_into_patch: false,
+            jump_thunk: false,
+        });
+        let r = decide(
+            &hook(),
+            Some(&func(0x10, 1)),
+            Some(report(Verdict::Accepted)),
+            Some(&new),
+            vec![],
+        );
+        assert!(r.is_resolved());
     }
 }

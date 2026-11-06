@@ -78,6 +78,49 @@ pub struct FunctionFeatures {
     #[serde(default)]
     pub imports: Vec<String>,
     pub signature: Option<FunctionSignature>,
+    /// Register arguments the code reads before writing (Win64: rcx/xmm0, rdx/xmm1, r8/xmm2, r9/xmm3), up to
+    /// the first call, as 1 + the highest slot used. A lower bound on the parameter count: unused trailing
+    /// parameters and stack arguments are invisible. Capped at 4. Inferred from code; no symbols needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_args: Option<u8>,
+    /// What a Detours-style entry patch would overwrite. `None` if the analyzer didn't compute it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<EntryInfo>,
+}
+
+/// Facts about a function's entry that decide whether a 5-byte `jmp` patch (Detours) can be applied safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryInfo {
+    /// Bytes the patch overwrites, rounded up to whole instructions. Below 5 means the function is too short.
+    pub patch_len: u8,
+    /// Some branch in the function targets the patched bytes. After patching it would land inside the `jmp`
+    /// (or, for a branch back to the entry, re-enter the detour).
+    pub branch_into_patch: bool,
+    /// The function is only a jump elsewhere (a thunk). The hook probably belongs on the jump target.
+    pub jump_thunk: bool,
+}
+
+impl EntryInfo {
+    pub const PATCH_SIZE: u8 = 5;
+
+    /// Problems that make the entry unsafe to patch, in plain words. Empty means hookable.
+    pub fn hazards(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.patch_len < Self::PATCH_SIZE {
+            out.push(format!(
+                "function is only {} bytes, shorter than the {}-byte patch",
+                self.patch_len,
+                Self::PATCH_SIZE
+            ));
+        }
+        if self.branch_into_patch {
+            out.push("a branch inside the function targets the bytes the patch overwrites".into());
+        }
+        if self.jump_thunk {
+            out.push("the function is only a jump (thunk); hook its target instead".into());
+        }
+        out
+    }
 }
 
 /// Where a function name came from. Trust differs by source.

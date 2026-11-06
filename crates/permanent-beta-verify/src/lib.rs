@@ -82,8 +82,11 @@ impl BehavioralRunner for NoBehavioralCorpus {
 /// Checks whose pass is already implied by a piece of evidence.
 pub fn implied_checks(kind: &str) -> &'static [&'static str] {
     match kind {
-        // Identical normalized code: same referenced strings and the same size.
-        evidence_kind::NORMALIZED_HASH => &["string-refs", "size-ratio"],
+        // Identical normalized code: same referenced strings, size, constants and register-argument use. (Imports
+        // are reached through masked RIP-relative operands, so a hash match says nothing about them.)
+        evidence_kind::NORMALIZED_HASH => {
+            &["string-refs", "size-ratio", "constants", "inferred-args"]
+        }
         evidence_kind::STRINGS => &["string-refs"],
         // Paired because they sit at the same position under the same matched caller.
         evidence_kind::CALL_SEQUENCE => &["callers"],
@@ -92,7 +95,7 @@ pub fn implied_checks(kind: &str) -> &'static [&'static str] {
 }
 
 /// Checks that can fail a candidate but never count as supporting evidence.
-pub const SANITY_ONLY: &[&str] = &["size-ratio"];
+pub const SANITY_ONLY: &[&str] = &["size-ratio", "inferred-args"];
 
 /// Acceptance policy per hook criticality (design §6.3). Thresholds are guesses until calibrated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +140,9 @@ impl Verifier {
                 Box::new(SizeRatioCheck),
                 Box::new(CalleeCheck),
                 Box::new(CallerCheck),
+                Box::new(ConstantsCheck),
+                Box::new(ImportsCheck),
+                Box::new(InferredArgsCheck),
             ],
             Box::new(NoBehavioralCorpus),
         )
@@ -299,6 +305,97 @@ impl StructuralCheck for SizeRatioCheck {
     }
 }
 
+/// Jaccard overlap of two feature sets. Pass at ≥ 0.5; fail below 0.2 when each side has at least two items;
+/// otherwise inconclusive. Edited functions legitimately change some constants and imports, so only a
+/// near-total mismatch fails. Thresholds are guesses.
+fn overlap_check<T: Eq + std::hash::Hash>(name: &str, noun: &str, a: &[T], b: &[T]) -> CheckResult {
+    let (a, b): (HashSet<&T>, HashSet<&T>) = (a.iter().collect(), b.iter().collect());
+    if a.is_empty() && b.is_empty() {
+        return CheckResult::new(name, CheckOutcome::Inconclusive, format!("no {noun}"));
+    }
+    let jaccard = a.intersection(&b).count() as f32 / a.union(&b).count() as f32;
+    let outcome = if jaccard >= 0.5 {
+        CheckOutcome::Pass
+    } else if jaccard < 0.2 && a.len() >= 2 && b.len() >= 2 {
+        CheckOutcome::Fail
+    } else {
+        CheckOutcome::Inconclusive
+    };
+    CheckResult::new(
+        name,
+        outcome,
+        format!("{noun} Jaccard {jaccard:.2} ({} vs {})", a.len(), b.len()),
+    )
+}
+
+/// Non-trivial immediate constants (e.g. table sizes, magic numbers, masks) should mostly survive.
+pub struct ConstantsCheck;
+
+impl StructuralCheck for ConstantsCheck {
+    fn name(&self) -> &'static str {
+        "constants"
+    }
+
+    fn check(
+        &self,
+        _: &VerifyContext,
+        old: &FunctionFeatures,
+        new: &FunctionFeatures,
+    ) -> CheckResult {
+        overlap_check(self.name(), "constants", &old.constants, &new.constants)
+    }
+}
+
+/// Imported APIs called (`dll!name`) should mostly survive.
+pub struct ImportsCheck;
+
+impl StructuralCheck for ImportsCheck {
+    fn name(&self) -> &'static str {
+        "imports"
+    }
+
+    fn check(
+        &self,
+        _: &VerifyContext,
+        old: &FunctionFeatures,
+        new: &FunctionFeatures,
+    ) -> CheckResult {
+        overlap_check(self.name(), "imports", &old.imports, &new.imports)
+    }
+}
+
+/// Register arguments read before written, inferred from code (works without symbols). A difference is a
+/// strong hint the signature changed, which matters for hooks. Sanity-only: the count is a lower bound, so
+/// agreement says little.
+pub struct InferredArgsCheck;
+
+impl StructuralCheck for InferredArgsCheck {
+    fn name(&self) -> &'static str {
+        "inferred-args"
+    }
+
+    fn check(
+        &self,
+        _: &VerifyContext,
+        old: &FunctionFeatures,
+        new: &FunctionFeatures,
+    ) -> CheckResult {
+        match (old.inferred_args, new.inferred_args) {
+            (Some(a), Some(b)) if a == b => CheckResult::new(
+                self.name(),
+                CheckOutcome::Pass,
+                format!("{a} register args"),
+            ),
+            (Some(a), Some(b)) => CheckResult::new(
+                self.name(),
+                CheckOutcome::Fail,
+                format!("reads {a} → {b} register args; the signature may have changed"),
+            ),
+            _ => CheckResult::new(self.name(), CheckOutcome::Inconclusive, "not inferred"),
+        }
+    }
+}
+
 /// Neighbour consistency: of the old function's neighbours that have a candidate, how many land on the new
 /// function's neighbours. Pass at ≥ 50% agreement; fail below that only with at least two mapped neighbours
 /// (one disagreeing neighbour could itself be the wrong candidate). Thresholds are guesses.
@@ -405,6 +502,8 @@ mod tests {
             name_source: None,
             normalized_hash: None,
             mnemonic_hash: None,
+            inferred_args: None,
+            entry: None,
             basic_blocks: None,
             edges: None,
             callees: vec![],
@@ -658,5 +757,94 @@ mod tests {
             Policy::for_criticality(Criticality::Normal),
         );
         assert_eq!(r.verdict, Verdict::NeedsReview, "{:?}", r.checks);
+    }
+
+    #[test]
+    fn shared_constants_count_as_independent_evidence() {
+        let mut o = func(0x10, 100, &[], None);
+        let mut n = func(0x10, 100, &[], None);
+        o.constants = vec![0xedb88320, 0x1000];
+        n.constants = vec![0xedb88320, 0x1000];
+        let r = verify(
+            &cand(0x10, 0x10, evidence_kind::NAME),
+            &o,
+            &n,
+            Criticality::Normal,
+        );
+        assert_eq!(r.verdict, Verdict::Accepted, "{:?}", r.checks);
+    }
+
+    #[test]
+    fn constants_are_implied_by_a_hash_match_but_imports_are_not() {
+        let mut f = func(0x10, 100, &[], None);
+        f.constants = vec![0x1234];
+        f.imports = vec!["kernel32.dll!CreateFileW".into()];
+        let r = verify(
+            &cand(0x10, 0x10, evidence_kind::NORMALIZED_HASH),
+            &f,
+            &f,
+            Criticality::Normal,
+        );
+        let counted = |name: &str| r.checks.iter().find(|c| c.check == name).unwrap().counted;
+        assert!(!counted("constants"));
+        assert!(counted("imports"));
+        assert_eq!(
+            r.verdict,
+            Verdict::Accepted,
+            "imports are independent evidence"
+        );
+    }
+
+    #[test]
+    fn disjoint_imports_fail() {
+        let mut o = func(0x10, 100, &["a"], None);
+        let mut n = func(0x10, 100, &["a"], None);
+        o.imports = vec![
+            "kernel32.dll!ReadFile".into(),
+            "kernel32.dll!CloseHandle".into(),
+        ];
+        n.imports = vec!["user32.dll!MessageBoxW".into(), "user32.dll!GetDC".into()];
+        let r = verify(
+            &cand(0x10, 0x10, evidence_kind::NAME),
+            &o,
+            &n,
+            Criticality::Normal,
+        );
+        let imports = r.checks.iter().find(|c| c.check == "imports").unwrap();
+        assert_eq!(imports.outcome, CheckOutcome::Fail);
+        assert_ne!(r.verdict, Verdict::Accepted);
+    }
+
+    #[test]
+    fn inferred_argument_change_sends_to_review() {
+        // Scenario S4: the function now reads r8 as well.
+        let mut o = func(0x10, 100, &["a"], None);
+        let mut n = func(0x10, 100, &["a"], None);
+        o.inferred_args = Some(2);
+        n.inferred_args = Some(3);
+        let r = verify(
+            &cand(0x10, 0x10, evidence_kind::NAME),
+            &o,
+            &n,
+            Criticality::Normal,
+        );
+        assert_eq!(r.verdict, Verdict::NeedsReview);
+    }
+
+    #[test]
+    fn matching_inferred_arguments_are_not_evidence() {
+        let mut f = func(0x10, 100, &[], None);
+        f.inferred_args = Some(2);
+        let r = verify(
+            &cand(0x10, 0x10, evidence_kind::NAME),
+            &f,
+            &f,
+            Criticality::Normal,
+        );
+        assert_eq!(
+            r.verdict,
+            Verdict::NeedsReview,
+            "sanity-only: a pass doesn't count"
+        );
     }
 }

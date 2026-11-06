@@ -17,6 +17,8 @@ pub enum ReviewReason {
     InsufficientEvidence,
     /// Matched, but the function signature changed; the hook may need adapting.
     SignatureChanged,
+    /// Matched and verified, but a Detours-style entry patch can't be applied safely to the new function.
+    NotHookable,
     /// Proposed by an AI proposer and awaiting a human.
     AiProposal,
 }
