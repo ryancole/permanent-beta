@@ -1,6 +1,7 @@
 //! Analysis layer (design §4): produce or load an [`AnalysisExport`].
 //!
-//! - [`native`]: in-process PE x64 analyzer (stub; planned: `object`/`pelite`, `.pdata`, `iced-x86`, `pdb`).
+//! - [`native`]: in-process PE x64 analyzer (`object` for parsing, `.pdata` + call targets for function
+//!   discovery, `iced-x86` for features). Uses no symbols beyond exports.
 //! - [`export`]: load and save `AnalysisExport` JSON, e.g. as written by the Ghidra headless exporter.
 
 use permanent_beta_model::AnalysisExport;
@@ -31,6 +32,10 @@ pub enum AnalysisError {
     },
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
+    #[error("{path}: not a valid PE image: {reason}")]
+    InvalidPe { path: String, reason: String },
+    #[error("{path}: unsupported binary: {reason}")]
+    Unsupported { path: String, reason: String },
 }
 
 /// Anything that can turn a binary on disk into an [`AnalysisExport`].

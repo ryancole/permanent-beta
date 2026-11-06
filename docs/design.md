@@ -172,16 +172,26 @@ Per function (fields optional unless noted):
 referenced by signatures, and a `features_version` so that hashes from different normalizer versions are never
 compared.
 
-### 4.2 Native analyzer (fast path, in Rust) **[Provisional]**
+### 4.2 Native analyzer (fast path, in Rust)
 
-Target: PE x64. Plan:
+Target: PE x64. Implemented in `permanent-beta-analysis/src/native` (M1, first version):
 
-- Parse with `object` or `pelite`.
-- Function starts from `.pdata` (`RUNTIME_FUNCTION` entries), which covers every non-leaf function and most leaf
-  functions. Add exports, PDB symbols, and call targets discovered by disassembly. Leaf functions without unwind
-  info are a known gap. **[Validate]** how large that gap is on real targets.
-- Decode with `iced-x86`; compute normalized and mnemonic hashes, callees, string and constant references.
-- Read PDBs (`pdb` crate) when present for names and types.
+- Parse headers and sections with `object`; `.pdata` and the import table are parsed by hand from section bytes.
+- Function starts: non-chained `.pdata` entries, the entry point and exports, then direct call/jump targets found
+  by disassembly, iterated to a fixpoint. This matters more than expected: at `/O2`, MSVC emits no `.pdata` for
+  leaf functions that don't touch the stack, which was most of the fixture's test functions. Functions without
+  `.pdata` end at the next known start, minus `int3` padding.
+- Decode with `iced-x86`. Normalized hash (opcode and operands, with RIP-relative targets, external branch
+  targets and in-image addresses masked; internal branch offsets kept), mnemonic hash, basic-block count,
+  callees, string literals (ASCII and UTF-16) and imports referenced through RIP-relative operands, and
+  non-trivial constants.
+- Build id = SHA-256 of the file. The PDB GUID and age are read from the debug directory; no symbols are read.
+- Scored against the fixture answer keys (`permanent-beta-corpus/tests/native_fixtures.rs`): every answer-key
+  function is found in all three flag sets.
+
+Known gaps: no PDB names or types yet (`pdb` crate, planned), chained `.pdata` fragments aren't merged into their
+parent, functions reached only indirectly (vtables, callbacks) without `.pdata` are missed, and `edges` isn't
+computed. **[Validate]** the discovery approach on real targets with indirect calls and jump tables.
 
 What it won't do: decompilation or type recovery. That comes from the Ghidra export.
 
@@ -504,7 +514,7 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 ### 11.1 CLI (skeleton implements `match`, `repair`, `review list`)
 
 ```
-pbeta analyze <binary> --out a.json                       # native analyzer (stub)
+pbeta analyze <binary> --out a.json                       # native PE x64 analyzer
 pbeta match   --old a.json --new b.json [--json]
 pbeta repair  --old a.json --new b.json --hooks hooks.toml [--out hooks.new.toml] [--store path] [--json]
 pbeta review  list [--store path]

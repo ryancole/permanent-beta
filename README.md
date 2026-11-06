@@ -3,9 +3,10 @@
 Map functions across versions of a native binary and repair instrumentation hooks (for example Microsoft Detours)
 when the target is rebuilt or patched.
 
-> Status: **skeleton (M0)**. The matching, verification and repair pipeline runs end to end on hand-written analysis
-> exports. The native PE analyzer, Ghidra exporter, behavioral testing, MCP server and Ghidra UI are not built yet.
-> See [docs/design.md](docs/design.md).
+> Status: **early (M1)**. `pbeta analyze` reads real PE x64 executables, and the matching, verification and repair
+> pipeline runs end to end on its output. Purpose-built test executables and their answer keys are in `corpus/`.
+> The Ghidra exporter, behavioral testing, MCP server and Ghidra UI are not built yet. See
+> [docs/design.md](docs/design.md).
 
 ## Principles
 
@@ -21,7 +22,7 @@ when the target is rebuilt or patched.
 ```
 crates/
   permanent-beta-model/     shared types: analysis schema, candidates, evidence, mappings, hooks, review items
-  permanent-beta-analysis/  binary → AnalysisExport (native PE x64 analyzer: stub; Ghidra export loader)
+  permanent-beta-analysis/  binary → AnalysisExport (native PE x64 analyzer; Ghidra export loader)
   permanent-beta-match/     matching passes → candidates (never decides acceptance)
   permanent-beta-verify/    structural checks, behavioral runner interface, acceptance policy
   permanent-beta-repair/    per-hook repair decisions, manifest rewrite

@@ -33,3 +33,6 @@ jobs:
           $truth = Get-ChildItem target/fixtures -Recurse -Filter truth.json
           if ($truth.Count -eq 0) { throw "no truth.json generated" }
           $truth | ForEach-Object { $_.FullName }
+      - name: score the native analyzer against the fixture answer keys
+        if: runner.os == 'Windows'
+        run: cargo test -p permanent-beta-corpus --test native_fixtures -- --ignored --nocapture
