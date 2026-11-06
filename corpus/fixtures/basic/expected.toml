@@ -14,10 +14,10 @@
 #   unmatched  no match (the function is gone)
 #   added      new-build only; nothing may be matched onto it
 
-[gate.min_correct]  # baseline set 2026-11-05 from the first native-analyzer run
-o2 = 5
-o2-icf = 6
-od = 6
+[gate.min_correct]  # raised 2026-11-05 after caller/callee checks and call-graph propagation (was 5/6/6)
+o2 = 6
+o2-icf = 7
+od = 7
 
 [[scenario]]
 id = "main"

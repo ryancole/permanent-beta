@@ -14,8 +14,26 @@ pub enum CandidateSource {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
+    /// One of [`evidence_kind`] for deterministic matchers.
     pub kind: String,
     pub detail: String,
+}
+
+/// Evidence kinds written by matchers and read by verification to decide which checks are independent of the
+/// evidence (design §6.1). Shared here so `match` and `verify` agree without depending on each other.
+pub mod evidence_kind {
+    /// Same unique export or PDB name.
+    pub const NAME: &str = "name";
+    /// Same unique normalized instruction hash.
+    pub const NORMALIZED_HASH: &str = "normalized_hash";
+    /// Same unique mnemonic sequence (operands may differ).
+    pub const MNEMONIC_HASH: &str = "mnemonic_hash";
+    /// Same unique set of referenced strings.
+    pub const STRINGS: &str = "strings";
+    /// Same position in the call sequence of an already-matched caller.
+    pub const CALL_SEQUENCE: &str = "call_sequence";
+    /// One of several equally plausible competitors (review evidence only, never accepted).
+    pub const AMBIGUOUS: &str = "ambiguous";
 }
 
 /// A proposed old→new function correspondence. Not accepted until verified.
@@ -52,6 +70,14 @@ pub struct CheckResult {
     pub check: String,
     pub outcome: CheckOutcome,
     pub detail: String,
+    /// Whether a pass counted towards the acceptance policy. False when the check only repeats the evidence
+    /// that produced the candidate, or is a sanity check that can fail a candidate but never support it.
+    #[serde(default = "default_true")]
+    pub counted: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl CheckResult {
@@ -60,6 +86,7 @@ impl CheckResult {
             check: check.to_owned(),
             outcome,
             detail: detail.into(),
+            counted: true,
         }
     }
 }

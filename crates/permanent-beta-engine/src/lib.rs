@@ -9,7 +9,7 @@ use permanent_beta_model::{
     VerificationReport,
 };
 use permanent_beta_repair::{HookRepair, RepairAction, decide, review_items, rewrite_manifest};
-use permanent_beta_verify::{Policy, Verifier};
+use permanent_beta_verify::{Policy, Verifier, VerifyContext};
 use serde::Serialize;
 
 pub use permanent_beta_repair;
@@ -60,12 +60,13 @@ impl Engine {
     pub fn match_builds(&self, old: &AnalysisExport, new: &AnalysisExport) -> MatchReport {
         let outcome = run_passes(old, new, &self.matchers);
         let candidates = &outcome.candidates;
+        let ctx = VerifyContext::new(old, new, candidates);
         let policy = Policy::for_criticality(Criticality::Normal);
         let reports: Vec<VerificationReport> = candidates
             .iter()
             .filter_map(|c| {
                 let (o, n) = (old.function(c.old)?, new.function(c.new)?);
-                Some(self.verifier.verify(c, o, n, policy))
+                Some(self.verifier.verify(&ctx, c, o, n, policy))
             })
             .collect();
 
@@ -99,6 +100,7 @@ impl Engine {
     ) -> RepairReport {
         let outcome = run_passes(old, new, &self.matchers);
         let candidates = &outcome.candidates;
+        let ctx = VerifyContext::new(old, new, candidates);
         let (from, to) = (&old.build.id, &new.build.id);
 
         let repairs: Vec<HookRepair> = manifest
@@ -111,11 +113,13 @@ impl Engine {
                 let new_fn = cand.and_then(|c| new.function(c.new));
                 let policy = Policy::for_criticality(hook.criticality);
                 let report = match (cand, old_fn, new_fn) {
-                    (Some(c), Some(o), Some(n)) => Some(self.verifier.verify(c, o, n, policy)),
+                    (Some(c), Some(o), Some(n)) => {
+                        Some(self.verifier.verify(&ctx, c, o, n, policy))
+                    }
                     _ => None,
                 };
                 let alternatives = match (cand, old_fn) {
-                    (None, Some(o)) => self.alternatives(&outcome, o, new, policy),
+                    (None, Some(o)) => self.alternatives(&ctx, &outcome, o, new, policy),
                     _ => Vec::new(),
                 };
                 decide(hook, old_fn, report, new_fn, alternatives)
@@ -161,6 +165,7 @@ impl Engine {
     /// `decide` routes these to review regardless of their verdicts.
     fn alternatives(
         &self,
+        ctx: &VerifyContext,
         outcome: &MatchOutcome,
         old_fn: &FunctionFeatures,
         new: &AnalysisExport,
@@ -193,7 +198,10 @@ impl Engine {
                         })
                         .collect(),
                 };
-                Some(self.verifier.verify(&candidate, old_fn, new_fn, policy))
+                Some(
+                    self.verifier
+                        .verify(ctx, &candidate, old_fn, new_fn, policy),
+                )
             })
             .collect()
     }

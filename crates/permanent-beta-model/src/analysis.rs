@@ -68,6 +68,7 @@ pub struct FunctionFeatures {
     pub mnemonic_hash: Option<String>,
     pub basic_blocks: Option<u32>,
     pub edges: Option<u32>,
+    /// Direct callees (including tail-jump targets), in order of first call site.
     #[serde(default)]
     pub callees: Vec<Rva>,
     #[serde(default)]

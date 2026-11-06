@@ -45,6 +45,14 @@
         "return_type": "int",
         "params": [{ "name": "doc", "ty": "Doc*" }, { "name": "path", "ty": "const wchar_t*" }]
       }
+    },
+    {
+      "rva": "0x1800",
+      "size": 120,
+      "name": "AppMain",
+      "name_source": "export",
+      "normalized_hash": "nh:appmain-v1",
+      "callees": ["0x1000", "0x1200", "0x1400", "0x1600"]
     }
   ]
 }

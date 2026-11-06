@@ -54,6 +54,14 @@
           { "name": "flags", "ty": "uint32_t" }
         ]
       }
+    },
+    {
+      "rva": "0x2b00",
+      "size": 130,
+      "name": "AppMain",
+      "name_source": "export",
+      "normalized_hash": "nh:appmain-v2",
+      "callees": ["0x2000", "0x2300", "0x2500", "0x2700", "0x2900"]
     }
   ]
 }

@@ -220,8 +220,8 @@ neighbourhood passes.
 | 1 | Symbol name | Export or PDB name unique on both sides | Implemented in the skeleton. |
 | 2 | Normalized hash | `normalized_hash` unique on both sides | Implemented. |
 | 3 | Unique string set | Sorted referenced strings, unique | Implemented. |
-| 4 | Mnemonic hash | `mnemonic_hash` unique | Planned. |
-| 5 | Call-graph propagation | Callers/callees of matched pairs, unique by position or features | Planned; iterate to fixpoint. |
+| 4 | Mnemonic hash | `mnemonic_hash` unique | Deferred: on tiny functions, two unrelated functions can each have a unique mnemonic sequence, so uniqueness alone doesn't make it safe. Revisit with a minimum-size or similarity gate. |
+| 5 | Call-graph propagation | Callees of matched callers | Implemented (`CallSequenceMatcher`), iterated to fixpoint. **Candidate** only when a callee's code occurs exactly once among the caller's unmatched callees in both builds, which doesn't depend on call order. Pairing by call *position* (or repeated identical code by order) is a **review suggestion** (an ambiguity), never a candidate: MSVC reorders calls to side-effect-free functions, and in the `basic` fixture that paired a deleted function with an edited one. The corpus gate caught it. |
 | 6 | Structural similarity | CFG fingerprint + feature vector, best-vs-second-best margin | Planned; this is where false positives live. |
 | 7 | AI proposer | Pseudocode comparison for leftovers | Optional (§8). |
 
@@ -255,15 +255,16 @@ Implemented as small `StructuralCheck`s returning `pass | fail | inconclusive` w
 |---|---|---|
 | Parameter count | Equal when both signatures are known | Implemented |
 | String references | Jaccard similarity ≥ 0.5 **[Guess]** at the threshold | Implemented |
-| Size ratio | New/old size within 0.5–2.0; fail outside 0.25–4.0 **[Guess]** | Implemented |
-| Callers/callees | Matched neighbours of the old function are neighbours of the new one | Planned |
+| Size ratio | New/old size within 0.5–2.0; fail outside 0.25–4.0 **[Guess]**. Sanity check only: can fail a candidate, never counts as support | Implemented |
+| Callers / callees | Of the old function's neighbours that have a candidate, ≥ 50% land on the new function's neighbours; fail below that with ≥ 2 mapped neighbours **[Guess]**. Uses this run's candidates, so it measures consistency, not truth | Implemented |
 | Constants and imports | Overlap of non-trivial immediates and imported APIs | Planned |
 | Calling convention / prologue | Compatible with the hook's prototype and trampoline needs (e.g. enough bytes before a branch target for Detours) | Planned |
 | Hookability | Detours can patch the entry: no jump into the first N bytes, not a thunk, etc. | Planned |
 
-**Independence caveat:** a check that measures the same thing the matcher matched on adds little. A
-normalized-hash match will trivially pass the string check. The policy should count only checks that are
-independent of the producing pass. **[Provisional]**. Not yet enforced in the skeleton.
+**Independence (implemented):** a check that measures what the candidate's evidence already established adds
+nothing, so its pass doesn't count (`CheckResult.counted = false`, visible to reviewers). Implied checks per
+evidence kind (`permanent_beta_verify::implied_checks`): normalized hash → string refs and size; strings → string
+refs; call sequence → callers. Failures always count, so evidence can't excuse a failing check.
 
 ### 6.2 Behavioral checks
 
@@ -274,11 +275,16 @@ The skeleton ships `NoBehavioralCorpus`, which always returns inconclusive.
 
 Policy is a function of the hook's criticality (from the manifest):
 
-| Criticality | Min. independent structural passes | Behavioral pass required |
+| Criticality | Min. independent passes (beyond the candidate's own evidence) | Behavioral pass required |
 |---|---|---|
 | low | 1 | no |
-| normal | 2 | no |
+| normal | 1 | no |
 | high | 2 | **yes** |
+
+All three numbers are **[Guess]**. Normal was 2 when every passing check counted. Once implied passes and the
+size check stopped counting, 2 *independent* passes made a correctly matched leaf function with no strings
+impossible to accept. Now a unique match plus one independent check (typically callers) is enough, and the corpus
+gate guards it. Low may drop to 0 once calibrated.
 
 Verdict rules (implemented):
 

@@ -160,7 +160,8 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
 
     let mut nh = Sha256::new();
     let mut mh = Sha256::new();
-    let mut callees = BTreeSet::new();
+    // Callees in order of first call site: the call-sequence matcher aligns on this order.
+    let mut callees: Vec<Rva> = Vec::new();
     let mut strings = BTreeSet::new();
     let mut constants = BTreeSet::new();
     let mut imports = BTreeSet::new();
@@ -184,7 +185,10 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
                     } else {
                         nh.update(b"x");
                         if let Some(rva) = image.va_to_rva(t).filter(|&r| image.is_executable(r)) {
-                            callees.insert(Rva(rva as u64));
+                            let r = Rva(rva as u64);
+                            if !callees.contains(&r) {
+                                callees.push(r);
+                            }
                         }
                     }
                 }
@@ -260,7 +264,7 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
         mnemonic_hash: (!insns.is_empty()).then(|| short_hash(mh, "mh")),
         basic_blocks: Some(basic_blocks),
         edges: None,
-        callees: callees.into_iter().collect(),
+        callees,
         strings: strings.into_iter().collect(),
         constants: constants.into_iter().collect(),
         imports: imports.into_iter().collect(),
