@@ -1,0 +1,11 @@
+[package]
+name = "permanent-beta-repair"
+description = "Per-hook repair decisions and hook manifest rewriting."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+permanent-beta-model.workspace = true
+serde.workspace = true

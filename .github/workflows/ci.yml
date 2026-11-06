@@ -22,6 +22,6 @@ jobs:
         shell: bash
         run: |
           set +e
-          cargo run -q -p rehook-cli -- repair --old examples/demo/v1.json --new examples/demo/v2.json --hooks examples/demo/hooks.toml
+          cargo run -q -p permanent-beta-cli -- repair --old examples/demo/v1.json --new examples/demo/v2.json --hooks examples/demo/hooks.toml
           code=$?
           test "$code" -eq 1

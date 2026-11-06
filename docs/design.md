@@ -1,6 +1,4 @@
-# rehook — design document
-
-> **Working name.** "rehook" is a placeholder. Crate-name and trademark availability have not been checked.
+# Permanent Beta — design document
 
 Status: draft v0.1 · 2026-11-05 · Owner: Ryan Cole
 
@@ -54,6 +52,7 @@ Detecting breakage is easy. **Repairing** it is the valuable part, and it requir
 
 | Topic | Choice | Status |
 |---|---|---|
+| Product name | Permanent Beta; crates `permanent-beta-*`, CLI `pbeta` | **[Decided]** |
 | Core language | Rust | **[Decided]** |
 | v1 targets | Windows PE, x64 only | **[Provisional]** |
 | Analysis source | Hybrid: native analyzer in the core + import of a Ghidra headless export | **[Provisional]** |
@@ -92,7 +91,7 @@ flowchart LR
       TC[behavioral test corpus]
     end
 
-    subgraph Core["rehook core (Rust, open source)"]
+    subgraph Core["Permanent Beta core (Rust, open source)"]
       AN[analysis\nnormalize to AnalysisExport]
       MA[match\npasses → candidates]
       VE[verify\nstructural + behavioral]
@@ -110,7 +109,7 @@ flowchart LR
     EN --- MA & VE & RE & ST
     RE --> ST
 
-    CLI[rehook CLI] --> EN
+    CLI[pbeta CLI] --> EN
     MCP[MCP server] --> EN
     GX[Ghidra extension (Java)] -->|JSON / RPC| CLI
 ```
@@ -119,27 +118,27 @@ flowchart LR
 
 | Crate | Responsibility | May depend on |
 |---|---|---|
-| `rehook-model` | Shared data types: analysis schema, candidates, evidence, mappings, hooks, review items. No logic beyond helpers. | (nothing internal) |
-| `rehook-analysis` | Produce an `AnalysisExport` from a binary (native analyzer) or load one produced by Ghidra. | model |
-| `rehook-match` | Matching passes that emit `Candidate`s with evidence. Never decides acceptance. | model |
-| `rehook-verify` | Structural checks, behavioral test runner interface, acceptance policy → `Verdict`. | model |
-| `rehook-repair` | Per-hook decisions, manifest rewrite, generated code. | model |
-| `rehook-store` | Versioned mapping history, evidence, review queue persistence. | model |
-| `rehook-engine` | Orchestrates analysis output → match → verify → repair. | model, match, verify, repair |
-| `rehook-cli` | `rehook` binary; argument parsing, I/O, exit codes. | engine, analysis, store, model |
-| *(planned)* `rehook-ai` | Proposers that call a local or remote model and emit `Candidate`s. | model |
-| *(planned)* `rehook-mcp` | MCP server over the engine. | engine, store, model |
-| *(planned)* `rehook-py` | PyO3 bindings for IDA / scripting. | engine, model |
+| `permanent-beta-model` | Shared data types: analysis schema, candidates, evidence, mappings, hooks, review items. No logic beyond helpers. | (nothing internal) |
+| `permanent-beta-analysis` | Produce an `AnalysisExport` from a binary (native analyzer) or load one produced by Ghidra. | model |
+| `permanent-beta-match` | Matching passes that emit `Candidate`s with evidence. Never decides acceptance. | model |
+| `permanent-beta-verify` | Structural checks, behavioral test runner interface, acceptance policy → `Verdict`. | model |
+| `permanent-beta-repair` | Per-hook decisions, manifest rewrite, generated code. | model |
+| `permanent-beta-store` | Versioned mapping history, evidence, review queue persistence. | model |
+| `permanent-beta-engine` | Orchestrates analysis output → match → verify → repair. | model, match, verify, repair |
+| `permanent-beta-cli` | `pbeta` binary; argument parsing, I/O, exit codes. | engine, analysis, store, model |
+| *(planned)* `permanent-beta-ai` | Proposers that call a local or remote model and emit `Candidate`s. | model |
+| *(planned)* `permanent-beta-mcp` | MCP server over the engine. | engine, store, model |
+| *(planned)* `permanent-beta-py` | PyO3 bindings for IDA / scripting. | engine, model |
 
 **Rule that matters most:** `match` and `verify` do not depend on each other. Matchers propose, verification judges,
-and the only shared language is `rehook-model`. A matcher cannot mark its own output accepted, and that includes
+and the only shared language is `permanent-beta-model`. A matcher cannot mark its own output accepted, and that includes
 AI proposers.
 
 ### 3.2 Process model
 
 - **CLI** is the primary interface: one process per invocation, JSON in and out, deterministic exit codes.
 - **Ghidra extension** (Java) runs out of process. It either invokes the CLI, or later talks to a long-running
-  `rehook serve` over local JSON-RPC. Nothing is linked into the JVM. **[Provisional]**
+  `pbeta serve` over local JSON-RPC. Nothing is linked into the JVM. **[Provisional]**
 - **MCP server** wraps the same engine API. It exposes read and propose operations; acceptance still goes through
   verification and policy (§9.2).
 
@@ -337,7 +336,7 @@ captures, per call:
   "test_id": "save-doc-0003",
   "hook": "SaveDocument",
   "build": "<sha256>",
-  "recorder": "rehook-harness 0.1",
+  "recorder": "permanent-beta-harness 0.1",
   "abi": "win64",
   "args": [
     { "slot": "rcx", "type": "Doc*", "points_to": "blob:sha256:…", "layout": "Doc@<build>" },
@@ -504,14 +503,14 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 ### 11.1 CLI (skeleton implements `match`, `repair`, `review list`)
 
 ```
-rehook analyze <binary> --out a.json                       # native analyzer (stub)
-rehook match   --old a.json --new b.json [--json]
-rehook repair  --old a.json --new b.json --hooks hooks.toml [--out hooks.new.toml] [--store path] [--json]
-rehook review  list [--store path]
+pbeta analyze <binary> --out a.json                       # native analyzer (stub)
+pbeta match   --old a.json --new b.json [--json]
+pbeta repair  --old a.json --new b.json --hooks hooks.toml [--out hooks.new.toml] [--store path] [--json]
+pbeta review  list [--store path]
 ```
 
 Exit codes: `0` everything resolved · `1` some hooks need review · `2` error. That makes
-`rehook repair` usable as a CI step that fails when a human is needed.
+`pbeta repair` usable as a CI step that fails when a human is needed.
 
 ### 11.2 MCP server (step 2)
 
@@ -537,7 +536,7 @@ be clear. **[Validate]**
 
 ### 11.4 IDA Pro plugin (step 5)
 
-Via PyO3 bindings (`rehook-py`) from IDAPython, or the same CLI/RPC route. Start after the repair pipeline is
+Via PyO3 bindings (`permanent-beta-py`) from IDAPython, or the same CLI/RPC route. Start after the repair pipeline is
 validated on the corpus.
 
 ### 11.5 Licensing **[Provisional]**
@@ -605,7 +604,7 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 14. Target-segment priority. Which segment do you interview first?
 15. Hosted service: is it worth building if most paying customers require on-prem anyway?
 16. Open-source license (Apache-2.0 vs MIT vs MPL-2.0) and contributor terms (DCO vs CLA).
-17. Product name.
+17. Product name: decided as Permanent Beta (CLI `pbeta`). Trademark and crates.io availability not yet checked. **[Validate]**
 18. Who reviews AI-written code besides you, and what review is required to merge (e.g. corpus gate + owner
     approval)?
 
@@ -630,6 +629,6 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | **M2 Corpus** | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression |
 | **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions |
-| **M5 MCP + AI proposer** | `rehook-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus |
+| **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus |
 | **M6 Ghidra extension** | Exporter + review UI | Usable by an external tester |
 | Later | Hosted / on-prem history service, IDA plugin, ELF | Driven by §14 validation |

@@ -7,12 +7,12 @@ stop plausible-but-wrong matching logic from merging.
 
 - Read `docs/design.md` §3 before changing crate structure.
 - Allowed internal dependencies (enforced by Cargo.toml review):
-  - `rehook-model`: none
-  - `rehook-analysis`, `rehook-match`, `rehook-verify`, `rehook-repair`, `rehook-store`: `rehook-model` only
-  - `rehook-engine`: model, match, verify, repair
-  - `rehook-cli`: engine, analysis, store, model
-- `rehook-match` and `rehook-verify` must never depend on each other. Matchers propose; verification judges.
-- No matcher, AI proposer or MCP tool may produce an accepted mapping without going through `rehook-verify`.
+  - `permanent-beta-model`: none
+  - `permanent-beta-analysis`, `permanent-beta-match`, `permanent-beta-verify`, `permanent-beta-repair`, `permanent-beta-store`: `permanent-beta-model` only
+  - `permanent-beta-engine`: model, match, verify, repair
+  - `permanent-beta-cli`: engine, analysis, store, model
+- `permanent-beta-match` and `permanent-beta-verify` must never depend on each other. Matchers propose; verification judges.
+- No matcher, AI proposer or MCP tool may produce an accepted mapping without going through `permanent-beta-verify`.
 - Ambiguity yields no candidate (review), never a best guess.
 
 ## Change rules

@@ -157,6 +157,82 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "permanent-beta-analysis"
+version = "0.0.1"
+dependencies = [
+ "permanent-beta-model",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "permanent-beta-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "permanent-beta-analysis",
+ "permanent-beta-engine",
+ "permanent-beta-model",
+ "permanent-beta-store",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "permanent-beta-engine"
+version = "0.0.1"
+dependencies = [
+ "permanent-beta-match",
+ "permanent-beta-model",
+ "permanent-beta-repair",
+ "permanent-beta-verify",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "permanent-beta-match"
+version = "0.0.1"
+dependencies = [
+ "permanent-beta-model",
+]
+
+[[package]]
+name = "permanent-beta-model"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "permanent-beta-repair"
+version = "0.0.1"
+dependencies = [
+ "permanent-beta-model",
+ "serde",
+]
+
+[[package]]
+name = "permanent-beta-store"
+version = "0.0.1"
+dependencies = [
+ "permanent-beta-model",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "permanent-beta-verify"
+version = "0.0.1"
+dependencies = [
+ "permanent-beta-model",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -172,82 +248,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "rehook-analysis"
-version = "0.0.1"
-dependencies = [
- "rehook-model",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "rehook-cli"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "clap",
- "rehook-analysis",
- "rehook-engine",
- "rehook-model",
- "rehook-store",
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "rehook-engine"
-version = "0.0.1"
-dependencies = [
- "rehook-match",
- "rehook-model",
- "rehook-repair",
- "rehook-verify",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "rehook-match"
-version = "0.0.1"
-dependencies = [
- "rehook-model",
-]
-
-[[package]]
-name = "rehook-model"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rehook-repair"
-version = "0.0.1"
-dependencies = [
- "rehook-model",
- "serde",
-]
-
-[[package]]
-name = "rehook-store"
-version = "0.0.1"
-dependencies = [
- "rehook-model",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "rehook-verify"
-version = "0.0.1"
-dependencies = [
- "rehook-model",
 ]
 
 [[package]]

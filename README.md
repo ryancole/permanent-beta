@@ -1,4 +1,4 @@
-# rehook (working name)
+# Permanent Beta
 
 Map functions across versions of a native binary and repair instrumentation hooks (for example Microsoft Detours)
 when the target is rebuilt or patched.
@@ -20,14 +20,14 @@ when the target is rebuilt or patched.
 
 ```
 crates/
-  rehook-model/     shared types: analysis schema, candidates, evidence, mappings, hooks, review items
-  rehook-analysis/  binary → AnalysisExport (native PE x64 analyzer: stub; Ghidra export loader)
-  rehook-match/     matching passes → candidates (never decides acceptance)
-  rehook-verify/    structural checks, behavioral runner interface, acceptance policy
-  rehook-repair/    per-hook repair decisions, manifest rewrite
-  rehook-store/     mapping history + review queue (JSON file now, SQLite planned)
-  rehook-engine/    orchestration: match → verify → repair
-  rehook-cli/       the `rehook` binary
+  permanent-beta-model/     shared types: analysis schema, candidates, evidence, mappings, hooks, review items
+  permanent-beta-analysis/  binary → AnalysisExport (native PE x64 analyzer: stub; Ghidra export loader)
+  permanent-beta-match/     matching passes → candidates (never decides acceptance)
+  permanent-beta-verify/    structural checks, behavioral runner interface, acceptance policy
+  permanent-beta-repair/    per-hook repair decisions, manifest rewrite
+  permanent-beta-store/     mapping history + review queue (JSON file now, SQLite planned)
+  permanent-beta-engine/    orchestration: match → verify → repair
+  permanent-beta-cli/       the `pbeta` binary
 integrations/
   ghidra/           Ghidra extension + headless exporter (planned, Java)
   ida/              IDA Pro plugin (planned, after repair is validated)
@@ -37,7 +37,7 @@ examples/demo/      hand-written analysis exports + hook manifest for the end-to
 docs/design.md      architecture, data model, verification, review queue, open questions, risks
 ```
 
-Dependency rule: `match` and `verify` never depend on each other. Both depend only on `rehook-model`.
+Dependency rule: `match` and `verify` never depend on each other. Both depend only on `permanent-beta-model`.
 
 ## Build and try the demo
 
@@ -48,15 +48,15 @@ cargo test --workspace
 ```
 
 ```bash
-cargo run -p rehook-cli -- match --old examples/demo/v1.json --new examples/demo/v2.json
+cargo run -p permanent-beta-cli -- match --old examples/demo/v1.json --new examples/demo/v2.json
 ```
 
 ```bash
-cargo run -p rehook-cli -- repair --old examples/demo/v1.json --new examples/demo/v2.json --hooks examples/demo/hooks.toml --out target/hooks.v2.toml --store target/demo-store.json
+cargo run -p permanent-beta-cli -- repair --old examples/demo/v1.json --new examples/demo/v2.json --hooks examples/demo/hooks.toml --out target/hooks.v2.toml --store target/demo-store.json
 ```
 
 ```bash
-cargo run -p rehook-cli -- review list --store target/demo-store.json
+cargo run -p permanent-beta-cli -- review list --store target/demo-store.json
 ```
 
 Expected `repair` outcome for the demo: `ParseConfig` relocated; `CreateDocument` needs review (high criticality,

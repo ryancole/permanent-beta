@@ -11,13 +11,13 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates. Dependency rules are documented in docs/design.md §3.1 and CLAUDE.md.
-rehook-model = { path = "crates/rehook-model" }
-rehook-analysis = { path = "crates/rehook-analysis" }
-rehook-match = { path = "crates/rehook-match" }
-rehook-verify = { path = "crates/rehook-verify" }
-rehook-repair = { path = "crates/rehook-repair" }
-rehook-store = { path = "crates/rehook-store" }
-rehook-engine = { path = "crates/rehook-engine" }
+permanent-beta-model = { path = "crates/permanent-beta-model" }
+permanent-beta-analysis = { path = "crates/permanent-beta-analysis" }
+permanent-beta-match = { path = "crates/permanent-beta-match" }
+permanent-beta-verify = { path = "crates/permanent-beta-verify" }
+permanent-beta-repair = { path = "crates/permanent-beta-repair" }
+permanent-beta-store = { path = "crates/permanent-beta-store" }
+permanent-beta-engine = { path = "crates/permanent-beta-engine" }
 
 # External crates.
 anyhow = "1"
