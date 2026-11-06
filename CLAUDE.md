@@ -21,7 +21,9 @@ stop plausible-but-wrong matching logic from merging.
 
 - Any change to analysis, matching or verification logic needs tests that include a *negative* case (something that
   must not match or must not be accepted).
-- Once the corpus gate exists (design §10), report corpus precision and recall before and after in the PR.
+- Run `pwsh corpus/build-fixtures.ps1 -Score` before and after any analysis, matching or verification change and put
+  both scorecards in the PR. Wrong matches must stay at zero. When correct matches go up, raise
+  `gate.min_correct` in the fixture's `expected.toml` in the same PR.
 - Thresholds are tagged `[Guess]` in the design doc until calibrated. Don't present them as validated.
 - Keep the analysis schema versioned. Bump `ANALYSIS_SCHEMA_VERSION` on breaking changes.
 - No features for unpacking, defeating integrity checks, or evading anti-cheat or anti-tamper (design §12).

@@ -273,10 +273,12 @@ dependencies = [
  "anyhow",
  "clap",
  "permanent-beta-analysis",
+ "permanent-beta-engine",
  "permanent-beta-model",
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

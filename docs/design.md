@@ -504,6 +504,10 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 - **Target:** zero silent wrong repairs on the corpus, with accepted-mapping precision ≥ 99.5% **[Guess]**, to be set
   from data.
 - **CI gate:** any change to analysis, match or verify must not reduce accepted precision on the corpus.
+  *Implemented for the purpose-built fixtures* (`pbeta-corpus score`, `corpus/fixtures/*/expected.toml`): zero
+  wrong matches across every function in scope, and correct matches at or above a per-flag-set baseline that is
+  raised as matching improves. Per-scenario targets are reported as met or not yet. Real-world projects are still
+  planned.
 - **Hook corpus:** a sample app plus a Detours hook DLL and recorded behavioral tests, rebuilt across versions, to
   test the full repair loop end to end.
 

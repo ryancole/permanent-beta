@@ -12,11 +12,14 @@
 .EXAMPLE
   pwsh corpus/build-fixtures.ps1
   pwsh corpus/build-fixtures.ps1 -Fixture basic -Flags o2-icf
+  pwsh corpus/build-fixtures.ps1 -Score
 #>
 [CmdletBinding()]
 param(
     [string[]] $Fixture,
-    [string[]] $Flags
+    [string[]] $Flags,
+    # After building, analyze, match and score each fixture against its expected.toml (fails on a gate failure).
+    [switch] $Score
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,5 +89,11 @@ foreach ($name in $fixtureNames) {
             '--old', "$variantDir\v1\fixture.map", '--new', "$variantDir\v2\fixture.map",
             '--object', 'fixture.obj', '--out', "$variantDir\truth.json")
         Write-Host "wrote $variantDir\truth.json"
+    }
+
+    $expected = Join-Path $fixturesDir "$name/expected.toml"
+    if ($Score -and (Test-Path $expected)) {
+        Invoke-Native 'cargo' @('run', '-q', '-p', 'permanent-beta-corpus', '--', 'score',
+            '--built', (Join-Path $outRoot $name), '--expected', $expected)
     }
 }

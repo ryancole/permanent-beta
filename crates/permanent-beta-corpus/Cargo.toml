@@ -17,8 +17,8 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-# Scoring the analyzer against answer keys. The dependency points this way only: no pipeline crate may depend
-# on permanent-beta-corpus (CLAUDE.md).
+toml.workspace = true
+# For scoring the real pipeline against answer keys. The dependency points this way only: no pipeline crate may
+# depend on permanent-beta-corpus (CLAUDE.md).
 permanent-beta-analysis.workspace = true
+permanent-beta-engine.workspace = true

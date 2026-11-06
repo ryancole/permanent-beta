@@ -15,8 +15,8 @@ A small C++ program in two versions (`v1/`, `v2/`). Each `pb_*` function is one 
 | S8 | `pb_static_strings` | static, unique string references, identical source | match by strings, relocate |
 | S9 | `pb_added` | v2 only | no match |
 
-Machine-checkable expected outcomes are the next step (design §10). Today `truth.json` records only the true
-mapping.
+Expected outcomes are in `expected.toml`: a gate (zero wrong matches, no drop below the correct-match baseline)
+and per-scenario targets. Score with `pwsh corpus/build-fixtures.ps1 -Score`.
 
 Inline functions from headers (`printf`, `__local_stdio_printf_options`) are also compiled into `fixture.obj`, so
 they appear in the answer key too. That's realistic, so they stay in scope.

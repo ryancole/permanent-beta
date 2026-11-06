@@ -1,0 +1,73 @@
+# Expected outcomes for the `basic` fixture. Scored by `pbeta-corpus score` and
+# crates/permanent-beta-corpus/tests/fixture_scores.rs.
+#
+# Gate (CI fails if broken):
+#   - zero wrong matches, always (not configurable);
+#   - at least `min_correct` correct matches per flag set, counting every function in fixture.obj,
+#     including inlined header functions such as printf. When matching improves, raise these numbers so
+#     the improvement can't silently regress.
+#
+# Targets (reported as "met" / "not yet", never failing): what the engine should eventually do.
+#   accepted   correct match, accepted by verification
+#   review     correct match, sent to review (e.g. the function changed)
+#   ambiguous  no match; competing candidates listed for review
+#   unmatched  no match (the function is gone)
+#   added      new-build only; nothing may be matched onto it
+
+[gate.min_correct]  # baseline set 2026-11-05 from the first native-analyzer run
+o2 = 5
+o2-icf = 6
+od = 6
+
+[[scenario]]
+id = "main"
+function = "main"
+target = "accepted"
+
+[[scenario]]
+id = "S1"
+function = "pb_unchanged"
+target = "accepted"
+
+[[scenario]]
+id = "S2"
+function = "pb_moved"
+target = "accepted"
+
+[[scenario]]
+id = "S3"
+function = "pb_body_edited"
+target = "review"
+
+[[scenario]]
+id = "S4"
+function = "pb_param_added"
+target = "review"
+
+[[scenario]]
+id = "S5"
+function = "pb_struct_reader"
+target = "review"
+
+# Two identical bodies. Without ICF the engine can't tell them apart from code alone; with /OPT:ICF they're one
+# function in both builds.
+[[scenario]]
+id = "S6"
+function = "pb_dup_a"
+target = "ambiguous"
+overrides = { "o2-icf" = "accepted" }
+
+[[scenario]]
+id = "S7"
+function = "pb_deleted"
+target = "unmatched"
+
+[[scenario]]
+id = "S8"
+function = "pb_static_strings"
+target = "accepted"
+
+[[scenario]]
+id = "S9"
+function = "pb_added"
+target = "added"
