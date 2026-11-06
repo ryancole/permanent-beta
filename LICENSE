@@ -1,0 +1,12 @@
+LICENSE PLACEHOLDER — NO LICENSE GRANTED YET
+
+The open-source license for this repository has not been chosen. Until this file is
+replaced with an actual license text, all rights are reserved by the copyright holder.
+
+Intent (provisional, see docs/design.md §11.5):
+  - Core engine, CLI, MCP server, Ghidra extension, test harness: open source,
+    Apache-2.0 recommended.
+  - Signature database, proprietary test corpus, hosted history service: proprietary,
+    maintained in separate repositories and NOT part of this repository.
+
+Copyright (c) 2026 Ryan Cole

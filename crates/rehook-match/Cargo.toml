@@ -1,0 +1,11 @@
+[package]
+name = "rehook-match"
+description = "Matching passes that propose old-to-new function candidates with evidence. Never decides acceptance."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Must not depend on rehook-verify (design §3.1).
+[dependencies]
+rehook-model.workspace = true

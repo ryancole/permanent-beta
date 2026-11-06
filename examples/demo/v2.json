@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "build": {
+    "id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "file_name": "editor.exe",
+    "version": "1.1.0",
+    "machine": "x64",
+    "pdb": { "guid": "00000000-0000-0000-0000-000000000002", "age": 1 }
+  },
+  "producer": { "tool": "hand-written-demo", "version": "0" },
+  "functions": [
+    {
+      "rva": "0x2000",
+      "size": 190,
+      "name": "CreateDocument",
+      "name_source": "pdb",
+      "normalized_hash": "nh:create-v2",
+      "strings": ["Untitled"],
+      "signature": {
+        "calling_convention": "fastcall",
+        "return_type": "Doc*",
+        "params": [{ "name": "app", "ty": "App*" }, { "name": "path", "ty": "const wchar_t*" }]
+      }
+    },
+    {
+      "rva": "0x2300",
+      "size": 96,
+      "normalized_hash": "nh:parse-config",
+      "strings": ["config.ini", "[settings]"]
+    },
+    {
+      "rva": "0x2500",
+      "size": 48,
+      "normalized_hash": "nh:checksum"
+    },
+    {
+      "rva": "0x2700",
+      "size": 48,
+      "normalized_hash": "nh:checksum"
+    },
+    {
+      "rva": "0x2900",
+      "size": 240,
+      "name": "SaveDocument",
+      "name_source": "pdb",
+      "normalized_hash": "nh:save-v2",
+      "strings": ["Saving %s"],
+      "signature": {
+        "calling_convention": "fastcall",
+        "return_type": "int",
+        "params": [
+          { "name": "doc", "ty": "Doc*" },
+          { "name": "path", "ty": "const wchar_t*" },
+          { "name": "flags", "ty": "uint32_t" }
+        ]
+      }
+    }
+  ]
+}

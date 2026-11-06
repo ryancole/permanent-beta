@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: demo repair (expects exit code 1 = needs review)
+        shell: bash
+        run: |
+          set +e
+          cargo run -q -p rehook-cli -- repair --old examples/demo/v1.json --new examples/demo/v2.json --hooks examples/demo/hooks.toml
+          code=$?
+          test "$code" -eq 1

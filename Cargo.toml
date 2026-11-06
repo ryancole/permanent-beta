@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+# License not chosen yet (see LICENSE and docs/design.md §11.5). Add `license = "..."` once decided.
+
+[workspace.dependencies]
+# Internal crates. Dependency rules are documented in docs/design.md §3.1 and CLAUDE.md.
+rehook-model = { path = "crates/rehook-model" }
+rehook-analysis = { path = "crates/rehook-analysis" }
+rehook-match = { path = "crates/rehook-match" }
+rehook-verify = { path = "crates/rehook-verify" }
+rehook-repair = { path = "crates/rehook-repair" }
+rehook-store = { path = "crates/rehook-store" }
+rehook-engine = { path = "crates/rehook-engine" }
+
+# External crates.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"

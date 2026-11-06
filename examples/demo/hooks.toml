@@ -1,0 +1,41 @@
+# Demo hook manifest (format: docs/design.md §7.1). Locators are valid for the v1 build.
+
+[[hook]]
+name = "CreateDocument"
+detour = "Hook_CreateDocument"
+criticality = "high"            # high => needs a behavioral pass; none recorded yet => review
+prototype = "Doc* __fastcall CreateDocument(App* app, const wchar_t* path)"
+
+[hook.target]
+build = "1111111111111111111111111111111111111111111111111111111111111111"
+rva = 0x1000
+symbol = "CreateDocument"
+
+[[hook]]
+name = "ParseConfig"
+detour = "Hook_ParseConfig"
+criticality = "normal"          # unnamed in both builds; matched by normalized hash => relocated
+
+[hook.target]
+build = "1111111111111111111111111111111111111111111111111111111111111111"
+rva = 0x1200
+
+[[hook]]
+name = "ChecksumBlock"
+detour = "Hook_ChecksumBlock"
+criticality = "normal"          # two identical copies in v2 => ambiguous, no candidate => review
+
+[hook.target]
+build = "1111111111111111111111111111111111111111111111111111111111111111"
+rva = 0x1400
+pattern = "48 8B C1 33 D2 ?? ??"
+
+[[hook]]
+name = "SaveDocument"
+detour = "Hook_SaveDocument"
+criticality = "normal"          # gained a parameter in v2 => signature changed => review
+
+[hook.target]
+build = "1111111111111111111111111111111111111111111111111111111111111111"
+rva = 0x1600
+symbol = "SaveDocument"
