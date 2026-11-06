@@ -126,6 +126,7 @@ flowchart LR
 | `permanent-beta-store` | Versioned mapping history, evidence, review queue persistence. | model |
 | `permanent-beta-engine` | Orchestrates analysis output → match → verify → repair. | model, match, verify, repair |
 | `permanent-beta-cli` | `pbeta` binary; argument parsing, I/O, exit codes. | engine, analysis, store, model |
+| `permanent-beta-corpus` | Test tooling: linker map parser, ground-truth answer keys (`pbeta-corpus`). Nothing depends on it. | model |
 | *(planned)* `permanent-beta-ai` | Proposers that call a local or remote model and emit `Candidate`s. | model |
 | *(planned)* `permanent-beta-mcp` | MCP server over the engine. | engine, store, model |
 | *(planned)* `permanent-beta-py` | PyO3 bindings for IDA / scripting. | engine, model |

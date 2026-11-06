@@ -28,11 +28,12 @@ crates/
   permanent-beta-store/     mapping history + review queue (JSON file now, SQLite planned)
   permanent-beta-engine/    orchestration: match → verify → repair
   permanent-beta-cli/       the `pbeta` binary
+  permanent-beta-corpus/    test tooling: map-file parser, answer keys (`pbeta-corpus`)
 integrations/
   ghidra/           Ghidra extension + headless exporter (planned, Java)
   ida/              IDA Pro plugin (planned, after repair is validated)
 harness/            C++ Detours harness for recording and replaying behavior (planned)
-corpus/             ground-truth corpus recipes and metrics (planned)
+corpus/             test fixtures + MSVC build script (answer keys from map files); real-world corpus planned
 examples/demo/      hand-written analysis exports + hook manifest for the end-to-end demo
 docs/design.md      architecture, data model, verification, review queue, open questions, risks
 ```

@@ -1,4 +1,18 @@
-# Ground-truth corpus (planned, M2)
+# Ground-truth corpus
+
+## Purpose-built fixtures (now)
+
+`fixtures/<name>/v1` and `v2` are small C++ programs where each function is one matching scenario. The script
+`build-fixtures.ps1` compiles them with MSVC under several flag sets and writes an answer key (`truth.json`)
+from the linker map files, using `pbeta-corpus truth`. See [fixtures/basic/README.md](fixtures/basic/README.md).
+
+```bash
+pwsh corpus/build-fixtures.ps1
+```
+
+Requires Visual Studio or Build Tools with the x64 C++ toolset. Output goes to `target/fixtures/` and isn't committed.
+
+## Real-world corpus (planned, M2)
 
 Recipes to build open-source C/C++ projects across real version tags with MSVC under several flag sets
 (`/O2`, `/OPT:ICF`, `/LTCG`, PGO), keeping PDBs. Matching runs on stripped copies; PDB names are used only for

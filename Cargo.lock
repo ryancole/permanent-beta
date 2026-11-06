@@ -180,6 +180,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "permanent-beta-corpus"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "permanent-beta-model",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "permanent-beta-engine"
 version = "0.0.1"
 dependencies = [

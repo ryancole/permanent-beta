@@ -11,6 +11,8 @@ stop plausible-but-wrong matching logic from merging.
   - `permanent-beta-analysis`, `permanent-beta-match`, `permanent-beta-verify`, `permanent-beta-repair`, `permanent-beta-store`: `permanent-beta-model` only
   - `permanent-beta-engine`: model, match, verify, repair
   - `permanent-beta-cli`: engine, analysis, store, model
+  - `permanent-beta-corpus` (test tooling): model now; may add engine and analysis for scoring. No pipeline crate
+    may depend on it: the answer key is for scoring only and must never reach analysis, matching or verification.
 - `permanent-beta-match` and `permanent-beta-verify` must never depend on each other. Matchers propose; verification judges.
 - No matcher, AI proposer or MCP tool may produce an accepted mapping without going through `permanent-beta-verify`.
 - Ambiguity yields no candidate (review), never a best guess.
