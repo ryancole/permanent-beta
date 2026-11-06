@@ -127,9 +127,26 @@ fn cmd_match(old: &Path, new: &Path, json: bool) -> Result<u8> {
             source_str(&r.candidate.source)
         );
     }
+    for a in &report.ambiguities {
+        let list = |rvas: &[rehook_model::Rva]| {
+            rvas.iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "{:<10} {:<10} {:<14} {} ({})",
+            list(&a.old),
+            list(&a.new),
+            "ambiguous",
+            a.matcher,
+            a.detail
+        );
+    }
     println!(
-        "\n{} candidates; {} old and {} new functions unmatched",
+        "\n{} candidates, {} ambiguous groups; {} old and {} new functions unmatched",
         report.reports.len(),
+        report.ambiguities.len(),
         report.unmatched_old.len(),
         report.unmatched_new.len()
     );

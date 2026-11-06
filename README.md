@@ -60,8 +60,8 @@ cargo run -p rehook-cli -- review list --store target/demo-store.json
 ```
 
 Expected `repair` outcome for the demo: `ParseConfig` relocated; `CreateDocument` needs review (high criticality,
-no behavioral tests yet); `SaveDocument` needs review (parameter count changed); `ChecksumBlock` needs review (no
-unique candidate, because two identical functions exist in v2). Exit code `1` = some hooks need review.
+no behavioral tests yet); `SaveDocument` needs review (parameter count changed); `ChecksumBlock` needs review as
+ambiguous (two identical functions exist in v2, and both are listed in its review item). Exit code `1` = some hooks need review.
 
 ## Exit codes
 

@@ -31,6 +31,10 @@ pub struct HookRepair {
     pub old: Option<Rva>,
     pub action: RepairAction,
     pub verification: Option<VerificationReport>,
+    /// Competing new-build functions when the match was ambiguous. Verified only to give the reviewer
+    /// evidence; never accepted automatically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<VerificationReport>,
 }
 
 impl HookRepair {
@@ -42,18 +46,22 @@ impl HookRepair {
 /// Decide the outcome for one hook.
 ///
 /// `old_fn` is the hook target in the old analysis, `report` the verification of its candidate (if any),
-/// `new_fn` the candidate's function in the new analysis.
+/// `new_fn` the candidate's function in the new analysis, and `alternatives` the verified competitors when
+/// matching found the target ambiguous. Alternatives only matter when there is no candidate; they are never
+/// accepted.
 pub fn decide(
     hook: &HookSpec,
     old_fn: Option<&FunctionFeatures>,
     report: Option<VerificationReport>,
     new_fn: Option<&FunctionFeatures>,
+    alternatives: Vec<VerificationReport>,
 ) -> HookRepair {
     let review = |reason, detail: String, report| HookRepair {
         hook: hook.name.clone(),
         old: old_fn.map(|f| f.rva),
         action: RepairAction::NeedsReview { reason, detail },
         verification: report,
+        alternatives: Vec::new(),
     };
 
     let Some(old_fn) = old_fn else {
@@ -64,11 +72,28 @@ pub fn decide(
         );
     };
     let (Some(report), Some(new_fn)) = (report, new_fn) else {
-        return review(
-            ReviewReason::Unmatched,
-            "no unique candidate in the new build".into(),
+        if alternatives.is_empty() {
+            return review(
+                ReviewReason::Unmatched,
+                "no candidate in the new build".into(),
+                None,
+            );
+        }
+        let rvas: Vec<String> = alternatives
+            .iter()
+            .map(|a| a.candidate.new.to_string())
+            .collect();
+        let mut repair = review(
+            ReviewReason::Ambiguous,
+            format!(
+                "{} functions in the new build are equally plausible ({}); the engine will not pick one",
+                rvas.len(),
+                rvas.join(", ")
+            ),
             None,
         );
+        repair.alternatives = alternatives;
+        return repair;
     };
 
     let sig_changed =
@@ -126,6 +151,7 @@ pub fn decide(
                 old: Some(old_fn.rva),
                 action,
                 verification: Some(report),
+                alternatives: Vec::new(),
             }
         }
     }
@@ -179,7 +205,12 @@ pub fn review_items(repairs: &[HookRepair], from: &BuildId, to: &BuildId) -> Vec
                 old: r.old,
                 reason: *reason,
                 detail: detail.clone(),
-                candidates: r.verification.iter().cloned().collect(),
+                candidates: r
+                    .verification
+                    .iter()
+                    .chain(&r.alternatives)
+                    .cloned()
+                    .collect(),
             }),
             _ => None,
         })
@@ -262,6 +293,7 @@ mod tests {
             Some(&func(0x10, 1)),
             Some(report(Verdict::Accepted)),
             Some(&func(0x20, 1)),
+            vec![],
         );
         assert_eq!(
             r.action,
@@ -279,6 +311,7 @@ mod tests {
             Some(&func(0x10, 1)),
             Some(report(Verdict::Accepted)),
             Some(&func(0x20, 2)),
+            vec![],
         );
         assert!(matches!(
             r.action,
@@ -294,8 +327,42 @@ mod tests {
         let manifest = HookManifest {
             hooks: vec![hook()],
         };
-        let r = decide(&hook(), Some(&func(0x10, 1)), None, None);
+        let r = decide(&hook(), Some(&func(0x10, 1)), None, None, vec![]);
         let out = rewrite_manifest(&manifest, &[r], &BuildId("new".into()));
         assert_eq!(out.hooks[0].target.build, BuildId("old".into()));
+    }
+
+    #[test]
+    fn no_candidate_and_no_alternatives_is_unmatched() {
+        let r = decide(&hook(), Some(&func(0x10, 1)), None, None, vec![]);
+        assert!(matches!(
+            r.action,
+            RepairAction::NeedsReview {
+                reason: ReviewReason::Unmatched,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ambiguity_goes_to_review_even_if_alternatives_verify() {
+        // Both competitors would pass verification on their own; the hook must still not resolve.
+        let mut a = report(Verdict::Accepted);
+        let mut b = report(Verdict::Accepted);
+        a.candidate.new = Rva(0x20);
+        b.candidate.new = Rva(0x30);
+        let r = decide(&hook(), Some(&func(0x10, 1)), None, None, vec![a, b]);
+
+        assert!(!r.is_resolved());
+        assert!(matches!(
+            r.action,
+            RepairAction::NeedsReview {
+                reason: ReviewReason::Ambiguous,
+                ..
+            }
+        ));
+        let items = review_items(&[r], &BuildId("old".into()), &BuildId("new".into()));
+        assert_eq!(items[0].reason, ReviewReason::Ambiguous);
+        assert_eq!(items[0].candidates.len(), 2);
     }
 }

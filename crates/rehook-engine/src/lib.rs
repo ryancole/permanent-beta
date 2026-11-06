@@ -2,10 +2,11 @@
 //!
 //! The engine never decides acceptance itself; it routes candidates through `rehook-verify`.
 
-use rehook_match::{Matcher, default_matchers, run_passes};
+use rehook_match::{MatchOutcome, Matcher, default_matchers, run_passes};
 use rehook_model::{
-    AnalysisExport, BuildId, Criticality, Decider, FunctionFeatures, HookManifest, HookSpec,
-    Mapping, MappingStatus, ReviewItem, Rva, VerificationReport,
+    Ambiguity, AnalysisExport, BuildId, Candidate, CandidateSource, Criticality, Decider, Evidence,
+    FunctionFeatures, HookManifest, HookSpec, Mapping, MappingStatus, ReviewItem, Rva,
+    VerificationReport,
 };
 use rehook_repair::{HookRepair, RepairAction, decide, review_items, rewrite_manifest};
 use rehook_verify::{Policy, Verifier};
@@ -23,6 +24,8 @@ pub struct MatchReport {
     pub from_build: BuildId,
     pub to_build: BuildId,
     pub reports: Vec<VerificationReport>,
+    /// Key groups the passes refused to resolve. Their functions also appear in `unmatched_*`.
+    pub ambiguities: Vec<Ambiguity>,
     pub unmatched_old: Vec<Rva>,
     pub unmatched_new: Vec<Rva>,
 }
@@ -55,7 +58,8 @@ impl Engine {
 
     /// Match every function and verify each candidate with the `normal` policy.
     pub fn match_builds(&self, old: &AnalysisExport, new: &AnalysisExport) -> MatchReport {
-        let candidates = run_passes(old, new, &self.matchers);
+        let outcome = run_passes(old, new, &self.matchers);
+        let candidates = &outcome.candidates;
         let policy = Policy::for_criticality(Criticality::Normal);
         let reports: Vec<VerificationReport> = candidates
             .iter()
@@ -82,6 +86,7 @@ impl Engine {
                 candidates.iter().any(|c| c.new == r)
             }),
             reports,
+            ambiguities: outcome.ambiguities.clone(),
         }
     }
 
@@ -92,7 +97,8 @@ impl Engine {
         old: &AnalysisExport,
         new: &AnalysisExport,
     ) -> RepairReport {
-        let candidates = run_passes(old, new, &self.matchers);
+        let outcome = run_passes(old, new, &self.matchers);
+        let candidates = &outcome.candidates;
         let (from, to) = (&old.build.id, &new.build.id);
 
         let repairs: Vec<HookRepair> = manifest
@@ -103,16 +109,16 @@ impl Engine {
                 let old_fn = resolve_old(hook, old);
                 let cand = old_fn.and_then(|f| candidates.iter().find(|c| c.old == f.rva));
                 let new_fn = cand.and_then(|c| new.function(c.new));
+                let policy = Policy::for_criticality(hook.criticality);
                 let report = match (cand, old_fn, new_fn) {
-                    (Some(c), Some(o), Some(n)) => Some(self.verifier.verify(
-                        c,
-                        o,
-                        n,
-                        Policy::for_criticality(hook.criticality),
-                    )),
+                    (Some(c), Some(o), Some(n)) => Some(self.verifier.verify(c, o, n, policy)),
                     _ => None,
                 };
-                decide(hook, old_fn, report, new_fn)
+                let alternatives = match (cand, old_fn) {
+                    (None, Some(o)) => self.alternatives(&outcome, o, new, policy),
+                    _ => Vec::new(),
+                };
+                decide(hook, old_fn, report, new_fn, alternatives)
             })
             .collect();
 
@@ -149,6 +155,47 @@ impl Engine {
             mappings,
             repairs,
         }
+    }
+
+    /// Verify each competitor of an ambiguous old function, purely as evidence for the reviewer.
+    /// `decide` routes these to review regardless of their verdicts.
+    fn alternatives(
+        &self,
+        outcome: &MatchOutcome,
+        old_fn: &FunctionFeatures,
+        new: &AnalysisExport,
+        policy: Policy,
+    ) -> Vec<VerificationReport> {
+        let groups: Vec<&Ambiguity> = outcome
+            .ambiguities
+            .iter()
+            .filter(|a| a.old.contains(&old_fn.rva))
+            .collect();
+        outcome
+            .competitors(old_fn.rva)
+            .into_iter()
+            .filter_map(|rva| {
+                let new_fn = new.function(rva)?;
+                let mine: Vec<&&Ambiguity> =
+                    groups.iter().filter(|a| a.new.contains(&rva)).collect();
+                let candidate = Candidate {
+                    old: old_fn.rva,
+                    new: rva,
+                    source: CandidateSource::Deterministic {
+                        matcher: mine.first().map(|a| a.matcher.clone()).unwrap_or_default(),
+                    },
+                    score: 0.0,
+                    evidence: mine
+                        .iter()
+                        .map(|a| Evidence {
+                            kind: "ambiguous".into(),
+                            detail: a.detail.clone(),
+                        })
+                        .collect(),
+                };
+                Some(self.verifier.verify(&candidate, old_fn, new_fn, policy))
+            })
+            .collect()
     }
 }
 

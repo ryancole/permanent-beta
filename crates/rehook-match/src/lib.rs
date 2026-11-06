@@ -3,8 +3,11 @@
 //! Invariants:
 //! - One-to-one: a function on either side is claimed at most once; earlier (stronger) passes win.
 //! - Uniqueness: a key shared by more than one unmatched function on either side yields no candidate.
+//!   It yields an [`Ambiguity`] instead, so review can show the competing functions.
 
-use rehook_model::{AnalysisExport, Candidate, CandidateSource, Evidence, FunctionFeatures, Rva};
+use rehook_model::{
+    Ambiguity, AnalysisExport, Candidate, CandidateSource, Evidence, FunctionFeatures, Rva,
+};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
@@ -16,9 +19,40 @@ pub struct MatchContext<'a> {
     pub matched_new: &'a HashSet<Rva>,
 }
 
+/// What one pass produced: unique candidates, plus key groups it refused to resolve.
+#[derive(Debug, Default)]
+pub struct Proposals {
+    pub candidates: Vec<Candidate>,
+    pub ambiguities: Vec<Ambiguity>,
+}
+
 pub trait Matcher {
     fn name(&self) -> &'static str;
-    fn propose(&self, ctx: &MatchContext<'_>) -> Vec<Candidate>;
+    fn propose(&self, ctx: &MatchContext<'_>) -> Proposals;
+}
+
+/// Result of all passes.
+#[derive(Debug, Default)]
+pub struct MatchOutcome {
+    pub candidates: Vec<Candidate>,
+    /// Ambiguities still open after all passes: only functions that no pass matched, and only groups
+    /// with at least one function left on each side. Sorted and deduplicated.
+    pub ambiguities: Vec<Ambiguity>,
+}
+
+impl MatchOutcome {
+    /// New-build functions that compete for `old` in an unresolved ambiguity. Sorted, deduplicated.
+    pub fn competitors(&self, old: Rva) -> Vec<Rva> {
+        let mut out: Vec<Rva> = self
+            .ambiguities
+            .iter()
+            .filter(|a| a.old.contains(&old))
+            .flat_map(|a| a.new.iter().copied())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 /// Default passes, strongest first.
@@ -36,10 +70,11 @@ pub fn run_passes(
     old: &AnalysisExport,
     new: &AnalysisExport,
     matchers: &[Box<dyn Matcher>],
-) -> Vec<Candidate> {
+) -> MatchOutcome {
     let mut matched_old = HashSet::new();
     let mut matched_new = HashSet::new();
     let mut accepted = Vec::new();
+    let mut ambiguities = Vec::new();
     loop {
         let before = accepted.len();
         for matcher in matchers {
@@ -50,37 +85,111 @@ pub fn run_passes(
                 matched_new: &matched_new,
             };
             let proposals = matcher.propose(&ctx);
-            for c in proposals {
+            for c in proposals.candidates {
                 if !matched_old.contains(&c.old) && !matched_new.contains(&c.new) {
                     matched_old.insert(c.old);
                     matched_new.insert(c.new);
                     accepted.push(c);
                 }
             }
+            ambiguities.extend(proposals.ambiguities);
         }
         if accepted.len() == before {
             break;
         }
     }
-    accepted
+
+    // Drop functions a pass matched after the ambiguity was recorded, then groups left empty on a side.
+    for a in &mut ambiguities {
+        a.old.retain(|r| !matched_old.contains(r));
+        a.new.retain(|r| !matched_new.contains(r));
+    }
+    ambiguities.retain(|a| !a.old.is_empty() && !a.new.is_empty());
+    ambiguities.sort_by(|a, b| (&a.old, &a.new, &a.matcher).cmp(&(&b.old, &b.new, &b.matcher)));
+    ambiguities.dedup();
+
+    MatchOutcome {
+        candidates: accepted,
+        ambiguities,
+    }
 }
 
-/// Pairs functions whose key is unique among unmatched functions on *both* sides. Sorted for determinism.
-pub fn unique_pairs<K: Hash + Eq>(
+/// Functions grouped by key among unmatched functions on both sides.
+#[derive(Debug, Default, PartialEq)]
+pub struct KeyGroups {
+    /// Key held by exactly one function on each side.
+    pub unique: Vec<(Rva, Rva)>,
+    /// Key present on both sides but held by more than one function on at least one side.
+    pub ambiguous: Vec<(Vec<Rva>, Vec<Rva>)>,
+}
+
+/// Group unmatched functions by `key`. Sorted for determinism.
+pub fn group_by_key<K: Hash + Eq>(
     ctx: &MatchContext<'_>,
     key: &dyn Fn(&FunctionFeatures) -> Option<K>,
-) -> Vec<(Rva, Rva)> {
+) -> KeyGroups {
     let old_ix = index(&ctx.old.functions, ctx.matched_old, key);
     let new_ix = index(&ctx.new.functions, ctx.matched_new, key);
-    let mut pairs: Vec<(Rva, Rva)> = old_ix
-        .iter()
-        .filter_map(|(k, olds)| {
-            let news = new_ix.get(k)?;
-            (olds.len() == 1 && news.len() == 1).then(|| (olds[0], news[0]))
-        })
-        .collect();
-    pairs.sort();
-    pairs
+    let mut groups = KeyGroups::default();
+    for (k, olds) in &old_ix {
+        let Some(news) = new_ix.get(k) else { continue };
+        if olds.len() == 1 && news.len() == 1 {
+            groups.unique.push((olds[0], news[0]));
+        } else {
+            let (mut o, mut n) = (olds.clone(), news.clone());
+            o.sort();
+            n.sort();
+            groups.ambiguous.push((o, n));
+        }
+    }
+    groups.unique.sort();
+    groups.ambiguous.sort();
+    groups
+}
+
+/// Shared body of the key-based passes: unique groups become candidates, the rest become ambiguities.
+/// `describe` explains the key using the (first) old function.
+fn propose_by_key<K: Hash + Eq>(
+    ctx: &MatchContext<'_>,
+    matcher: &str,
+    score: f32,
+    kind: &str,
+    key: &dyn Fn(&FunctionFeatures) -> Option<K>,
+    describe: &dyn Fn(&FunctionFeatures) -> String,
+) -> Proposals {
+    let groups = group_by_key(ctx, key);
+    let describe_rva = |rva: Rva| ctx.old.function(rva).map(describe).unwrap_or_default();
+    Proposals {
+        candidates: groups
+            .unique
+            .into_iter()
+            .map(|(old, new)| {
+                candidate(
+                    matcher,
+                    old,
+                    new,
+                    score,
+                    kind,
+                    format!("unique {}", describe_rva(old)),
+                )
+            })
+            .collect(),
+        ambiguities: groups
+            .ambiguous
+            .into_iter()
+            .map(|(old, new)| Ambiguity {
+                matcher: matcher.to_owned(),
+                detail: format!(
+                    "{} old and {} new functions share {}",
+                    old.len(),
+                    new.len(),
+                    describe_rva(old[0])
+                ),
+                old,
+                new,
+            })
+            .collect(),
+    }
 }
 
 fn index<K: Hash + Eq>(
@@ -127,25 +236,15 @@ impl Matcher for SymbolNameMatcher {
         "symbol-name"
     }
 
-    fn propose(&self, ctx: &MatchContext<'_>) -> Vec<Candidate> {
-        unique_pairs(ctx, &|f: &FunctionFeatures| f.name.clone())
-            .into_iter()
-            .map(|(old, new)| {
-                let name = ctx
-                    .old
-                    .function(old)
-                    .and_then(|f| f.name.clone())
-                    .unwrap_or_default();
-                candidate(
-                    self.name(),
-                    old,
-                    new,
-                    0.9,
-                    "name",
-                    format!("unique name `{name}` on both sides"),
-                )
-            })
-            .collect()
+    fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
+        propose_by_key(
+            ctx,
+            self.name(),
+            0.9,
+            "name",
+            &|f: &FunctionFeatures| f.name.clone(),
+            &|f: &FunctionFeatures| format!("name `{}`", f.name.as_deref().unwrap_or("")),
+        )
     }
 }
 
@@ -157,25 +256,15 @@ impl Matcher for NormalizedHashMatcher {
         "normalized-hash"
     }
 
-    fn propose(&self, ctx: &MatchContext<'_>) -> Vec<Candidate> {
-        unique_pairs(ctx, &|f: &FunctionFeatures| f.normalized_hash.clone())
-            .into_iter()
-            .map(|(old, new)| {
-                let hash = ctx
-                    .old
-                    .function(old)
-                    .and_then(|f| f.normalized_hash.clone())
-                    .unwrap_or_default();
-                candidate(
-                    self.name(),
-                    old,
-                    new,
-                    0.95,
-                    "normalized_hash",
-                    format!("unique hash {hash}"),
-                )
-            })
-            .collect()
+    fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
+        propose_by_key(
+            ctx,
+            self.name(),
+            0.95,
+            "normalized_hash",
+            &|f: &FunctionFeatures| f.normalized_hash.clone(),
+            &|f: &FunctionFeatures| format!("hash {}", f.normalized_hash.as_deref().unwrap_or("")),
+        )
     }
 }
 
@@ -187,28 +276,18 @@ impl Matcher for UniqueStringsMatcher {
         "unique-strings"
     }
 
-    fn propose(&self, ctx: &MatchContext<'_>) -> Vec<Candidate> {
-        unique_pairs(ctx, &string_set_key)
-            .into_iter()
-            .map(|(old, new)| {
-                let key = ctx
-                    .old
-                    .function(old)
-                    .and_then(string_set_key)
-                    .unwrap_or_default();
-                candidate(
-                    self.name(),
-                    old,
-                    new,
-                    0.7,
-                    "strings",
-                    format!(
-                        "unique referenced-string set [{}]",
-                        key.replace('\u{1f}', ", ")
-                    ),
-                )
-            })
-            .collect()
+    fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
+        propose_by_key(
+            ctx,
+            self.name(),
+            0.7,
+            "strings",
+            &string_set_key,
+            &|f: &FunctionFeatures| {
+                let key = string_set_key(f).unwrap_or_default();
+                format!("referenced-string set [{}]", key.replace('\u{1f}', ", "))
+            },
+        )
     }
 }
 
@@ -274,12 +353,13 @@ mod tests {
             vec![func(0x110, Some("f"), None), func(0x220, None, Some("h1"))],
         );
         let got = run_passes(&old, &new, &default_matchers());
-        let pairs: Vec<_> = got.iter().map(|c| (c.old.0, c.new.0)).collect();
+        let pairs: Vec<_> = got.candidates.iter().map(|c| (c.old.0, c.new.0)).collect();
         assert_eq!(pairs, vec![(0x10, 0x110), (0x20, 0x220)]);
+        assert!(got.ambiguities.is_empty());
     }
 
     #[test]
-    fn ambiguous_hash_yields_no_candidate() {
+    fn ambiguous_hash_yields_no_candidate_but_records_ambiguity() {
         let old = export("a", vec![func(0x10, None, Some("dup"))]);
         let new = export(
             "b",
@@ -288,7 +368,34 @@ mod tests {
                 func(0x200, None, Some("dup")),
             ],
         );
-        assert!(run_passes(&old, &new, &default_matchers()).is_empty());
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(got.candidates.is_empty());
+        assert_eq!(
+            got.ambiguities.len(),
+            1,
+            "recorded once despite the fixpoint loop"
+        );
+        assert_eq!(got.ambiguities[0].matcher, "normalized-hash");
+        assert_eq!(got.ambiguities[0].old, vec![Rva(0x10)]);
+        assert_eq!(got.ambiguities[0].new, vec![Rva(0x100), Rva(0x200)]);
+        assert_eq!(got.competitors(Rva(0x10)), vec![Rva(0x100), Rva(0x200)]);
+    }
+
+    #[test]
+    fn ambiguity_resolved_by_a_later_pass_is_dropped() {
+        // The hash pass sees two copies; the string pass then pairs 0x10 with 0x100 uniquely.
+        let mut f_old = func(0x10, None, Some("dup"));
+        f_old.strings = vec!["s".into()];
+        let mut f_new = func(0x100, None, Some("dup"));
+        f_new.strings = vec!["s".into()];
+        let old = export("a", vec![f_old]);
+        let new = export("b", vec![f_new, func(0x200, None, Some("dup"))]);
+
+        let got = run_passes(&old, &new, &default_matchers());
+        assert_eq!(got.candidates.len(), 1);
+        assert_eq!(got.candidates[0].new, Rva(0x100));
+        assert!(got.ambiguities.is_empty());
+        assert!(got.competitors(Rva(0x10)).is_empty());
     }
 
     #[test]
@@ -300,7 +407,7 @@ mod tests {
             "b",
             vec![func(0x100, Some("f"), None), func(0x200, None, Some("h"))],
         );
-        let got = run_passes(&old, &new, &default_matchers());
+        let got = run_passes(&old, &new, &default_matchers()).candidates;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].new, Rva(0x100));
     }

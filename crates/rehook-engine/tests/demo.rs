@@ -43,7 +43,18 @@ fn demo_repair_outcomes() {
         reason("CreateDocument"),
         Some(ReviewReason::InsufficientEvidence)
     );
-    assert_eq!(reason("ChecksumBlock"), Some(ReviewReason::Unmatched));
+    assert_eq!(reason("ChecksumBlock"), Some(ReviewReason::Ambiguous));
+    let checksum_item = report
+        .review_items
+        .iter()
+        .find(|i| i.hook.as_deref() == Some("ChecksumBlock"))
+        .unwrap();
+    let competitors: Vec<Rva> = checksum_item
+        .candidates
+        .iter()
+        .map(|c| c.candidate.new)
+        .collect();
+    assert_eq!(competitors, vec![Rva(0x2500), Rva(0x2700)]);
     assert_eq!(reason("SaveDocument"), Some(ReviewReason::SignatureChanged));
 
     assert_eq!(report.mappings.len(), 1);

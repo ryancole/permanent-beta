@@ -29,6 +29,16 @@ pub struct Candidate {
     pub evidence: Vec<Evidence>,
 }
 
+/// A key shared by several unmatched functions, so the pass refused to pick (design §5.2).
+/// Not a candidate: it exists so review can show the competing functions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ambiguity {
+    pub matcher: String,
+    pub old: Vec<Rva>,
+    pub new: Vec<Rva>,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckOutcome {
