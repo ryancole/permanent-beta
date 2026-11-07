@@ -1,23 +1,21 @@
-# Status — where we left off (2026-11-05)
+# Status — where we left off (2026-11-06)
 
-Last commit: `e8abb4e` on `master`, pushed. CI runs for the two latest pushes (`ee84771`, `e8abb4e`) were not
-checked. They include the first GitHub run of the zlib corpus step. If it fails, the likely cause is the
-runner's MSVC laying out code differently: adjust the baselines in `corpus/projects/zlib/expected.toml`, and keep
-wrong matches at 0.
+CI is green through `52b8665`, and the zlib corpus results on the GitHub runner match local builds. Latest work:
+the matched-callees pass (design §5.1 pass 5a).
 
 ## What works
 
 - **`pbeta analyze`** reads PE x64 executables with no symbols: functions from `.pdata` plus call targets,
   normalized and mnemonic hashes, callees in call order, strings, constants, imports, inferred register
   arguments, and entry hookability.
-- **`pbeta match` / `repair` / `review list`**: four matching passes (name, normalized hash, strings, call
-  graph); verification on parameters, strings, size, callers, callees, constants, imports and inferred
+- **`pbeta match` / `repair` / `review list`**: five matching passes (name, normalized hash, strings, matched
+  callees, call graph); verification on parameters, strings, size, callers, callees, constants, imports and inferred
   arguments, counting only evidence independent of the match; repair with review reasons (unmatched,
   ambiguous, verification failed, insufficient evidence, signature changed, not hookable); exit codes 0/1/2;
   updated manifest; append-only JSON store.
 - **Corpus gate** (CI, Windows): zero wrong matches, plus correct-match baselines.
   - Purpose-built fixture `basic` (`corpus/fixtures`): 3 flag sets.
-  - zlib v1.2.13 → v1.3 → v1.3.1 (`corpus/projects/zlib`): /O2 61 of 69 correct, /Od 150–152 of 163, 0 wrong.
+  - zlib v1.2.13 → v1.3 → v1.3.1 (`corpus/projects/zlib`): /O2 63 of 69 correct, /Od 154–156 of 163, 0 wrong.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score` and `pwsh corpus/build-projects.ps1 -Score`. Add
     `--misses` to `pbeta-corpus score` to list misses.
 
@@ -36,8 +34,9 @@ wrong matches at 0.
 
 ## Suggested next steps
 
-1. **Callee-based matching pass:** match a function by the set of already-matched functions it calls. It
-   targets most of the remaining zlib /O2 misses (`adler32`/`crc32` tail-call wrappers, small helpers).
+1. **Analyzer gap:** the 6 remaining zlib /O2 misses (`zcalloc`, `zcfree`, `_tr_init`, `_tr_align`,
+   `inflateReset`, `gzopen`) have no function in the export at all, so no matcher can reach them. Find out why
+   (no `.pdata` entry and not a direct call target?) and discover them.
 2. **Similarity matching for edited functions** (design §5.1 pass 6), with a best-vs-second-best margin.
    Fixture scenarios S3–S5 are still ambiguous or unmatched.
 3. **A second real-world project with more churn between releases** (e.g. SQLite or libcurl), so tuning isn't

@@ -64,6 +64,7 @@ pub fn default_matchers() -> Vec<Box<dyn Matcher>> {
         Box::new(SymbolNameMatcher),
         Box::new(NormalizedHashMatcher),
         Box::new(UniqueStringsMatcher),
+        Box::new(MatchedCalleesMatcher),
         Box::new(CallSequenceMatcher),
     ]
 }
@@ -133,8 +134,17 @@ pub fn group_by_key<K: Hash + Eq>(
     ctx: &MatchContext<'_>,
     key: &dyn Fn(&FunctionFeatures) -> Option<K>,
 ) -> KeyGroups {
-    let old_ix = index(&ctx.old.functions, ctx.matched_old, key);
-    let new_ix = index(&ctx.new.functions, ctx.matched_new, key);
+    group_by_keys(ctx, key, key)
+}
+
+/// Like [`group_by_key`], with a separate key function per build (for keys that refer to the other build).
+pub fn group_by_keys<K: Hash + Eq>(
+    ctx: &MatchContext<'_>,
+    old_key: &dyn Fn(&FunctionFeatures) -> Option<K>,
+    new_key: &dyn Fn(&FunctionFeatures) -> Option<K>,
+) -> KeyGroups {
+    let old_ix = index(&ctx.old.functions, ctx.matched_old, old_key);
+    let new_ix = index(&ctx.new.functions, ctx.matched_new, new_key);
     let mut groups = KeyGroups::default();
     for (k, olds) in &old_ix {
         let Some(news) = new_ix.get(k) else { continue };
@@ -162,7 +172,19 @@ fn propose_by_key<K: Hash + Eq>(
     key: &dyn Fn(&FunctionFeatures) -> Option<K>,
     describe: &dyn Fn(&FunctionFeatures) -> String,
 ) -> Proposals {
-    let groups = group_by_key(ctx, key);
+    propose_by_keys(ctx, matcher, score, kind, key, key, describe)
+}
+
+fn propose_by_keys<K: Hash + Eq>(
+    ctx: &MatchContext<'_>,
+    matcher: &str,
+    score: f32,
+    kind: &str,
+    old_key: &dyn Fn(&FunctionFeatures) -> Option<K>,
+    new_key: &dyn Fn(&FunctionFeatures) -> Option<K>,
+    describe: &dyn Fn(&FunctionFeatures) -> String,
+) -> Proposals {
+    let groups = group_by_keys(ctx, old_key, new_key);
     let describe_rva = |rva: Rva| ctx.old.function(rva).map(describe).unwrap_or_default();
     Proposals {
         candidates: groups
@@ -306,7 +328,69 @@ fn string_set_key(f: &FunctionFeatures) -> Option<String> {
     Some(s.join("\u{1f}"))
 }
 
-/// Pass 4: call-graph propagation (design §5.1 pass 5).
+/// Pass 4: identical code that calls the same already-matched functions (design §5.1 pass 5a).
+///
+/// Normalization masks call targets, so code that differs only in what it calls hashes the same, and the hash
+/// pass finds it ambiguous: e.g. zlib's `jmp`-only wrappers `adler32` → `adler32_z` and `crc32` → `crc32_z`.
+/// Key: normalized hash plus the callee list (in call order) mapped into the new build.
+///
+/// - Every callee must already be matched. A partly mapped list would treat unknown callees as equal.
+/// - A function with no callees has no key: its key would be the hash alone, which the hash pass already tried.
+/// - Several functions with the same code and the same mapped callees stay ambiguous.
+pub struct MatchedCalleesMatcher;
+
+type CalleeKey = (String, Vec<Rva>);
+
+impl Matcher for MatchedCalleesMatcher {
+    fn name(&self) -> &'static str {
+        "matched-callees"
+    }
+
+    fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
+        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|c| (c.old, c.new)).collect();
+        let old_key = |f: &FunctionFeatures| -> Option<CalleeKey> {
+            if f.callees.is_empty() {
+                return None;
+            }
+            let mapped: Option<Vec<Rva>> = f.callees.iter().map(|c| map.get(c).copied()).collect();
+            Some((f.normalized_hash.clone()?, mapped?))
+        };
+        // New callees are taken as they are: an unmatched one can't equal a mapped old callee, so it never
+        // produces a shared key.
+        let new_key = |f: &FunctionFeatures| -> Option<CalleeKey> {
+            if f.callees.is_empty() {
+                return None;
+            }
+            Some((f.normalized_hash.clone()?, f.callees.clone()))
+        };
+        let describe = |f: &FunctionFeatures| {
+            let callees: Vec<String> = f.callees.iter().map(|c| c.to_string()).collect();
+            format!(
+                "code {} calling matched [{}]",
+                f.normalized_hash.as_deref().unwrap_or(""),
+                callees.join(", ")
+            )
+        };
+        let mut proposals = propose_by_keys(
+            ctx,
+            self.name(),
+            0.9,
+            evidence_kind::CALLEES,
+            &old_key,
+            &new_key,
+            &describe,
+        );
+        for c in &mut proposals.candidates {
+            c.evidence.push(Evidence {
+                kind: evidence_kind::NORMALIZED_HASH.to_owned(),
+                detail: "identical normalized code".into(),
+            });
+        }
+        proposals
+    }
+}
+
+/// Pass 5: call-graph propagation (design §5.1 pass 5).
 ///
 /// For each already-matched caller, compare its unmatched callees in both builds.
 ///
@@ -892,6 +976,129 @@ mod tests {
         );
         let got = pairs(&old, &new);
         assert!(!got.iter().any(|&(o, _)| o == 0x20), "{got:?}");
+    }
+
+    // Matched-callees pass. Named functions are matched by name; `w` is a wrapper hash shared by every wrapper.
+
+    fn calls(rva: u64, hash: &str, callees: &[u64]) -> FunctionFeatures {
+        let mut f = func(rva, None, Some(hash));
+        f.callees = callees.iter().map(|&r| Rva(r)).collect();
+        f
+    }
+
+    fn matcher_of(old: &AnalysisExport, new: &AnalysisExport, old_rva: u64) -> Option<String> {
+        run_passes(old, new, &default_matchers())
+            .candidates
+            .iter()
+            .find(|c| c.old.0 == old_rva)
+            .map(|c| match &c.source {
+                CandidateSource::Deterministic { matcher } => matcher.clone(),
+                other => format!("{other:?}"),
+            })
+    }
+
+    #[test]
+    fn identical_wrappers_are_told_apart_by_their_matched_callees() {
+        // adler32 → adler32_z and crc32 → crc32_z: the same `jmp`, ambiguous by hash alone.
+        let old = export(
+            "a",
+            vec![
+                func(0x10, Some("adler32_z"), None),
+                func(0x20, Some("crc32_z"), None),
+                calls(0x30, "w", &[0x10]),
+                calls(0x40, "w", &[0x20]),
+            ],
+        );
+        let new = export(
+            "b",
+            vec![
+                func(0x110, Some("adler32_z"), None),
+                func(0x120, Some("crc32_z"), None),
+                calls(0x140, "w", &[0x120]),
+                calls(0x130, "w", &[0x110]),
+            ],
+        );
+        let got = pairs(&old, &new);
+        assert!(got.contains(&(0x30, 0x130)), "{got:?}");
+        assert!(got.contains(&(0x40, 0x140)), "{got:?}");
+        assert_eq!(
+            matcher_of(&old, &new, 0x30).as_deref(),
+            Some("matched-callees")
+        );
+    }
+
+    #[test]
+    fn wrappers_calling_the_same_function_stay_ambiguous() {
+        // Two identical wrappers of the same function in both builds: callees don't say which is which.
+        let old = export(
+            "a",
+            vec![
+                func(0x10, Some("f"), None),
+                calls(0x30, "w", &[0x10]),
+                calls(0x40, "w", &[0x10]),
+            ],
+        );
+        let new = export(
+            "b",
+            vec![
+                func(0x110, Some("f"), None),
+                calls(0x130, "w", &[0x110]),
+                calls(0x140, "w", &[0x110]),
+            ],
+        );
+        assert_eq!(pairs(&old, &new), vec![(0x10, 0x110)]);
+    }
+
+    #[test]
+    fn a_partly_matched_callee_list_is_not_a_key() {
+        // Old wrapper calls x and an unmatched u. New wrappers: one calls x and an unmatched v, one calls x and y.
+        // Ignoring the unmatched callees would pair 0x30 with 0x130, but u and v are unknown, not equal.
+        let old = export(
+            "a",
+            vec![
+                func(0x10, Some("x"), None),
+                func(0x20, Some("y"), None),
+                func(0x50, None, Some("u1")),
+                calls(0x30, "w", &[0x10, 0x50]),
+            ],
+        );
+        let new = export(
+            "b",
+            vec![
+                func(0x110, Some("x"), None),
+                func(0x120, Some("y"), None),
+                func(0x150, None, Some("v")),
+                calls(0x130, "w", &[0x110, 0x150]),
+                calls(0x140, "w", &[0x110, 0x120]),
+            ],
+        );
+        let got = pairs(&old, &new);
+        assert!(!got.iter().any(|&(o, _)| o == 0x30), "{got:?}");
+    }
+
+    #[test]
+    fn a_wrapper_whose_matched_callee_differs_is_not_proposed() {
+        // Old wrapper calls x; the only new wrapper with that code calls y. Same code, different target.
+        let old = export(
+            "a",
+            vec![
+                func(0x10, Some("x"), None),
+                func(0x20, Some("y"), None),
+                calls(0x30, "w", &[0x10]),
+                calls(0x40, "w", &[0x10]),
+            ],
+        );
+        let new = export(
+            "b",
+            vec![
+                func(0x110, Some("x"), None),
+                func(0x120, Some("y"), None),
+                calls(0x140, "w", &[0x120]),
+                calls(0x150, "w", &[0x120]),
+            ],
+        );
+        let got = pairs(&old, &new);
+        assert!(!got.iter().any(|&(o, _)| o == 0x30 || o == 0x40), "{got:?}");
     }
 
     #[test]

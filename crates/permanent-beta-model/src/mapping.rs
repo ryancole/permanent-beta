@@ -32,6 +32,8 @@ pub mod evidence_kind {
     pub const STRINGS: &str = "strings";
     /// Same position in the call sequence of an already-matched caller.
     pub const CALL_SEQUENCE: &str = "call_sequence";
+    /// Calls the same already-matched functions, in the same order (paired with identical normalized code).
+    pub const CALLEES: &str = "callees";
     /// One of several equally plausible competitors (review evidence only, never accepted).
     pub const AMBIGUOUS: &str = "ambiguous";
 }

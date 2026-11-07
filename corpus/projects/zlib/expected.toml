@@ -8,14 +8,15 @@
 # There are no per-scenario targets: real code isn't designed around scenarios.
 #
 # Baseline 2026-11-05 (first run): /O2 61 of 69 functions present in both builds, /Od 150 and 152 of 163.
-# Remaining /O2 misses are tiny wrappers: zcalloc, zcfree, _tr_init, _tr_align, inflateReset, gzopen
-# (unmatched) and adler32/crc32 (ambiguous: tail-call wrappers whose code is identical once the external
-# target is masked).
+# 2026-11-06, matched-callees pass: /O2 63 of 69, /Od 154 and 156 of 163 (adler32/crc32 at /O2;
+# adler32_combine, crc32_combine, gztell, gzoffset at /Od: identical code told apart by matched callees).
+# The remaining /O2 misses (zcalloc, zcfree, _tr_init, _tr_align, inflateReset, gzopen) have no function at
+# their RVA in the analysis export, so no matcher can see them: an analyzer gap, not a matching one.
 
 [gate.min_correct]
-"o2__v1.2.13__v1.3" = 61
-"o2__v1.3__v1.3.1" = 61
-"o2-icf__v1.2.13__v1.3" = 61
-"o2-icf__v1.3__v1.3.1" = 61
-"od__v1.2.13__v1.3" = 150
-"od__v1.3__v1.3.1" = 152
+"o2__v1.2.13__v1.3" = 63
+"o2__v1.3__v1.3.1" = 63
+"o2-icf__v1.2.13__v1.3" = 63
+"o2-icf__v1.3__v1.3.1" = 63
+"od__v1.2.13__v1.3" = 154
+"od__v1.3__v1.3.1" = 156

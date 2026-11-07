@@ -90,6 +90,8 @@ pub fn implied_checks(kind: &str) -> &'static [&'static str] {
         evidence_kind::STRINGS => &["string-refs"],
         // Paired because they sit at the same position under the same matched caller.
         evidence_kind::CALL_SEQUENCE => &["callers"],
+        // Paired because both call the same matched functions.
+        evidence_kind::CALLEES => &["callees"],
         _ => &[],
     }
 }
@@ -756,6 +758,29 @@ mod tests {
             &new.functions[1],
             Policy::for_criticality(Criticality::Normal),
         );
+        assert_eq!(r.verdict, Verdict::NeedsReview, "{:?}", r.checks);
+    }
+
+    #[test]
+    fn matched_callee_candidates_cannot_use_the_callee_check() {
+        // main was paired because it calls f' and g'; the callees check would only repeat that.
+        let (old, new) = call_graph(vec![Rva(0x110), Rva(0x120)]);
+        let candidates = [
+            cand(0x1, 0x101, evidence_kind::CALLEES),
+            cand(0x10, 0x110, evidence_kind::NAME),
+            cand(0x20, 0x120, evidence_kind::NAME),
+        ];
+        let ctx = VerifyContext::new(&old, &new, &candidates);
+        let r = Verifier::with_defaults().verify(
+            &ctx,
+            &candidates[0],
+            &old.functions[0],
+            &new.functions[0],
+            Policy::for_criticality(Criticality::Normal),
+        );
+        let callees = r.checks.iter().find(|c| c.check == "callees").unwrap();
+        assert_eq!(callees.outcome, CheckOutcome::Pass);
+        assert!(!callees.counted);
         assert_eq!(r.verdict, Verdict::NeedsReview, "{:?}", r.checks);
     }
 
