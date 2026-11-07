@@ -17,5 +17,6 @@ permanent-beta-engine.workspace = true
 permanent-beta-store.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

@@ -9,12 +9,13 @@ use permanent_beta_model::{
     Rva, VerificationReport,
 };
 use permanent_beta_repair::{
-    HookRepair, RepairAction, decide, from_review, review_items, rewrite_manifest,
+    HookRepair, RepairAction, decide, from_review, review_items, rewrite_manifest, stale_locator,
 };
-use permanent_beta_verify::{Policy, Verifier, VerifyContext};
+use permanent_beta_verify::{BehavioralRunner, Policy, Verifier, VerifyContext};
 use serde::Serialize;
 
 pub use permanent_beta_repair;
+pub use permanent_beta_verify;
 
 pub struct Engine {
     matchers: Vec<Box<dyn Matcher>>,
@@ -56,6 +57,11 @@ impl Engine {
 
     pub fn with_defaults() -> Self {
         Self::new(default_matchers(), Verifier::with_defaults())
+    }
+
+    /// The default passes and checks, with behavioral evidence from `runner` (design §6.2).
+    pub fn with_behavioral(runner: Box<dyn BehavioralRunner>) -> Self {
+        Self::new(default_matchers(), Verifier::with_behavioral(runner))
     }
 
     /// Match every function and verify each candidate with the `normal` policy.
@@ -122,7 +128,9 @@ impl Engine {
             .hooks
             .iter()
             .map(|hook| {
-                // TODO: if hook.target.build != old.build.id, route to review instead of trusting the locator.
+                if hook.target.build != old.build.id {
+                    return stale_locator(hook, from);
+                }
                 let old_fn = resolve_old(hook, old);
                 let reviewed = old_fn.and_then(|o| {
                     let m = prior.accepted.iter().find(|m| m.old == o.rva)?;
@@ -418,6 +426,34 @@ mod tests {
         };
         assert!(detail.contains("reviewer rejected 0x110"), "{detail}");
         assert!(r.review_items[0].candidates.is_empty());
+    }
+
+    #[test]
+    fn a_locator_bound_to_another_build_is_not_trusted() {
+        // The hook was written for build "z" (e.g. an earlier repair sent it to review). Its RVA happens to be a
+        // function in "a" with a unique match in "b"; relocating it would hook whatever "a" has at that address.
+        let old = export("a", vec![func(0x10, "k")]);
+        let new = export("b", vec![func(0x110, "k")]);
+        let mut stale = manifest();
+        stale.hooks[0].target.build = BuildId("z".into());
+        let r = Engine::with_defaults().repair(&stale, &old, &new);
+        assert!(r.needs_review());
+        assert_eq!(r.review_items[0].reason, ReviewReason::StaleLocator);
+        assert!(r.mappings.is_empty());
+        assert_eq!(
+            r.updated_manifest.hooks[0].target.build,
+            BuildId("z".into())
+        );
+        assert_eq!(r.updated_manifest.hooks[0].target.rva, Some(Rva(0x10)));
+
+        // Control: bound to the old build, the same hook is looked up and matched (this bare test function then
+        // lacks independent evidence, which is a different review reason).
+        let r = Engine::with_defaults().repair(&manifest(), &old, &new);
+        assert_eq!(r.repairs[0].old, Some(Rva(0x10)));
+        assert_eq!(
+            r.repairs[0].verification.as_ref().map(|v| v.candidate.new),
+            Some(Rva(0x110))
+        );
     }
 
     #[test]

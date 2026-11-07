@@ -11,6 +11,9 @@ use permanent_beta_model::{
 };
 use std::collections::{HashMap, HashSet};
 
+pub mod behavioral;
+pub use behavioral::TraceDiffRunner;
+
 /// What checks can see beyond the two functions: the other candidates of this run and call-graph indexes.
 ///
 /// The mapping holds *candidates*, not accepted mappings, so neighbour checks measure consistency with the rest
@@ -144,6 +147,11 @@ impl Verifier {
     }
 
     pub fn with_defaults() -> Self {
+        Self::with_behavioral(Box::new(NoBehavioralCorpus))
+    }
+
+    /// The default structural checks with this behavioral runner (e.g. a [`TraceDiffRunner`]).
+    pub fn with_behavioral(behavioral: Box<dyn BehavioralRunner>) -> Self {
         Self::new(
             vec![
                 Box::new(ParamCountCheck),
@@ -155,7 +163,7 @@ impl Verifier {
                 Box::new(ImportsCheck),
                 Box::new(InferredArgsCheck),
             ],
-            Box::new(NoBehavioralCorpus),
+            behavioral,
         )
     }
 

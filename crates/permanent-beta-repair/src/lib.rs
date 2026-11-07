@@ -176,6 +176,28 @@ pub fn decide(
     }
 }
 
+/// A hook whose locator is bound to another build than `old_build`. Its RVA is an address in that other build,
+/// so looking it up in the old analysis could land on an unrelated function. Typically a hook an earlier repair
+/// sent to review: it keeps its old binding until a reviewer decides it, or until it's repaired from its own build.
+pub fn stale_locator(hook: &HookSpec, old_build: &BuildId) -> HookRepair {
+    HookRepair {
+        hook: hook.name.clone(),
+        old: None,
+        action: RepairAction::NeedsReview {
+            reason: ReviewReason::StaleLocator,
+            detail: format!(
+                "locator is bound to build {}, not the old build {}; repair it from its own build, or decide its \
+                 earlier review item",
+                short(&hook.target.build),
+                short(old_build)
+            ),
+        },
+        verification: None,
+        alternatives: Vec::new(),
+        reviewed_by: None,
+    }
+}
+
 /// A hook whose target a reviewer already decided (an accepted human mapping for this build pair). Not
 /// re-verified here: the reviewer decided on a verification report, which is stored with the mapping.
 pub fn from_review(

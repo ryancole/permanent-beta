@@ -4,11 +4,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use permanent_beta_analysis::{Analyzer, export, native::NativePeAnalyzer};
 use permanent_beta_engine::Engine;
-use permanent_beta_engine::permanent_beta_repair::RepairAction;
+use permanent_beta_engine::permanent_beta_repair::{HookRepair, RepairAction};
+use permanent_beta_engine::permanent_beta_verify::{
+    TraceDiffRunner,
+    behavioral::{self, HookOutcome, TraceDiff},
+};
 use permanent_beta_model::{
-    CandidateSource, DecisionAction, HookManifest, PriorDecisions, ReviewStatus, Rva, Verdict,
+    CandidateSource, DecisionAction, HookManifest, PriorDecisions, ReviewStatus, Rva, Trace,
+    TraceEvent, Verdict,
 };
 use permanent_beta_store::{Choice, JsonFileStore, MappingStore};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -60,6 +66,39 @@ enum Command {
         /// Record accepted mappings and review items in this store, and honor its review decisions.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Behavioral evidence (design §7.3): a scenario trace of the old build with hooks at the old RVAs.
+        /// Needs --new-trace.
+        #[arg(long, requires = "new_trace")]
+        old_trace: Option<PathBuf>,
+        /// The same scenario on the new build with hooks at the candidates' RVAs. Needs --old-trace.
+        #[arg(long, requires = "old_trace")]
+        new_trace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare scenario call traces hook by hook (design §7.3). Exit code 1 if any hook's behavior differs, a
+    /// hook didn't fire or wasn't attached, the run crashed, or a hook sent to review was applied anyway.
+    TraceDiff {
+        /// Trace of the old build with the original hooks.
+        #[arg(
+            long,
+            conflicts_with = "baseline",
+            required_unless_present = "baseline"
+        )]
+        old: Option<PathBuf>,
+        /// Trace of the new build with the repaired hooks.
+        #[arg(long, requires = "old")]
+        new: Option<PathBuf>,
+        /// Check a single baseline trace instead: every hook must attach and fire.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// The manifest the (new) run used.
+        #[arg(long)]
+        hooks: PathBuf,
+        /// `pbeta repair --json` output for this step: hooks it sent to review must be held, and every hook
+        /// that wasn't attached must be one of them.
+        #[arg(long, conflicts_with = "baseline")]
+        repair: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -134,8 +173,39 @@ fn run(cli: Cli) -> Result<u8> {
             hooks,
             out,
             store,
+            old_trace,
+            new_trace,
             json,
-        } => cmd_repair(&old, &new, &hooks, out.as_deref(), store.as_deref(), json),
+        } => {
+            let traces = match (old_trace, new_trace) {
+                (Some(o), Some(n)) => Some((load_trace(&o)?, load_trace(&n)?)),
+                _ => None,
+            };
+            cmd_repair(
+                &old,
+                &new,
+                &hooks,
+                out.as_deref(),
+                store.as_deref(),
+                traces,
+                json,
+            )
+        }
+        Command::TraceDiff {
+            old,
+            new,
+            baseline,
+            hooks,
+            repair,
+            json,
+        } => cmd_trace_diff(
+            old.as_deref(),
+            new.as_deref(),
+            baseline.as_deref(),
+            &hooks,
+            repair.as_deref(),
+            json,
+        ),
         Command::Review { command } => match command {
             ReviewCommand::List { store, all } => cmd_review_list(&store, all),
             ReviewCommand::Accept {
@@ -212,20 +282,22 @@ fn cmd_repair(
     hooks: &Path,
     out: Option<&Path>,
     store: Option<&Path>,
+    traces: Option<(Trace, Trace)>,
     json: bool,
 ) -> Result<u8> {
     let (old, new) = (export::load(old)?, export::load(new)?);
-    let manifest: HookManifest = toml::from_str(
-        &std::fs::read_to_string(hooks).with_context(|| format!("reading {}", hooks.display()))?,
-    )
-    .with_context(|| format!("parsing hook manifest {}", hooks.display()))?;
+    let manifest = load_manifest(hooks)?;
 
     let mut opened = store.map(JsonFileStore::open).transpose()?;
     let prior = opened
         .as_ref()
         .map(|s| s.prior_decisions(&old.build.id, &new.build.id))
         .unwrap_or_else(PriorDecisions::default);
-    let report = Engine::with_defaults().repair_with(&manifest, &old, &new, &prior);
+    let engine = match traces {
+        Some((o, n)) => Engine::with_behavioral(Box::new(TraceDiffRunner::new(o, n))),
+        None => Engine::with_defaults(),
+    };
+    let report = engine.repair_with(&manifest, &old, &new, &prior);
 
     if let Some(out) = out {
         std::fs::write(out, toml::to_string_pretty(&report.updated_manifest)?)
@@ -268,6 +340,129 @@ fn cmd_repair(
     } else {
         EXIT_OK
     })
+}
+
+fn load_manifest(path: &Path) -> Result<HookManifest> {
+    toml::from_str(
+        &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+    )
+    .with_context(|| format!("parsing hook manifest {}", path.display()))
+}
+
+/// A JSON Lines trace (one `TraceEvent` per line) as the harness DLL writes it.
+fn load_trace(path: &Path) -> Result<Trace> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let events = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .map(|(i, l)| {
+            serde_json::from_str::<TraceEvent>(l)
+                .with_context(|| format!("{} line {}", path.display(), i + 1))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Trace { events })
+}
+
+/// Hooks `pbeta repair --json` sent to review, with their reasons.
+fn held_for_review(path: &Path) -> Result<BTreeMap<String, String>> {
+    #[derive(serde::Deserialize)]
+    struct Report {
+        repairs: Vec<HookRepair>,
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let report: Report = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .with_context(|| format!("parsing repair report {}", path.display()))?;
+    report
+        .repairs
+        .into_iter()
+        .filter_map(|r| match r.action {
+            RepairAction::NeedsReview { reason, .. } => Some((r.hook, reason)),
+            _ => None,
+        })
+        .map(|(hook, reason)| {
+            let reason = serde_json::to_value(reason)?;
+            Ok((hook, reason.as_str().unwrap_or("?").to_owned()))
+        })
+        .collect()
+}
+
+fn cmd_trace_diff(
+    old: Option<&Path>,
+    new: Option<&Path>,
+    baseline: Option<&Path>,
+    hooks: &Path,
+    repair: Option<&Path>,
+    json: bool,
+) -> Result<u8> {
+    let manifest = load_manifest(hooks)?;
+    let diff = match (old, new, baseline) {
+        (_, _, Some(b)) => behavioral::check_baseline(&load_trace(b)?, &manifest),
+        (Some(o), Some(n), None) => {
+            let held = repair.map(held_for_review).transpose()?;
+            behavioral::diff_traces(&load_trace(o)?, &load_trace(n)?, &manifest, held.as_ref())
+        }
+        _ => anyhow::bail!("give --old and --new, or --baseline"),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+    } else {
+        print_trace_diff(&diff);
+    }
+    Ok(if diff.passed() {
+        EXIT_OK
+    } else {
+        EXIT_NEEDS_REVIEW
+    })
+}
+
+fn print_trace_diff(diff: &TraceDiff) {
+    for h in &diff.hooks {
+        let verdict = if h.outcome.passed() { "ok  " } else { "FAIL" };
+        let what = match &h.outcome {
+            HookOutcome::Recorded { calls } => format!("recorded {calls} calls"),
+            HookOutcome::Same { calls } => format!("same {calls} calls"),
+            HookOutcome::Differs {
+                call,
+                expected,
+                got,
+            } => format!(
+                "call {call} differs: expected {}, got {}",
+                expected.as_deref().unwrap_or("no call"),
+                got.as_deref().unwrap_or("no call")
+            ),
+            HookOutcome::NotFired { expected } => {
+                format!("attached but never fired (old run: {expected} calls)")
+            }
+            HookOutcome::AttachFailed { status } => format!("attach failed: {status}"),
+            HookOutcome::HeldForReview { reason } => {
+                format!("not applied: needs review ({reason})")
+            }
+            HookOutcome::NotApplied { reason } => format!("not applied ({reason})"),
+            HookOutcome::SkippedUnreported { reason } => {
+                format!("not applied ({reason}) and not reported for review")
+            }
+            HookOutcome::AppliedDespiteReview { reason } => {
+                format!("applied although repair sent it to review ({reason})")
+            }
+            HookOutcome::NoBaseline { calls } => {
+                format!("no baseline to compare ({calls} calls, not checked)")
+            }
+            HookOutcome::Missing => "not in the trace".to_owned(),
+        };
+        println!("{verdict} {:<18} {what}", h.hook);
+    }
+    if !diff.completed {
+        println!("FAIL run did not exit normally (crash?): the trace has no end event");
+    }
+    let passed = diff.hooks.iter().filter(|h| h.outcome.passed()).count();
+    println!(
+        "\n{passed}/{} hooks ok{}",
+        diff.hooks.len(),
+        if diff.passed() { "" } else { "; FAILED" }
+    );
 }
 
 fn cmd_review_list(store: &Path, all: bool) -> Result<u8> {

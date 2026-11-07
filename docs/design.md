@@ -276,7 +276,10 @@ callers, callees, constants and imports. Failures always count, so evidence can'
 ### 6.2 Behavioral checks
 
 A `BehavioralRunner` replays recorded tests (§7.3) against the new build and returns pass, fail or inconclusive.
-The skeleton ships `NoBehavioralCorpus`, which always returns inconclusive.
+The default is `NoBehavioralCorpus`, which always returns inconclusive. `TraceDiffRunner` (implemented, M4) judges a
+candidate from two scenario traces: the calls a detour at the old RVA saw in the old run must equal the calls a
+detour at the candidate's RVA saw in the new run. It's inconclusive when either side has no hook there, and fails
+on any difference or a crashed run. `pbeta repair --old-trace --new-trace` uses it.
 
 ### 6.3 Acceptance policy
 
@@ -333,7 +336,7 @@ Each locator is bound to a specific `build`. A repaired manifest re-binds it to 
 |---|---|---|
 | `unchanged` | Verified, same RVA | Locator re-bound to the new build. |
 | `relocated` | Verified, new RVA | New RVA; planned: a regenerated, minimal-wildcard, uniqueness-checked AOB pattern. |
-| `needs_review` | Unmatched, ambiguous, verification failed, insufficient evidence, signature changed, or not hookable (the new function is under 5 bytes, a branch targets the patched bytes, or it is only a jump thunk) | Review item; the locator stays bound to the old build. |
+| `needs_review` | Unmatched, ambiguous, verification failed, insufficient evidence, signature changed, not hookable (the new function is under 5 bytes, a branch targets the patched bytes, or it is only a jump thunk), or stale locator (bound to another build than the one repaired from, e.g. a hook an earlier repair sent to review: its RVA says nothing about the old build) | Review item; the locator stays bound to the old build. |
 
 Planned generators (all output goes to review unless purely mechanical):
 
@@ -390,6 +393,16 @@ old-layout blobs to the new layout through the field mapping. Without that, a la
 
 Recommendation: start with 3 (it exercises the actual repaired hook) and add 1 for leaf-ish functions.
 **[Provisional]**
+
+**Implemented (M4): scenario trace diff.** `corpus/hooks` has a Detours hook DLL and launcher
+(`DetourCreateProcessWithDllExW`). The DLL reads the hook manifest and attaches a logging detour to each hook whose
+locator is bound to the running build (by the .exe's SHA-256), so hooks sent to review are never applied. It
+writes a JSON Lines trace (`TraceEvent` in the model): attach and skip records, then one `call` per call with
+arguments and result by value (no pointers, which differ between runs), and `end` on a normal exit.
+`pbeta trace-diff` compares two runs hook by hook. Given the repair report, it also checks that every hook repair
+sent to review was held and every hook not applied was reported. Not yet recorded: memory behind pointers, writes
+and callee sequences (the JSON test cases above), and comparison rules (`compare.ignore`). Each detour logs what
+its prototype makes meaningful, written by hand.
 
 **Privacy:** recorded memory can contain customer data. Recordings stay local by default, with redaction rules in
 the harness config. **[Validate]** with target customers.
@@ -545,8 +558,10 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
   `static`) and functions moving between object files (`truth.rs`, two-stage join). Renames can't be inferred
   safely, so they're declared per project in `recipe.psd1` after checking the sources (Lua 5.4.7 renamed six
   functions, zstd four so far). Otherwise correct matches get scored as wrong.
-- **Hook corpus:** a sample app plus a Detours hook DLL and recorded behavioral tests, rebuilt across versions, to
-  test the full repair loop end to end.
+- **Hook corpus** (`corpus/hooks`, M4): a sample app in three versions, a Detours hook DLL, and eight hooks
+  written against v1. `corpus/build-hooks.ps1 -Run` repairs them v1 → v2 → v3, checks every relocation against the
+  linker maps, runs each version under its repaired hooks and diffs the traces; a deliberately swapped pair of
+  hooks must be caught by both. CI gate: zero wrong relocations, identical traces, held hooks reported.
 
 ---
 
@@ -557,14 +572,17 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 ```
 pbeta analyze <binary> --out a.json                       # native PE x64 analyzer
 pbeta match   --old a.json --new b.json [--json]
-pbeta repair  --old a.json --new b.json --hooks hooks.toml [--out hooks.new.toml] [--store path] [--json]
+pbeta repair  --old a.json --new b.json --hooks hooks.toml [--out hooks.new.toml] [--store path]
+              [--old-trace a.jsonl --new-trace b.jsonl] [--json]
+pbeta trace-diff --old a.jsonl --new b.jsonl --hooks hooks.new.toml [--repair report.json] [--json]
+pbeta trace-diff --baseline a.jsonl --hooks hooks.toml   # every hook attached and fired
 pbeta review  list [--store path] [--all]
 pbeta review  accept <id> --reviewer <name> [--candidate <rva>] [--force] [--note text] [--store path]
 pbeta review  reject <id> --reviewer <name> [--note text] [--store path]
 ```
 
-Exit codes: `0` everything resolved · `1` some hooks need review · `2` error. That makes
-`pbeta repair` usable as a CI step that fails when a human is needed.
+Exit codes: `0` everything resolved · `1` some hooks need review (`trace-diff`: a hook's behavior differs) ·
+`2` error. That makes `pbeta repair` usable as a CI step that fails when a human is needed.
 
 ### 11.2 MCP server (step 2)
 
@@ -682,7 +700,7 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | **M1 Spikes** | Native PE x64 analyzer on one real binary; Ghidra headless exporter; `pdb` crate on MSVC PDBs | Both analyzers export the same functions for a sample binary (diff report) |
 | **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression |
-| **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions |
+| **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Harness, trace diff and loop done 2026-11-06 (6 of 8 hooks resolved v1 → v2, 4 of 8 v2 → v3, 0 wrong, all applied hooks behave the same); AOB, offsets header and adaptation proposals not started |
 | **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus |
 | **M6 Ghidra extension** | Exporter + review UI | Usable by an external tester |
 | Later | Hosted / on-prem history service, IDA plugin, ELF | Driven by §14 validation |

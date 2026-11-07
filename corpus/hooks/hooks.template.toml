@@ -1,0 +1,79 @@
+# Hooks written against the sample app's v1 (corpus/hooks/README.md). Manifest format: docs/design.md §7.1.
+#
+# `pbeta-corpus hook-manifest` turns this into the v1 manifest: it resolves each `symbol` to its RVA through v1's
+# linker map (as a hook author with v1's PDB would) and binds the locator to v1's build id. The symbol is then
+# dropped: repair sees only RVAs, like a shipped manifest for a binary without symbols.
+#
+# Every `detour` names a detour in hookdll.cpp, written against the v1 prototype below.
+
+[[hook]]
+name = "log_event"
+detour = "Hook_log_event"
+prototype = "void log_event(const char* msg, int code)"
+
+[hook.target]
+build = "v1"
+symbol = "log_event"
+
+[[hook]]
+name = "price_lookup"
+detour = "Hook_price_lookup"
+prototype = "int price_lookup(int sku)"
+
+[hook.target]
+build = "v1"
+symbol = "price_lookup"
+
+[[hook]]
+name = "stock_level"
+detour = "Hook_stock_level"
+prototype = "int stock_level(int sku)"
+
+[hook.target]
+build = "v1"
+symbol = "stock_level"
+
+[[hook]]
+name = "apply_discount"
+detour = "Hook_apply_discount"
+prototype = "int apply_discount(int cents, int percent)"
+
+[hook.target]
+build = "v1"
+symbol = "apply_discount"
+
+[[hook]]
+name = "order_add"
+detour = "Hook_order_add"
+prototype = "int order_add(Order* o, int sku, int qty)"
+
+[hook.target]
+build = "v1"
+symbol = "order_add"
+
+[[hook]]
+name = "format_receipt"
+detour = "Hook_format_receipt"
+prototype = "int format_receipt(char* buf, int cap, const Order* o, const char* customer)"
+
+[hook.target]
+build = "v1"
+symbol = "format_receipt"
+
+[[hook]]
+name = "checksum"
+detour = "Hook_checksum"
+prototype = "unsigned checksum(const unsigned char* data, int len)"
+
+[hook.target]
+build = "v1"
+symbol = "checksum"
+
+[[hook]]
+name = "ship_order"
+detour = "Hook_ship_order"
+prototype = "unsigned ship_order(Order* o, const char* customer, int discount)"
+
+[hook.target]
+build = "v1"
+symbol = "ship_order"

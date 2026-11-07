@@ -1,0 +1,38 @@
+# What each repair step of the M4 hook-repair loop must achieve (corpus/build-hooks.ps1 -Run).
+#
+# Always enforced: zero wrong relocations against the answer key (linker maps), and an identical trace for every
+# applied hook (pbeta trace-diff). Per step and flag set:
+#   min_resolved  hooks re-bound to the new build, all correctly. Raise it when the engine resolves more.
+#   held          hooks that must stay in review, never applied: a changed signature (log_event gains a
+#                 parameter in v2), identical code (checksum and checksum_backup in v3), and locators still bound
+#                 to v1 after the first step sent them to review (stale_locator).
+#
+# Hooks resolved today (2026-11-06):
+#   v1-v2: price_lookup, stock_level, order_add, format_receipt, checksum, ship_order. Review: log_event
+#          (signature changed), apply_discount (rewritten body: insufficient evidence at /O2, unmatched at /Od).
+#   v2-v3: price_lookup, stock_level, order_add, format_receipt. Review: checksum (ambiguous), ship_order (body
+#          edited: insufficient evidence), log_event and apply_discount (stale locators).
+
+[[step]]
+name = "v1-v2"
+flags = "o2"
+min_resolved = 6
+held = ["log_event"]
+
+[[step]]
+name = "v2-v3"
+flags = "o2"
+min_resolved = 4
+held = ["log_event", "apply_discount", "checksum"]
+
+[[step]]
+name = "v1-v2"
+flags = "od"
+min_resolved = 6
+held = ["log_event"]
+
+[[step]]
+name = "v2-v3"
+flags = "od"
+min_resolved = 4
+held = ["log_event", "apply_discount", "checksum"]

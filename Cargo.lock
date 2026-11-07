@@ -262,6 +262,7 @@ dependencies = [
  "permanent-beta-engine",
  "permanent-beta-model",
  "permanent-beta-store",
+ "serde",
  "serde_json",
  "toml",
 ]
@@ -332,6 +333,8 @@ name = "permanent-beta-verify"
 version = "0.0.1"
 dependencies = [
  "permanent-beta-model",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

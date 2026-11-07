@@ -9,3 +9,7 @@ publish.workspace = true
 # Must not depend on permanent-beta-match (design §3.1).
 [dependencies]
 permanent-beta-model.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

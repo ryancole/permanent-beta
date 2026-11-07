@@ -19,6 +19,9 @@ pub enum ReviewReason {
     SignatureChanged,
     /// Matched and verified, but a Detours-style entry patch can't be applied safely to the new function.
     NotHookable,
+    /// The hook's locator is bound to a different build than the one being repaired from (e.g. a hook an
+    /// earlier repair sent to review), so its RVA says nothing about the old build.
+    StaleLocator,
     /// Proposed by an AI proposer and awaiting a human.
     AiProposal,
 }

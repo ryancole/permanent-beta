@@ -40,3 +40,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./corpus/build-projects.ps1 -Score
+      - name: hook-repair loop (Detours hooks repaired v1 -> v2 -> v3 and run; zero wrong relocations, identical traces)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./corpus/build-hooks.ps1 -Run

@@ -48,3 +48,14 @@ To see what wasn't matched:
 ```bash
 cargo run -q -p permanent-beta-corpus -- score --built target/corpus/zlib --expected corpus/projects/zlib/expected.toml --misses
 ```
+
+## Hook-repair loop (M4)
+
+`hooks/` holds a sample app in three versions, a Detours hook DLL with its launcher, and the hooks written
+against v1. `build-hooks.ps1 -Run` builds them (cloning Microsoft Detours at a pinned commit into
+`target/hooks-src/`), repairs the hooks v1 → v2 → v3 with `pbeta repair`, runs each version under its repaired
+hooks, and diffs the call traces. See [hooks/README.md](hooks/README.md).
+
+```bash
+pwsh corpus/build-hooks.ps1 -Run
+```

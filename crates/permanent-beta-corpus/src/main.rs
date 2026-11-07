@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use permanent_beta_corpus::{
     expected::Expected,
-    fixture, map,
+    fixture, hooks, map,
     truth::{GroundTruth, Scope},
 };
+use permanent_beta_model::{AnalysisExport, HookManifest};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -53,6 +54,55 @@ enum Command {
         #[arg(long)]
         misses: bool,
     },
+    /// Write the v1 hook manifest from a template whose locators name symbols (corpus/hooks).
+    HookManifest {
+        #[arg(long)]
+        template: PathBuf,
+        /// Linker map of the build the hooks are written for.
+        #[arg(long)]
+        map: PathBuf,
+        /// `pbeta analyze` output of that build (for its build id).
+        #[arg(long)]
+        analysis: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Check a repaired hook manifest against the answer key. Exits 1 on any wrong relocation, or when a step's
+    /// expectations (--expected) aren't met.
+    HookCheck {
+        #[arg(long)]
+        old_map: PathBuf,
+        #[arg(long)]
+        new_map: PathBuf,
+        /// The manifest repair started from.
+        #[arg(long)]
+        old_hooks: PathBuf,
+        /// The repaired manifest.
+        #[arg(long)]
+        new_hooks: PathBuf,
+        #[arg(long)]
+        old_analysis: PathBuf,
+        #[arg(long)]
+        new_analysis: PathBuf,
+        /// corpus/hooks/expected.toml; with --flags and --step, also enforce that step's baseline.
+        #[arg(long, requires_all = ["flags", "step"])]
+        expected: Option<PathBuf>,
+        #[arg(long)]
+        flags: Option<String>,
+        #[arg(long)]
+        step: Option<String>,
+    },
+    /// Swap two hooks' RVAs: a deliberately wrong relocation for negative controls.
+    HookSwap {
+        #[arg(long)]
+        hooks: PathBuf,
+        #[arg(long)]
+        a: String,
+        #[arg(long)]
+        b: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<ExitCode> {
@@ -98,6 +148,83 @@ fn main() -> Result<ExitCode> {
                 ExitCode::SUCCESS
             })
         }
+        Command::HookManifest {
+            template,
+            map,
+            analysis,
+            out,
+        } => {
+            let build = load_analysis(&analysis)?.build.id;
+            let manifest =
+                hooks::manifest_from_template(&load_hooks(&template)?, &load(&map)?, &build)
+                    .map_err(anyhow::Error::msg)?;
+            write_hooks(&manifest, &out)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::HookCheck {
+            old_map,
+            new_map,
+            old_hooks,
+            new_hooks,
+            old_analysis,
+            new_analysis,
+            expected,
+            flags,
+            step,
+        } => {
+            let checks = hooks::check_hooks(
+                &load_hooks(&old_hooks)?,
+                &load_hooks(&new_hooks)?,
+                &load(&old_map)?,
+                &load(&new_map)?,
+                &load_analysis(&old_analysis)?.build.id,
+                &load_analysis(&new_analysis)?.build.id,
+            );
+            let expected = expected
+                .map(|p| -> Result<hooks::HookExpected> {
+                    let text = std::fs::read_to_string(&p)
+                        .with_context(|| format!("reading {}", p.display()))?;
+                    hooks::HookExpected::parse(&text)
+                        .with_context(|| format!("parsing {}", p.display()))
+                })
+                .transpose()?;
+            let (flags, step) = (flags.unwrap_or_default(), step.unwrap_or_default());
+            let step_expected = expected.as_ref().and_then(|e| e.step(&step, &flags));
+            if expected.is_some() && step_expected.is_none() {
+                anyhow::bail!(
+                    "no [[step]] with name = {step:?} and flags = {flags:?} in the expected file"
+                );
+            }
+            for c in &checks {
+                let what = match &c.truth {
+                    hooks::HookTruth::Correct { symbol, old, new } => {
+                        format!("correct  {old} -> {new} ({symbol})")
+                    }
+                    hooks::HookTruth::Wrong { detail, .. } => format!("WRONG    {detail}"),
+                    hooks::HookTruth::Held => "held     (not re-bound: review)".to_owned(),
+                };
+                println!("answer key {:<18} {what}", c.hook);
+            }
+            let failures = hooks::gate(&checks, step_expected);
+            for f in &failures {
+                println!("answer key FAIL {f}");
+            }
+            Ok(if failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Command::HookSwap {
+            hooks: path,
+            a,
+            b,
+            out,
+        } => {
+            let swapped = hooks::swap(&load_hooks(&path)?, &a, &b).map_err(anyhow::Error::msg)?;
+            write_hooks(&swapped, &out)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Truth {
             old,
             new,
@@ -126,6 +253,23 @@ fn parse_rename(s: &str) -> Result<(String, String), String> {
         Some((a, b)) if !a.is_empty() && !b.is_empty() => Ok((a.to_owned(), b.to_owned())),
         _ => Err(format!("expected old=new, got `{s}`")),
     }
+}
+
+fn load_hooks(path: &Path) -> Result<HookManifest> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn write_hooks(manifest: &HookManifest, path: &Path) -> Result<()> {
+    std::fs::write(path, toml::to_string_pretty(manifest)?)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn load_analysis(path: &Path) -> Result<AnalysisExport> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
 fn load(path: &Path) -> Result<map::MapFile> {

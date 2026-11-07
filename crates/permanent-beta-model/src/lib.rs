@@ -7,9 +7,11 @@ pub mod hook;
 pub mod ids;
 pub mod mapping;
 pub mod review;
+pub mod trace;
 
 pub use analysis::*;
 pub use hook::*;
 pub use ids::*;
 pub use mapping::*;
 pub use review::*;
+pub use trace::*;
