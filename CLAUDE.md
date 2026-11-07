@@ -10,10 +10,12 @@ stop plausible-but-wrong matching logic from merging.
   - `permanent-beta-model`: none
   - `permanent-beta-analysis`, `permanent-beta-match`, `permanent-beta-verify`, `permanent-beta-repair`, `permanent-beta-store`: `permanent-beta-model` only
   - `permanent-beta-engine`: model, match, verify, repair
-  - `permanent-beta-cli`: engine, analysis, store, model
+  - `permanent-beta-ai`: model only. It proposes candidates; callers verify them and queue them for review.
+  - `permanent-beta-cli`: engine, analysis, store, model, ai. `pbeta propose` queues AI proposals for review and
+    never writes a mapping.
   - `permanent-beta-mcp`: engine, store, model. It may only read the store and add review items to it
     (`tools::ReviewQueue`); no tool may decide a review item or write a mapping.
-  - `permanent-beta-corpus` (test tooling): model now; may add engine and analysis for scoring. No pipeline crate
+  - `permanent-beta-corpus` (test tooling): model now; may add engine, analysis and ai for scoring. No pipeline crate
     may depend on it: the answer key is for scoring only and must never reach analysis, matching or verification.
 - `permanent-beta-match` and `permanent-beta-verify` must never depend on each other. Matchers propose; verification judges.
 - No matcher, AI proposer or MCP tool may produce an accepted mapping without going through `permanent-beta-verify`.

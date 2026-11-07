@@ -127,7 +127,7 @@ flowchart LR
 | `permanent-beta-engine` | Orchestrates analysis output → match → verify → repair. | model, match, verify, repair |
 | `permanent-beta-cli` | `pbeta` binary; argument parsing, I/O, exit codes. | engine, analysis, store, model |
 | `permanent-beta-corpus` | Test tooling: linker map parser, ground-truth answer keys (`pbeta-corpus`). Nothing depends on it. | model |
-| *(planned)* `permanent-beta-ai` | Proposers that call a local or remote model and emit `Candidate`s. | model |
+| `permanent-beta-ai` | AI proposer (§8): shortlist, prompt, strict answer parsing, model backends, recordings. Emits `Candidate`s only. | model |
 | `permanent-beta-mcp` | MCP server over the engine (`pbeta-mcp`, §11.2). Reads the store and adds review items; never decides one. | engine, store, model |
 | *(planned)* `permanent-beta-py` | PyO3 bindings for IDA / scripting. | engine, model |
 
@@ -228,7 +228,7 @@ neighbourhood passes.
 | 5a | Matched callees | `normalized_hash` + callee list mapped through earlier matches, unique on both sides | Implemented (`MatchedCalleesMatcher`). Normalization masks call targets, so code differing only in what it calls is hash-ambiguous (zlib's `adler32`/`crc32` `jmp` wrappers). Every callee must already be matched; no callees means no key. On zlib: /O2 61→63, /Od 150→154 and 152→156, 0 wrong. |
 | 5 | Call-graph propagation | Callees of matched callers | Implemented (`CallSequenceMatcher`), iterated to fixpoint. **Candidate** only when a callee's code occurs exactly once among the caller's unmatched callees in both builds, which doesn't depend on call order. Pairing by call *position* (or repeated identical code by order) is a **review suggestion** (an ambiguity), never a candidate: MSVC reorders calls to side-effect-free functions, and in the `basic` fixture that paired a deleted function with an edited one. The corpus gate caught it. |
 | 6 | Structural similarity | Weighted feature similarity among anchored pairs, best-vs-second-best margin on both sides | Implemented (`SimilarityMatcher`), a **weak** pass: it runs only once every stronger pass has stopped. Candidates share an anchor (matched callee or caller, string, constant, import). Score: weighted mean of code (mnemonic counts), shape (blocks, edges), size, matched callees and callers, strings, constants, imports. Candidate only if mutual best, score ≥ 0.75 and ≥ 0.05 ahead of the runner-up on both sides, size ≥ 16 bytes (**calibrated** 2026-11-07 with `pbeta-corpus sweep` over 21 corpus variants: wrong matches appear at score 0.70 and none at ≥ 0.75 for any margin 0.02–0.2 or size 8–32; margin 0.1 → 0.05 added 108 correct review candidates. Weights and the bucket limit are still **[Guess]**. Recheck with the sweep whenever the corpus grows). Vetoed by disagreeing matched callers; a new function that's the only callee of an unmatched new function gives an ambiguity (body moved behind a wrapper, zstd 1.5.6). Its evidence implies the neighbour, string, constant, import and size checks, so its matches go to review. On the corpus: 0 wrong; zstd /O2 433–511 → 623–669 correct, Lua /O2 642–667 → 706–714. |
-| 7 | AI proposer | Pseudocode comparison for leftovers | Optional (§8). |
+| 7 | AI proposer | Feature comparison for leftovers | Not a pass: run separately (`pbeta propose`, §8), and its candidates only go to review. |
 
 ### 5.2 Invariants
 
@@ -461,6 +461,41 @@ Design points:
 - **Measured.** AI proposals are tracked separately in corpus metrics (precision and acceptance rate). If they don't
   beat "send to review", they're switched off.
 
+**Implemented (2026-11-07):** `permanent-beta-ai`, used by `pbeta propose` and `pbeta-corpus score-ai`.
+
+- **Shortlist:** for an old function matching left unmatched, the 5 **[Guess]** closest unmatched new functions
+  by a cheap score (mnemonic counts, matched neighbours, strings, constants, imports, size). It only orders what
+  the model sees.
+- **Prompt:** features as JSON, not code: size, blocks, register arguments, top mnemonic counts, strings (at most
+  16, each clipped to 120 characters), constants, imports, and neighbours labelled `N:<new rva>` when matched.
+  Candidates are named `c1`..`c5`; the system prompt says strings are data and that `none` beats a guess.
+- **Answer:** `{choice, confidence, rationale}`, with `choice` one of the offered names or `none`, enforced by the
+  JSON Schema sent with the request and again on parsing; anything else is discarded. The rationale (at most 600
+  characters) becomes the candidate's `ai` evidence.
+- **Backend:** Claude through the Claude Code CLI in print mode (`claude -p --json-schema`), which runs on a Claude
+  subscription; default model `claude-opus-5-5`. All tools, MCP servers and settings are off and it runs in an
+  empty directory, so a reply can only be text. This is a remote provider: `pbeta propose` refuses to call it
+  without `--allow-remote`, and every exchange, prompt and reply, is appended to a log (`--log`). The same log
+  replays answers (`--replay`), which keeps corpus scores repeatable. A local OpenAI-compatible backend is not
+  built yet (the `Model` trait is the seam).
+- **Routing:** every proposal is verified with `Engine::verify_candidate` (same checks and policy) and queued as an
+  `ai_proposal` review item (`proposal_review_item`, shared with the MCP server). Nothing writes a mapping; a
+  human decides with `pbeta review`.
+- **Scoring:** `pbeta-corpus score-ai` asks about the in-scope unmatched old functions of each variant (deleted
+  ones included, where `none` is the right answer) and reports correct and wrong proposals, how many would pass
+  the normal policy, right and missed `none`s, and counterparts the shortlist didn't include.
+
+**First measurement (2026-11-07, `claude-opus-5-5`, Lua and zstd /O2, 20 questions per variant, 63 asked):**
+32 proposals, 31 correct, 1 wrong (precision 96.9%). 30 of the correct ones would pass the normal policy, and the
+wrong one wouldn't. The wrong one is a near miss: zstd 1.5.6 inlined one object file's `static` copy of
+`BIT_initDStream`, and Claude picked another object file's copy of the same function, which the per-object answer
+key counts as wrong. 31 answers were `none`, all for functions that do have a counterpart (none of the asked
+functions was deleted), mostly families of near-identical functions: Lua's one-line `math_*` wrappers and zstd's
+`ZSTD_compressBlock_fast_noDict_*` instantiations. The true counterpart wasn't on the shortlist twice. About 4
+seconds per question. Recorded in `corpus/ai/claude-opus-5-5.jsonl`; replaying it needs byte-identical builds.
+So far it beats sending these functions to review: half of them come with a correct suggestion, and verification
+caught the one wrong suggestion. Not yet measured: /Od, deleted functions, other models.
+
 ---
 
 ## 9. Data model and storage
@@ -611,6 +646,8 @@ pbeta trace-diff --old a.jsonl [--old older.jsonl]... --new b.jsonl --hooks hook
 pbeta trace-diff --baseline a.jsonl --hooks hooks.toml   # every hook attached and fired
 pbeta pattern <binary> --rva <rva>                        # shortest unique AOB pattern
 pbeta header  --hooks a.toml [--hooks b.toml]... --out hooks.gen.h
+pbeta propose --old a.json --new b.json [--store path] [--rva <rva>]... [--limit n] [--model id]
+              (--allow-remote | --replay) [--log path] [--json]     # AI proposals into review (§8)
 pbeta review  list [--store path] [--all]
 pbeta review  accept <id> --reviewer <name> [--candidate <rva>] [--force] [--note text] [--store path]
 pbeta review  reject <id> --reviewer <name> [--note text] [--store path]
@@ -754,6 +791,6 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression. Done 2026-11-07 apart from the SQLite store (deferred until history size or the hosted service needs it) |
 | **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (at /O2 7 of 8 hooks resolved v1 → v2 and 6 of 8 v2 → v3, at /Od 6 and 5, including a high-criticality hook and two hooks without structural evidence through their trial runs; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Not built: the recording harness (per-call test cases) and struct-layout proposals |
-| **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus. MCP server and review explanations done 2026-11-07; the proposer and its corpus metrics not started |
+| **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus. MCP server, review explanations, the proposer (`pbeta propose`) and its corpus scoring (`pbeta-corpus score-ai`) built 2026-11-07, first measured on Lua and zstd /O2: 31 of 32 proposals correct, the wrong one not passing verification (§8) |
 | **M6 Ghidra extension** | Exporter + review UI | Usable by an external tester |
 | Later | Hosted / on-prem history service, IDA plugin, ELF | Driven by §14 validation |

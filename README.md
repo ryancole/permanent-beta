@@ -30,6 +30,7 @@ crates/
   permanent-beta-engine/    orchestration: match → verify → repair
   permanent-beta-cli/       the `pbeta` binary
   permanent-beta-mcp/       `pbeta-mcp`: MCP server for agents (read, explain, propose; never accept)
+  permanent-beta-ai/        AI proposer for unmatched functions (Claude via Claude Code); proposals go to review
   permanent-beta-corpus/    test tooling: map-file parser, answer keys (`pbeta-corpus`)
 integrations/
   ghidra/           Ghidra extension + headless exporter (planned, Java)

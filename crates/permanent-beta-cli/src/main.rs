@@ -13,8 +13,8 @@ use permanent_beta_engine::permanent_beta_verify::{
     behavioral::{self, HookOutcome, TraceDiff},
 };
 use permanent_beta_model::{
-    BuildId, CandidateSource, DecisionAction, HookManifest, PriorDecisions, ReviewStatus, Rva,
-    Trace, TraceEvent, Verdict,
+    BuildId, CandidateSource, Criticality, DecisionAction, HookManifest, PriorDecisions,
+    ReviewStatus, Rva, Trace, TraceEvent, Verdict,
 };
 use permanent_beta_store::{Choice, JsonFileStore, MappingStore};
 use std::collections::BTreeMap;
@@ -133,6 +133,47 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Ask an AI model about functions matching left unmatched (design §8). Each proposal is verified like any
+    /// candidate and queued for review (`--store`); none is ever accepted. Exit code 1 if any were queued.
+    Propose {
+        #[arg(long)]
+        old: PathBuf,
+        #[arg(long)]
+        new: PathBuf,
+        /// Queue proposals in this store's review queue. Without it they're only printed.
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Only these old functions (default: every unmatched one). Repeatable.
+        #[arg(long)]
+        rva: Vec<Rva>,
+        /// Ask about at most this many functions.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Claude model id.
+        #[arg(long, default_value = "claude-opus-5-5")]
+        model: String,
+        #[arg(long)]
+        effort: Option<String>,
+        /// The Claude Code CLI (it runs on your Claude subscription after `/login`).
+        #[arg(long, env = "PBETA_CLAUDE", default_value = "claude")]
+        claude: PathBuf,
+        /// Every exchange with the model, prompt and reply, is appended here, and recorded answers are replayed
+        /// from it.
+        #[arg(long, default_value = ".pbeta/ai-log.jsonl")]
+        log: PathBuf,
+        /// Claude is a remote model: function features (strings included) leave this machine. Required to ask
+        /// it (design §8: remote providers are opt-in and logged).
+        #[arg(long)]
+        allow_remote: bool,
+        /// Only use answers already recorded in --log; never call the model.
+        #[arg(long, conflicts_with = "allow_remote")]
+        replay: bool,
+        /// Candidates shown per question.
+        #[arg(long, default_value_t = permanent_beta_ai::shortlist::SHORTLIST_LEN)]
+        shortlist: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and decide the review queue.
     Review {
         #[command(subcommand)]
@@ -235,6 +276,51 @@ fn run(cli: Cli) -> Result<u8> {
             })
         }
         Command::Pattern { binary, rva } => cmd_pattern(&binary, rva),
+        Command::Propose {
+            old,
+            new,
+            store,
+            rva,
+            limit,
+            model,
+            effort,
+            claude,
+            log,
+            allow_remote,
+            replay,
+            shortlist,
+            json,
+        } => {
+            anyhow::ensure!(
+                allow_remote || replay,
+                "Claude is a remote model: function features, strings included, would leave this machine. Pass \
+                 --allow-remote to ask it (every exchange is logged to {}), or --replay to use recorded answers",
+                log.display()
+            );
+            let live: Option<Box<dyn permanent_beta_ai::backend::Model>> = (!replay).then(|| {
+                Box::new(permanent_beta_ai::backend::ClaudeCode {
+                    program: claude,
+                    model: model.clone(),
+                    effort,
+                }) as Box<dyn permanent_beta_ai::backend::Model>
+            });
+            let backend = permanent_beta_ai::backend::Cassette::open(
+                &log,
+                &format!("claude-code:{model}"),
+                live,
+            )
+            .map_err(anyhow::Error::msg)?;
+            cmd_propose(ProposeArgs {
+                old: &old,
+                new: &new,
+                store: store.as_deref(),
+                only: &rva,
+                limit,
+                shortlist,
+                model: &backend,
+                json,
+            })
+        }
         Command::Header { hooks, out } => cmd_header(&hooks, &out),
         Command::TraceDiff {
             old,
@@ -478,6 +564,108 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
         EXIT_NEEDS_REVIEW
     } else {
         EXIT_OK
+    })
+}
+
+struct ProposeArgs<'a> {
+    old: &'a Path,
+    new: &'a Path,
+    store: Option<&'a Path>,
+    only: &'a [Rva],
+    limit: Option<usize>,
+    shortlist: usize,
+    model: &'a dyn permanent_beta_ai::backend::Model,
+    json: bool,
+}
+
+fn cmd_propose(a: ProposeArgs) -> Result<u8> {
+    use permanent_beta_ai::{Outcome, Proposer, shortlist::Matched};
+    let (old, new) = (export::load(a.old)?, export::load(a.new)?);
+    let engine = Engine::with_defaults();
+    let report = engine.match_builds(&old, &new);
+    let pairs: Vec<_> = report.reports.iter().map(|r| r.candidate.clone()).collect();
+    let targets: Vec<Rva> = if a.only.is_empty() {
+        report.unmatched_old.clone()
+    } else {
+        a.only.to_vec()
+    };
+    let targets = &targets[..a.limit.unwrap_or(usize::MAX).min(targets.len())];
+
+    let mut proposer = Proposer::new(a.model);
+    proposer.shortlist_len = a.shortlist;
+    let m = Matched::new(&old, &new, &pairs);
+    let mut rows = Vec::new();
+    let mut items = Vec::new();
+    for &rva in targets {
+        let asked = proposer.ask_with(&m, &old, &new, rva);
+        // Every proposal goes through the engine's verification, then to review: never accepted here.
+        let verified = match &asked.outcome {
+            Outcome::Proposed { candidate } => {
+                engine.verify_candidate(&old, &new, candidate, Criticality::Normal)
+            }
+            _ => None,
+        };
+        if let Some(v) = &verified {
+            items.push(
+                permanent_beta_engine::permanent_beta_repair::proposal_review_item(
+                    v,
+                    &old.build.id,
+                    &new.build.id,
+                ),
+            );
+        }
+        rows.push((asked, verified));
+    }
+    if let Some(path) = a.store {
+        JsonFileStore::open(path)?.enqueue_review(&items)?;
+    }
+
+    if a.json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|(asked, v)| serde_json::json!({ "asked": asked, "verification": v }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        for (asked, v) in &rows {
+            let what = match (&asked.outcome, v) {
+                (Outcome::Proposed { candidate }, Some(v)) => format!(
+                    "proposed {} (confidence {:.2}); verification: {}",
+                    candidate.new,
+                    candidate.score,
+                    verdict_str(v.verdict)
+                ),
+                (Outcome::Proposed { candidate }, None) => {
+                    format!("proposed {} (couldn't be verified)", candidate.new)
+                }
+                (Outcome::Abstained { confidence, .. }, _) => {
+                    format!(
+                        "none of {} candidates (confidence {confidence:.2})",
+                        asked.shortlist.len()
+                    )
+                }
+                (Outcome::NoShortlist, _) => "no unmatched function close enough to ask".into(),
+                (Outcome::Failed { error }, _) => format!("FAILED: {error}"),
+            };
+            println!("{:<10} {what}", asked.old.to_string());
+        }
+        println!(
+            "\n{} asked, {} proposals{}",
+            rows.len(),
+            items.len(),
+            match a.store {
+                Some(p) => format!(
+                    " queued for review in {} (decide with `pbeta review`)",
+                    p.display()
+                ),
+                None => " (not queued: no --store)".into(),
+            }
+        );
+    }
+    Ok(if items.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_NEEDS_REVIEW
     })
 }
 

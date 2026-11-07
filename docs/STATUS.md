@@ -50,6 +50,13 @@ What's new:
 - **`pbeta trace-diff`** (design §7.3, scenario trace diff): compares two runs' traces hook by hook (missed,
   different or failed calls, crashes, review hooks applied or silently skipped). `pbeta repair --old-trace
   --new-trace` adds the same evidence to verification (`TraceDiffRunner`).
+- **AI proposer** (M5, design §8): new `permanent-beta-ai` crate. For each function matching left unmatched it
+  shows Claude (through the Claude Code CLI, on a Claude subscription) the function's features and its 5
+  closest unmatched new functions, and takes a strict `{choice, confidence, rationale}` answer, `none` allowed.
+  `pbeta propose` verifies each proposal and queues it for review; it needs `--allow-remote` and logs every
+  exchange, which `--replay` reuses. `pbeta-corpus score-ai` scores answers against the answer keys. First
+  measurement on Lua and zstd /O2 (63 questions): 32 proposals, 31 correct; the wrong one (another object
+  file's copy of the same static function) doesn't pass verification; 31 cautious `none`s.
 - **`pbeta-mcp`** (M5, design §11.2): MCP server over stdio. Agents list builds, read functions and candidates,
   run verification, list and explain review items, and propose mappings, which are verified and queued as
   `ai_proposal` items. Agents can't accept; `pbeta review accept` decides.
@@ -86,14 +93,14 @@ What's new:
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
 | Ghidra extension, hosted service, IDA plugin | Not started (designed) |
-| AI fallback | Agents can propose through the MCP server; the built-in proposer and its corpus metrics not started (design §8) |
+| AI fallback | Built and measured (M5): 31 of 32 proposals correct on Lua and zstd /O2, the wrong one rejected by verification (design §8) |
 | License choice, market validation | Open |
 
 ## Suggested next steps
 
-1. **AI proposer** (M5, design §8): a local-model proposer for unmatched functions, through the same
-   verification, measured separately on the corpus (precision, acceptance rate). The MCP server already takes
-   proposals; this adds one that runs without an agent and gets scored.
+1. **Widen the AI measurement:** /Od variants, deleted functions (where `none` is right), and whether showing
+   instruction text would separate near-identical families (Lua `math_*`, zstd `*_noDict_*`), which it now
+   declines. Then decide whether `pbeta propose` should run as part of `repair` for unmatched hook targets.
 2. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.
 3. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
    proposals; both lean on PDB or Ghidra types.

@@ -400,6 +400,41 @@ pub fn review_items(repairs: &[HookRepair], from: &BuildId, to: &BuildId) -> Vec
         .collect()
 }
 
+/// The review item for a candidate proposed from outside the engine (the AI proposer, an MCP client), after
+/// verification. It waits for a human whatever the verdict: an AI never accepts (design §8). The id is stable
+/// per (old, new, build pair), so proposing the same pair again refreshes the item.
+pub fn proposal_review_item(
+    report: &VerificationReport,
+    from: &BuildId,
+    to: &BuildId,
+) -> ReviewItem {
+    let (o, n) = (report.candidate.old, report.candidate.new);
+    let by = match &report.candidate.source {
+        permanent_beta_model::CandidateSource::Ai { model } => model.clone(),
+        permanent_beta_model::CandidateSource::Human { reviewer } => reviewer.clone(),
+        permanent_beta_model::CandidateSource::Deterministic { matcher } => matcher.clone(),
+    };
+    let verdict = match report.verdict {
+        Verdict::Accepted => "it would pass the acceptance policy",
+        Verdict::NeedsReview => "it needs review",
+        Verdict::Rejected => "rejected",
+    };
+    ReviewItem {
+        id: format!("ai:{o}:{n}:{}:{}", short(from), short(to)),
+        hook: None,
+        from_build: from.clone(),
+        to_build: to.clone(),
+        old: Some(o),
+        reason: ReviewReason::AiProposal,
+        detail: format!(
+            "proposed by {by}: {o} -> {n}; verification says {verdict}; a human decides"
+        ),
+        candidates: vec![report.clone()],
+        proposals: Vec::new(),
+        status: Default::default(),
+    }
+}
+
 fn short(id: &BuildId) -> &str {
     id.0.get(..12).unwrap_or(&id.0)
 }

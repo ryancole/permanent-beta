@@ -1,0 +1,15 @@
+[package]
+name = "permanent-beta-ai"
+description = "AI proposer (design §8): asks a model which new-build function an unmatched old function became. Proposes only; verification judges."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Allowed internal dependencies: model only (design §3.1). It never sees verification or the store, so it can
+# only propose.
+[dependencies]
+permanent-beta-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"

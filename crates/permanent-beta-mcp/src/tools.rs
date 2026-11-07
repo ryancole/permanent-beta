@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use permanent_beta_engine::Engine;
+use permanent_beta_engine::permanent_beta_repair::proposal_review_item;
 use permanent_beta_model::{
     AnalysisExport, Candidate, CandidateSource, CheckOutcome, Criticality, DecisionAction,
     Evidence, ReviewDecision, ReviewItem, ReviewReason, ReviewStatus, Rva, Verdict,
@@ -272,26 +273,8 @@ impl Tools {
             .into_iter()
             .find(|r| r.candidate.old == o)
             .map(|r| r.candidate.new);
-        let model = match &report.candidate.source {
-            CandidateSource::Ai { model } => model.clone(),
-            _ => String::new(),
-        };
-        let id = format!("ai:{o}:{n}:{}:{}", short(&from.0), short(&to.0));
-        let item = ReviewItem {
-            id: id.clone(),
-            hook: None,
-            from_build: from.clone(),
-            to_build: to.clone(),
-            old: Some(o),
-            reason: ReviewReason::AiProposal,
-            detail: format!(
-                "proposed by {model}: {o} -> {n}; verification says {}; a human decides",
-                verdict(report.verdict)
-            ),
-            candidates: vec![report.clone()],
-            proposals: Vec::new(),
-            status: ReviewStatus::Open,
-        };
+        let item = proposal_review_item(&report, from, to);
+        let id = item.id.clone();
         queue.enqueue(&item)?;
         Ok(json!({
             "review_id": id,

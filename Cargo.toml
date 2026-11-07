@@ -18,6 +18,7 @@ permanent-beta-verify = { path = "crates/permanent-beta-verify" }
 permanent-beta-repair = { path = "crates/permanent-beta-repair" }
 permanent-beta-store = { path = "crates/permanent-beta-store" }
 permanent-beta-engine = { path = "crates/permanent-beta-engine" }
+permanent-beta-ai = { path = "crates/permanent-beta-ai" }
 permanent-beta-mcp = { path = "crates/permanent-beta-mcp" }
 
 # External crates.

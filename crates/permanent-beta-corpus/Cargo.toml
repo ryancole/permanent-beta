@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 permanent-beta-model.workspace = true
 anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,3 +22,4 @@ toml.workspace = true
 # depend on permanent-beta-corpus (CLAUDE.md).
 permanent-beta-analysis.workspace = true
 permanent-beta-engine.workspace = true
+permanent-beta-ai.workspace = true

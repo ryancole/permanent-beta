@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use permanent_beta_analysis::native::pattern::{Pattern, PatternIndex};
+use permanent_beta_corpus::ai_score;
 use permanent_beta_corpus::{
     expected::Expected,
     fixture, hooks, map,
@@ -126,6 +127,35 @@ enum Command {
         #[arg(long, value_delimiter = ',', default_value = "8,16,32")]
         sizes: Vec<u32>,
     },
+    /// Score the AI proposer (design §8) on built variants: ask about unmatched in-scope old functions, verify
+    /// each proposal, and judge it against the answer key. Replays answers recorded in --log; with
+    /// --allow-remote, asks Claude (through the Claude Code CLI) for the rest and records them.
+    ScoreAi {
+        /// Built directories (like `score --built`). Repeatable.
+        #[arg(long, required = true)]
+        built: Vec<PathBuf>,
+        /// Only variants whose path contains this.
+        #[arg(long)]
+        variant: Option<String>,
+        /// Questions per variant, lowest addresses first.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value = "claude-opus-5-5")]
+        model: String,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long, env = "PBETA_CLAUDE", default_value = "claude")]
+        claude: PathBuf,
+        /// Recorded exchanges: replayed, and appended to when asking live.
+        #[arg(long, default_value = "corpus/ai/claude-opus-5-5.jsonl")]
+        log: PathBuf,
+        /// Ask Claude for answers not in the log. Function features from the corpus leave this machine.
+        #[arg(long)]
+        allow_remote: bool,
+        /// Print every asked function with its judgement.
+        #[arg(long)]
+        rows: bool,
+    },
     /// Swap two hooks' RVAs: a deliberately wrong relocation for negative controls.
     HookSwap {
         #[arg(long)]
@@ -181,6 +211,84 @@ fn main() -> Result<ExitCode> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        Command::ScoreAi {
+            built,
+            variant,
+            limit,
+            model,
+            effort,
+            claude,
+            log,
+            allow_remote,
+            rows,
+        } => {
+            use permanent_beta_ai::backend::{Cassette, ClaudeCode, Model};
+            let live: Option<Box<dyn Model>> = allow_remote.then(|| {
+                Box::new(ClaudeCode {
+                    program: claude,
+                    model: model.clone(),
+                    effort,
+                }) as Box<dyn Model>
+            });
+            let backend = Cassette::open(&log, &format!("claude-code:{model}"), live)
+                .map_err(anyhow::Error::msg)?;
+            eprintln!(
+                "{} recorded answers in {}{}",
+                backend.len(),
+                log.display(),
+                if allow_remote {
+                    "; asking Claude for the rest"
+                } else {
+                    "; replay only"
+                }
+            );
+            let mut variants: Vec<PathBuf> = Vec::new();
+            for b in &built {
+                let mut v: Vec<PathBuf> = std::fs::read_dir(b)
+                    .with_context(|| format!("reading {}", b.display()))?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.join("truth.json").exists())
+                    .filter(|p| {
+                        variant
+                            .as_ref()
+                            .is_none_or(|s| p.to_string_lossy().contains(s.as_str()))
+                    })
+                    .collect();
+                v.sort();
+                variants.extend(v);
+            }
+            anyhow::ensure!(!variants.is_empty(), "no built variants");
+            let mut all = ai_score::AiTotals::default();
+            for dir in &variants {
+                let (truth, old, new) = fixture::load_variant(dir)?;
+                let (t, judged) = ai_score::score_variant(&truth, &old, &new, &backend, limit);
+                println!(
+                    "{}",
+                    ai_score::render_totals(&dir.display().to_string(), &t)
+                );
+                if rows {
+                    for r in &judged {
+                        let got = match &r.asked.outcome {
+                            permanent_beta_ai::Outcome::Proposed { candidate } => {
+                                candidate.new.to_string()
+                            }
+                            permanent_beta_ai::Outcome::Failed { error } => format!("({error})"),
+                            _ => "-".into(),
+                        };
+                        println!(
+                            "    {:<14} {:<34} old {} truth {:?} got {got}",
+                            r.judgement,
+                            r.names.join("/"),
+                            r.old,
+                            r.truth.iter().map(|t| t.to_string()).collect::<Vec<_>>()
+                        );
+                    }
+                }
+                all.add(&t);
+            }
+            println!("{}", ai_score::render_totals("all", &all));
+            Ok(ExitCode::SUCCESS)
         }
         Command::Sweep {
             built,

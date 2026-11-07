@@ -241,6 +241,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "permanent-beta-ai"
+version = "0.0.1"
+dependencies = [
+ "permanent-beta-model",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "permanent-beta-analysis"
 version = "0.0.1"
 dependencies = [
@@ -258,6 +268,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "permanent-beta-ai",
  "permanent-beta-analysis",
  "permanent-beta-engine",
  "permanent-beta-model",
@@ -273,6 +284,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "permanent-beta-ai",
  "permanent-beta-analysis",
  "permanent-beta-engine",
  "permanent-beta-model",
