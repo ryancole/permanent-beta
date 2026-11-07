@@ -128,7 +128,7 @@ flowchart LR
 | `permanent-beta-cli` | `pbeta` binary; argument parsing, I/O, exit codes. | engine, analysis, store, model |
 | `permanent-beta-corpus` | Test tooling: linker map parser, ground-truth answer keys (`pbeta-corpus`). Nothing depends on it. | model |
 | *(planned)* `permanent-beta-ai` | Proposers that call a local or remote model and emit `Candidate`s. | model |
-| *(planned)* `permanent-beta-mcp` | MCP server over the engine. | engine, store, model |
+| `permanent-beta-mcp` | MCP server over the engine (`pbeta-mcp`, §11.2). Reads the store and adds review items; never decides one. | engine, store, model |
 | *(planned)* `permanent-beta-py` | PyO3 bindings for IDA / scripting. | engine, model |
 
 **Rule that matters most:** `match` and `verify` do not depend on each other. Matchers propose, verification judges,
@@ -626,6 +626,24 @@ Tools: `list_builds`, `get_function`, `get_candidates`, `get_evidence`, `propose
 Accepting a review item requires a human decision through CLI or UI, or an explicit per-project setting that lets
 policy-passing proposals through. **[Provisional]**
 
+**Implemented (2026-11-07):** `pbeta-mcp --analysis <export>... [--store <path>]`, MCP over stdio (JSON-RPC 2.0,
+one message per line; `initialize`, `ping`, `tools/list`, `tools/call`; protocol 2024-11-05 to 2025-06-18). Written
+by hand rather than on an SDK: four methods, no async runtime.
+
+- All tools above except `get_evidence`: `get_candidates` with an `rva` returns the candidate with its evidence
+  and every check, which is what `get_evidence` would have.
+- `propose_mapping` builds an AI candidate (`source: ai`, evidence kind `ai` set by the server, never by the
+  model; it implies no check, so every check counts), verifies it with the engine's checks and policy
+  (`Engine::verify_candidate`, this pair's match as neighbour context), and adds an `ai_proposal` review item.
+  Whatever the verdict, it waits for a human. A pair a reviewer rejected is refused. Model name and rationale
+  are length-bounded and stored as data.
+- No tool decides an item or writes a mapping: the server's whole write surface is "add a review item"
+  (`tools::ReviewQueue`). The per-project setting for letting policy-passing proposals through is not built.
+- The store is reopened for every call, so decisions made with `pbeta review` meanwhile are seen and never
+  overwritten.
+- Results are JSON text. Strings from the binary are marked as data in tool descriptions and results (design
+  §8: a binary can carry prompt injections).
+
 REA (github.com/morluto/rea) is the reference for agent-facing tool ergonomics. Its interface has not been reviewed
 yet. **[Validate]**
 
@@ -736,6 +754,6 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression |
 | **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (at /O2 7 of 8 hooks resolved v1 → v2 and 6 of 8 v2 → v3, at /Od 6 and 5, including a high-criticality hook and two hooks without structural evidence through their trial runs; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Not built: the recording harness (per-call test cases) and struct-layout proposals |
-| **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus |
+| **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus. MCP server and review explanations done 2026-11-07; the proposer and its corpus metrics not started |
 | **M6 Ghidra extension** | Exporter + review UI | Usable by an external tester |
 | Later | Hosted / on-prem history service, IDA plugin, ELF | Driven by §14 validation |

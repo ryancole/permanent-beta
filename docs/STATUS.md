@@ -44,6 +44,9 @@ What's new:
 - **`pbeta trace-diff`** (design §7.3, scenario trace diff): compares two runs' traces hook by hook (missed,
   different or failed calls, crashes, review hooks applied or silently skipped). `pbeta repair --old-trace
   --new-trace` adds the same evidence to verification (`TraceDiffRunner`).
+- **`pbeta-mcp`** (M5, design §11.2): MCP server over stdio. Agents list builds, read functions and candidates,
+  run verification, list and explain review items, and propose mappings, which are verified and queued as
+  `ai_proposal` items. Agents can't accept; `pbeta review accept` decides.
 - **`pbeta repair --trial-out / --earlier / --new-binary`, `pbeta pattern`, `pbeta header`** (M4): trial
   manifests, repair from a hook's own build, AOB patterns, the offsets header, and prototype proposals in review
   items (see above, and design §7.2).
@@ -75,14 +78,16 @@ What's new:
 | 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim); struct layouts not started |
 | 4. Behavioral tests from the old version | Scenario trace diff and trial runs done (M4); recorded per-call test cases and replay not started |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
-| MCP server, Ghidra extension, hosted service, IDA plugin | Not started (designed) |
-| AI fallback | Not started (designed, design §8) |
+| MCP server | Done (M5): read tools, explanations, proposals into review |
+| Ghidra extension, hosted service, IDA plugin | Not started (designed) |
+| AI fallback | Agents can propose through the MCP server; the built-in proposer and its corpus metrics not started (design §8) |
 | License choice, market validation | Open |
 
 ## Suggested next steps
 
-1. **MCP server** (design §11.2): list and explain review items (now with proposals), propose mappings into
-   verification. Agents can't accept; decisions stay with `pbeta review` (or the UI later).
+1. **AI proposer** (M5, design §8): a local-model proposer for unmatched functions, through the same
+   verification, measured separately on the corpus (precision, acceptance rate). The MCP server already takes
+   proposals; this adds one that runs without an agent and gets scored.
 2. **Calibrate the similarity thresholds** (score 0.75, margin 0.1, size 16, weights; all [Guess]) from the
    corpus: score distributions of correct vs ambiguous pairs. Fixture S3–S5 at /O2 are still unmatched.
 3. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.

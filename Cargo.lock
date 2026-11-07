@@ -303,6 +303,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "permanent-beta-mcp"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "permanent-beta-engine",
+ "permanent-beta-model",
+ "permanent-beta-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "permanent-beta-model"
 version = "0.0.1"
 dependencies = [

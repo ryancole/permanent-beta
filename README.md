@@ -29,6 +29,7 @@ crates/
   permanent-beta-store/     mapping history + review queue (JSON file now, SQLite planned)
   permanent-beta-engine/    orchestration: match → verify → repair
   permanent-beta-cli/       the `pbeta` binary
+  permanent-beta-mcp/       `pbeta-mcp`: MCP server for agents (read, explain, propose; never accept)
   permanent-beta-corpus/    test tooling: map-file parser, answer keys (`pbeta-corpus`)
 integrations/
   ghidra/           Ghidra extension + headless exporter (planned, Java)

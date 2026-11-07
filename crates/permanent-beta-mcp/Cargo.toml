@@ -1,0 +1,22 @@
+[package]
+name = "permanent-beta-mcp"
+description = "MCP server: lets AI agents read builds, candidates and the review queue, and propose mappings into verification. Agents never accept."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pbeta-mcp"
+path = "src/main.rs"
+
+# Allowed internal dependencies: engine, store, model (design §3.1). Never repair or match directly, and never
+# anything that can decide a review item.
+[dependencies]
+permanent-beta-model.workspace = true
+permanent-beta-engine.workspace = true
+permanent-beta-store.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

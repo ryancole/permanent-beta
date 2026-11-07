@@ -101,6 +101,26 @@ impl Engine {
         }
     }
 
+    /// Verify one candidate proposed from outside the engine (an AI proposer, an MCP client) exactly like the
+    /// engine's own: the same checks and policy, with this build pair's match run as the neighbour context.
+    /// `None` if either function isn't in its analysis. Records and accepts nothing; the caller routes the
+    /// report to review.
+    pub fn verify_candidate(
+        &self,
+        old: &AnalysisExport,
+        new: &AnalysisExport,
+        candidate: &Candidate,
+        criticality: Criticality,
+    ) -> Option<VerificationReport> {
+        let (o, n) = (old.function(candidate.old)?, new.function(candidate.new)?);
+        let outcome = run_passes(old, new, &self.matchers);
+        let ctx = VerifyContext::new(old, new, &outcome.candidates);
+        Some(
+            self.verifier
+                .verify(&ctx, candidate, o, n, Policy::for_criticality(criticality)),
+        )
+    }
+
     /// Repair every hook in `manifest`, moving it from `old` to `new`, with no earlier review decisions.
     pub fn repair(
         &self,

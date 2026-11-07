@@ -38,6 +38,9 @@ pub mod evidence_kind {
     pub const SIMILARITY: &str = "similarity";
     /// One of several equally plausible competitors (review evidence only, never accepted).
     pub const AMBIGUOUS: &str = "ambiguous";
+    /// An AI proposer's rationale (design §8). Set by the server receiving the proposal, never by the model, so
+    /// a model can't label its guess as a deterministic kind. Implies no check: every check counts.
+    pub const AI: &str = "ai";
 }
 
 /// A proposed old→new function correspondence. Not accepted until verified.
