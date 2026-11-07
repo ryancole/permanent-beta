@@ -14,10 +14,13 @@
 
 # 2026-11-07, mnemonic-hash pass and similarity margin 0.1 -> 0.05: /O2 and /O2+ICF 710 and 716, /Od 1079 and
 # 1085, 0 wrong.
+# 2026-11-07, import names in the normalized hash (import thunks such as `sin` and `cos` no longer all hash the
+# same, so the math_* wrappers that call them are told apart): /O2 and /O2+ICF 716 and 722, /Od 1086 and 1092,
+# 0 wrong.
 [gate.min_correct]
-"o2__v5.4.6__v5.4.7" = 710
-"o2__v5.4.7__v5.4.8" = 716
-"o2-icf__v5.4.6__v5.4.7" = 710
-"o2-icf__v5.4.7__v5.4.8" = 716
-"od__v5.4.6__v5.4.7" = 1079
-"od__v5.4.7__v5.4.8" = 1085
+"o2__v5.4.6__v5.4.7" = 716
+"o2__v5.4.7__v5.4.8" = 722
+"o2-icf__v5.4.6__v5.4.7" = 716
+"o2-icf__v5.4.7__v5.4.8" = 722
+"od__v5.4.6__v5.4.7" = 1086
+"od__v5.4.7__v5.4.8" = 1092

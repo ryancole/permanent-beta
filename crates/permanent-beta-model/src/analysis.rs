@@ -4,8 +4,11 @@ use crate::ids::{BuildId, Rva};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Bump on any breaking change to [`AnalysisExport`].
-pub const ANALYSIS_SCHEMA_VERSION: u32 = 1;
+/// Bump on any breaking change to [`AnalysisExport`], including a change in what a hash covers: hashes from
+/// different versions aren't comparable.
+///
+/// 2: the normalized hash covers the name of an import read through the IAT.
+pub const ANALYSIS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisExport {

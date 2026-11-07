@@ -4,7 +4,14 @@ M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (de
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: finishing M4 (`corpus/build-hooks.ps1 -Run`, `corpus/hooks/README.md`). Results, the same shape at
+Latest work: **widening the AI measurement** (design §8). /Od and deleted functions measured: 54 of 56 proposals
+correct across Lua and zstd, /O2 and /Od; on deleted functions Claude answered `none` except for two near misses;
+no wrong proposal passes verification. The analyzer now hashes import names (analysis schema 2): Lua's `math_*`
+wrappers, which Claude couldn't tell apart, are now matched by the engine itself (+6 to +7 correct per Lua
+variant, 0 wrong). `score-ai --select deleted|present` picks the questions. One more zstd rename declared
+(`BMK_benchCLevel` → `BMK_benchCLevels`, found by Claude).
+
+Before that: finishing M4 (`corpus/build-hooks.ps1 -Run`, `corpus/hooks/README.md`). Results, the same shape at
 /O2 and /Od:
 
 | Hook | v1 → v2 | v2 → v3 |
@@ -74,7 +81,7 @@ What's new:
   pass's precision and recall.
   - Purpose-built fixture `basic` (`corpus/fixtures`): 3 flag sets.
   - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 159 of 163.
-  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 710–716 of ~735, /Od 1079–1085 of ~1095.
+  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 716–722 of ~735, /Od 1086–1092 of ~1095.
   - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 667–676 of ~729 (/O2+ICF 653–662), /Od 1700–1738 of ~1879.
   - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations,
     with trial runs, patterns, the header and proposed shims checked.
@@ -93,14 +100,14 @@ What's new:
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
 | Ghidra extension, hosted service, IDA plugin | Not started (designed) |
-| AI fallback | Built and measured (M5): 31 of 32 proposals correct on Lua and zstd /O2, the wrong one rejected by verification (design §8) |
+| AI fallback | Built and measured (M5): 54 of 56 proposals correct on Lua and zstd, /O2 and /Od; `none` on deleted functions apart from near misses; no wrong proposal passes verification (design §8) |
 | License choice, market validation | Open |
 
 ## Suggested next steps
 
-1. **Widen the AI measurement:** /Od variants, deleted functions (where `none` is right), and whether showing
-   instruction text would separate near-identical families (Lua `math_*`, zstd `*_noDict_*`), which it now
-   declines. Then decide whether `pbeta propose` should run as part of `repair` for unmatched hook targets.
+1. **Decide whether `pbeta propose` runs as part of `repair`** for unmatched hook targets (proposals into the
+   hook's review item, never applied). Optionally describe unmatched callees in the prompt, the lever for zstd's
+   `*_noDict_*` family; instruction text wouldn't separate it (design §8).
 2. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.
 3. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
    proposals; both lean on PDB or Ghidra types.

@@ -140,6 +140,9 @@ enum Command {
         /// Questions per variant, lowest addresses first.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Which unmatched functions to ask about: all, only deleted ones, or only ones with a counterpart.
+        #[arg(long, value_enum, default_value_t = ai_score::Select::All)]
+        select: ai_score::Select,
         #[arg(long, default_value = "claude-opus-5-5")]
         model: String,
         #[arg(long)]
@@ -216,6 +219,7 @@ fn main() -> Result<ExitCode> {
             built,
             variant,
             limit,
+            select,
             model,
             effort,
             claude,
@@ -262,7 +266,8 @@ fn main() -> Result<ExitCode> {
             let mut all = ai_score::AiTotals::default();
             for dir in &variants {
                 let (truth, old, new) = fixture::load_variant(dir)?;
-                let (t, judged) = ai_score::score_variant(&truth, &old, &new, &backend, limit);
+                let (t, judged) =
+                    ai_score::score_variant(&truth, &old, &new, &backend, select, limit);
                 println!(
                     "{}",
                     ai_score::render_totals(&dir.display().to_string(), &t)

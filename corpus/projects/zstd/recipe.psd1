@@ -35,6 +35,8 @@
             # Same call site and role; the unused cctx parameter was dropped.
             'ZSTDMT_serialState_update'                      = 'ZSTDMT_serialState_genSequences'
             'init_nbThreads'                                 = 'default_nbThreads'
+            # Same body and strings; it now returns int instead of BMK_benchOutcome_t. Found by the AI proposer.
+            'BMK_benchCLevel'                                = 'BMK_benchCLevels'
         }
     }
     Include  = @('lib', 'lib/common')

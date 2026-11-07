@@ -13,7 +13,8 @@
 //! Features: the normalized hash covers each instruction's opcode and operands but masks anything that moves
 //! when unrelated code moves: RIP-relative targets, branch targets outside the function, and immediates or
 //! displacements that are addresses inside the image. Branch targets inside the function are kept as offsets
-//! from the function start, so control-flow changes still change the hash.
+//! from the function start, so control-flow changes still change the hash. A RIP-relative operand that is an
+//! import address table slot is hashed by the imported function's name instead.
 
 use super::image::Image;
 use iced_x86::{
@@ -266,6 +267,13 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
                         nh.update(b"r");
                         if let Some(rva) = image.va_to_rva(ins.ip_rel_memory_address()) {
                             if let Some(name) = image.iat.get(&rva) {
+                                // The imported function's name is stable across builds, unlike the slot's
+                                // address, so it's hashed: otherwise every import thunk (`jmp [slot]`) hashes
+                                // the same, and so does code that differs only in which import it calls.
+                                // Only the name after `!`: an API-set DLL version can change with the toolset.
+                                nh.update(b"m");
+                                nh.update(name.rsplit('!').next().unwrap_or(name).as_bytes());
+                                nh.update([0]);
                                 imports.insert(name.clone());
                             } else if let Some(s) = image.string_literal(rva) {
                                 strings.insert(s);
@@ -518,6 +526,53 @@ mod tests {
             &range(0x1000, 0x1004),
         );
         assert_ne!(fa.normalized_hash, fb.normalized_hash);
+    }
+
+    /// `jmp qword ptr [rip+disp]` at 0x1000 reading the IAT slot at 0x2000 + `slot`.
+    fn thunk(slot: u32) -> Vec<u8> {
+        let mut code = vec![0xff, 0x25];
+        code.extend((0x1000 + slot - 6).to_le_bytes());
+        code
+    }
+
+    fn with_iat(code: &[u8], iat: &[(u32, &str)]) -> Image {
+        let mut img = image(code, &[0; 0x40]);
+        img.iat = iat.iter().map(|&(r, n)| (r, n.to_owned())).collect();
+        img
+    }
+
+    #[test]
+    fn import_thunks_hash_by_imported_name() {
+        // The same import through a different slot (the IAT moved): same hash.
+        let sin = features(
+            &with_iat(&thunk(0x10), &[(0x2010, "math.dll!sin")]),
+            &range(0x1000, 0x1006),
+        );
+        let sin_moved = features(
+            &with_iat(&thunk(0x18), &[(0x2018, "math.dll!sin")]),
+            &range(0x1000, 0x1006),
+        );
+        assert_eq!(sin.normalized_hash, sin_moved.normalized_hash);
+        assert_eq!(sin.imports, vec!["math.dll!sin".to_string()]);
+        // Only the name counts, not the API-set DLL it comes from.
+        let sin_other_dll = features(
+            &with_iat(&thunk(0x10), &[(0x2010, "math-l1-1-1.dll!sin")]),
+            &range(0x1000, 0x1006),
+        );
+        assert_eq!(sin.normalized_hash, sin_other_dll.normalized_hash);
+        // Negative: identical code reaching a different import must not hash the same (Lua's math_sin and
+        // math_cos thunks did before).
+        let cos = features(
+            &with_iat(&thunk(0x10), &[(0x2010, "math.dll!cos")]),
+            &range(0x1000, 0x1006),
+        );
+        assert_ne!(sin.normalized_hash, cos.normalized_hash);
+        assert_eq!(sin.mnemonic_hash, cos.mnemonic_hash, "same mnemonics");
+        // Negative: a RIP-relative read that isn't an IAT slot is still masked, not hashed by contents.
+        let a = features(&with_iat(&thunk(0x10), &[]), &range(0x1000, 0x1006));
+        let b = features(&with_iat(&thunk(0x18), &[]), &range(0x1000, 0x1006));
+        assert_eq!(a.normalized_hash, b.normalized_hash);
+        assert_ne!(a.normalized_hash, sin.normalized_hash);
     }
 
     #[test]

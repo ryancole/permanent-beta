@@ -494,7 +494,34 @@ functions was deleted), mostly families of near-identical functions: Lua's one-l
 `ZSTD_compressBlock_fast_noDict_*` instantiations. The true counterpart wasn't on the shortlist twice. About 4
 seconds per question. Recorded in `corpus/ai/claude-opus-5-5.jsonl`; replaying it needs byte-identical builds.
 So far it beats sending these functions to review: half of them come with a correct suggestion, and verification
-caught the one wrong suggestion. Not yet measured: /Od, deleted functions, other models.
+caught the one wrong suggestion. 
+
+**Widened (2026-11-07):** /Od, deleted functions (`score-ai --select deleted`) and the near-identical families,
+after the analyzer change below and with one more rename declared (zstd 1.5.7 `BMK_benchCLevel` →
+`BMK_benchCLevels`, which Claude found three times while the answer key called it deleted).
+
+| Set | Asked | Proposed | Correct | Wrong | Wrong passing policy | `none` |
+|---|---|---|---|---|---|---|
+| Lua /O2 | 11 | 7 | 7 | 0 | 0 | 4 |
+| Lua /Od | 10 | 6 | 6 | 0 | 0 | 4 |
+| zstd /O2 | 40 | 25 | 24 | 1 | 0 | 15 |
+| zstd /Od | 40 | 18 | 17 | 1 | 0 | 22 (1 right) |
+| Deleted (fixture + zstd, all flags) | 11 | 2 | 0 | 2 | 0 | 9 (all right) |
+
+Lua asks fewer questions than before because matching now resolves the `math_*` wrappers (below). Every wrong
+answer is a near miss, and none passes verification: `BIT_initDStream` (another object file's copy of
+the same `static` function, three times) and zstd 1.5.7's `ZSTD_entropyCompressSeqStore`, whose body moved into a
+new function behind a wrapper (Claude picked the body). On truly deleted functions Claude answered `none` every
+time apart from those copies. Precision at /Od is the same as at /O2; fewer of its correct proposals pass the
+policy alone (17 of 23 vs 30 of 31), because /Od code carries less independent evidence.
+
+Instruction text was not added: neither family Claude declines differs in its own instructions. Lua's `math_*`
+wrappers differed only in which import thunk they call (`sin`, `cos`, ...), and every thunk had the same
+normalized hash, so none matched and the calls showed as `unmatched`. The normalized hash now covers the imported
+name (analysis schema 2), the thunks match, and matching resolves the wrappers itself (+6 to +7 correct per Lua
+variant, 0 wrong). zstd's `ZSTD_compressBlock_fast_noDict_*_0/_1` differ only in calling the new
+`ZSTD_match4Found_cmov` or `_branch`, inlined in the old build; describing unmatched callees would be the lever
+there, not instruction text.
 
 ---
 

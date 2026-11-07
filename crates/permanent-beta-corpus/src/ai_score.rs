@@ -61,12 +61,26 @@ pub struct AiRow {
     pub judgement: &'static str,
 }
 
-/// Ask about up to `limit` in-scope unmatched old functions (lowest addresses first, so runs are comparable).
+/// Which unmatched in-scope old functions to ask about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Select {
+    /// All of them.
+    #[default]
+    All,
+    /// Only deleted ones (no counterpart in the new build): `none` is the only right answer.
+    Deleted,
+    /// Only ones with a counterpart.
+    Present,
+}
+
+/// Ask about up to `limit` in-scope unmatched old functions chosen by `select` (lowest addresses first, so runs
+/// are comparable).
 pub fn score_variant(
     truth: &GroundTruth,
     old: &AnalysisExport,
     new: &AnalysisExport,
     model: &dyn Model,
+    select: Select,
     limit: usize,
 ) -> (AiTotals, Vec<AiRow>) {
     let mut by_old: BTreeMap<Rva, (BTreeSet<String>, BTreeSet<Rva>)> = BTreeMap::new();
@@ -88,7 +102,13 @@ pub fn score_variant(
     for &rva in report
         .unmatched_old
         .iter()
-        .filter(|r| by_old.contains_key(r))
+        .filter(|r| {
+            by_old.get(r).is_some_and(|(_, t)| match select {
+                Select::All => true,
+                Select::Deleted => t.is_empty(),
+                Select::Present => !t.is_empty(),
+            })
+        })
         .take(limit)
     {
         let (names, acceptable) = &by_old[&rva];
@@ -229,19 +249,30 @@ mod tests {
         // A model that always picks the first candidate: right for `edited`, wrong for `gone`.
         let first =
             Scripted(|_: &Prompt| Ok(r#"{"choice":"c1","confidence":0.9,"rationale":"x"}"#.into()));
-        let (t, rows) = score_variant(&truth, &old, &new, &first, 10);
+        let (t, rows) = score_variant(&truth, &old, &new, &first, Select::All, 10);
         assert_eq!((t.asked, t.correct, t.wrong), (2, 1, 1), "{rows:#?}");
         // A model that always says none: right for the deleted one, a miss for the edited one.
         let none = Scripted(|_: &Prompt| {
             Ok(r#"{"choice":"none","confidence":0.5,"rationale":"x"}"#.into())
         });
-        let (t, _) = score_variant(&truth, &old, &new, &none, 10);
+        let (t, _) = score_variant(&truth, &old, &new, &none, Select::All, 10);
         assert_eq!(
             (t.abstained_right, t.abstained_missed, t.correct + t.wrong),
             (1, 1, 0)
         );
         assert_eq!(t.precision(), None);
         // The limit bounds the questions.
-        assert_eq!(score_variant(&truth, &old, &new, &none, 1).0.asked, 1);
+        assert_eq!(
+            score_variant(&truth, &old, &new, &none, Select::All, 1)
+                .0
+                .asked,
+            1
+        );
+        // Selecting deleted functions asks only about `gone`; a model that always picks c1 is then always wrong.
+        let (t, rows) = score_variant(&truth, &old, &new, &first, Select::Deleted, 10);
+        assert_eq!((t.asked, t.correct, t.wrong), (1, 0, 1), "{rows:#?}");
+        assert_eq!(rows[0].names, vec!["gone".to_owned()]);
+        let (t, _) = score_variant(&truth, &old, &new, &none, Select::Present, 10);
+        assert_eq!((t.asked, t.abstained_missed), (1, 1));
     }
 }
