@@ -1,15 +1,16 @@
 # Status — where we left off (2026-11-06)
 
-M2 (corpus) is done and green in CI (`c104289`). Latest work: the similarity pass (design §5.1 pass 6), which
-completes M3's matching depth apart from the mnemonic-hash pass and the SQLite store. 0 wrong matches on every
-corpus variant; not yet through CI.
+M2 (corpus) is done, and the similarity pass (design §5.1 pass 6) is green in CI (`4e7b78b`): M3's matching depth
+is done apart from the mnemonic-hash pass and the SQLite store, with 0 wrong matches on every corpus variant.
+Latest work: review-queue decisions (`pbeta review accept` / `reject`), honored by `repair --store`; not yet
+through CI.
 
 ## What works
 
 - **`pbeta analyze`** reads PE x64 executables with no symbols: functions from `.pdata`, call targets and
   address-taken code, with chained `.pdata` fragments merged into their parent; normalized and mnemonic hashes,
   callees in call order, strings, constants, imports, inferred register arguments, and entry hookability.
-- **`pbeta match` / `repair` / `review list`**: six matching passes (name, normalized hash, strings, matched
+- **`pbeta match` / `repair` / `review list|accept|reject`**: six matching passes (name, normalized hash, strings, matched
   callees, call graph, and a weak similarity pass for edited functions); string matches are vetoed when argument counts or matched callers contradict them,
   rechecked against the final matches. Verification on parameters, strings, size, callers, callees, constants,
   imports and inferred arguments, counting only evidence independent of the match; repair with review reasons
@@ -32,7 +33,7 @@ corpus variant; not yet through CI.
 | 2. Verify it's the same function | Done for symbol-less binaries; PDB signatures not read |
 | 3. Adapt hooks (signature/struct changes) | Detection only (inferred args, signatures if known); no adaptation |
 | 4. Behavioral tests from the old version | Not started (designed, design §7.3) |
-| 5. Review queue | Populated and listable; no accept/reject |
+| 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server, Ghidra extension, hosted service, IDA plugin | Not started (designed) |
 | AI fallback | Not started (designed, design §8) |
 | License choice, market validation | Open |
@@ -41,8 +42,8 @@ corpus variant; not yet through CI.
 
 1. **End-to-end Detours repair** (M4): a real hook DLL against the fixture's v1, repaired to v2 and run. That
    starts the behavioral harness (goal 4).
-2. **Review-queue actions** (accept, reject, pick a candidate), then the MCP server. Similarity matches all
-   land in review, so this is where they become usable.
+2. **MCP server** (design §11.2): list and explain review items, propose mappings into verification. Agents
+   can't accept; decisions stay with `pbeta review` (or the UI later).
 3. **Calibrate the similarity thresholds** (score 0.75, margin 0.1, size 16, weights; all [Guess]) from the
    corpus: score distributions of correct vs ambiguous pairs. Fixture S3–S5 at /O2 are still unmatched.
 4. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.

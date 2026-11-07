@@ -5,8 +5,10 @@ use clap::{Parser, Subcommand};
 use permanent_beta_analysis::{Analyzer, export, native::NativePeAnalyzer};
 use permanent_beta_engine::Engine;
 use permanent_beta_engine::permanent_beta_repair::RepairAction;
-use permanent_beta_model::{CandidateSource, HookManifest, Verdict};
-use permanent_beta_store::{JsonFileStore, MappingStore};
+use permanent_beta_model::{
+    CandidateSource, DecisionAction, HookManifest, PriorDecisions, ReviewStatus, Rva, Verdict,
+};
+use permanent_beta_store::{Choice, JsonFileStore, MappingStore};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -55,13 +57,13 @@ enum Command {
         /// Write the repaired manifest here.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Record accepted mappings and review items in this store.
+        /// Record accepted mappings and review items in this store, and honor its review decisions.
         #[arg(long)]
         store: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
-    /// Inspect the review queue.
+    /// Inspect and decide the review queue.
     Review {
         #[command(subcommand)]
         command: ReviewCommand,
@@ -70,8 +72,39 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ReviewCommand {
-    /// List open review items.
+    /// List open review items with their candidates. Exit code 1 if any are open.
     List {
+        #[arg(long, default_value = ".pbeta/store.json")]
+        store: PathBuf,
+        /// Include resolved items.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Accept a candidate as the hook target's counterpart. The next `repair --store` uses it.
+    Accept {
+        /// Review item id, as `review list` prints it.
+        id: String,
+        /// Which candidate (new-build RVA). Required when the item has more than one.
+        #[arg(long)]
+        candidate: Option<Rva>,
+        /// Who decided. Recorded with the decision and the mapping.
+        #[arg(long)]
+        reviewer: String,
+        #[arg(long)]
+        note: Option<String>,
+        /// Accept even a candidate that verification rejected.
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value = ".pbeta/store.json")]
+        store: PathBuf,
+    },
+    /// Reject every candidate of an item: none is the counterpart. They're never proposed for it again.
+    Reject {
+        id: String,
+        #[arg(long)]
+        reviewer: String,
+        #[arg(long)]
+        note: Option<String>,
         #[arg(long, default_value = ".pbeta/store.json")]
         store: PathBuf,
     },
@@ -103,9 +136,29 @@ fn run(cli: Cli) -> Result<u8> {
             store,
             json,
         } => cmd_repair(&old, &new, &hooks, out.as_deref(), store.as_deref(), json),
-        Command::Review {
-            command: ReviewCommand::List { store },
-        } => cmd_review_list(&store),
+        Command::Review { command } => match command {
+            ReviewCommand::List { store, all } => cmd_review_list(&store, all),
+            ReviewCommand::Accept {
+                id,
+                candidate,
+                reviewer,
+                note,
+                force,
+                store,
+            } => cmd_review_decide(
+                &store,
+                &id,
+                &reviewer,
+                Choice::Accept { candidate, force },
+                note,
+            ),
+            ReviewCommand::Reject {
+                id,
+                reviewer,
+                note,
+                store,
+            } => cmd_review_decide(&store, &id, &reviewer, Choice::Reject, note),
+        },
     }
 }
 
@@ -167,14 +220,18 @@ fn cmd_repair(
     )
     .with_context(|| format!("parsing hook manifest {}", hooks.display()))?;
 
-    let report = Engine::with_defaults().repair(&manifest, &old, &new);
+    let mut opened = store.map(JsonFileStore::open).transpose()?;
+    let prior = opened
+        .as_ref()
+        .map(|s| s.prior_decisions(&old.build.id, &new.build.id))
+        .unwrap_or_else(PriorDecisions::default);
+    let report = Engine::with_defaults().repair_with(&manifest, &old, &new, &prior);
 
     if let Some(out) = out {
         std::fs::write(out, toml::to_string_pretty(&report.updated_manifest)?)
             .with_context(|| format!("writing {}", out.display()))?;
     }
-    if let Some(path) = store {
-        let mut store = JsonFileStore::open(path)?;
+    if let Some(store) = opened.as_mut() {
         store.put_mappings(&report.mappings)?;
         store.enqueue_review(&report.review_items)?;
     }
@@ -183,9 +240,14 @@ fn cmd_repair(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for r in &report.repairs {
+            let by = r
+                .reviewed_by
+                .as_ref()
+                .map(|who| format!(" (decided by {who})"))
+                .unwrap_or_default();
             let outcome = match &r.action {
-                RepairAction::Unchanged { rva } => format!("unchanged at {rva}"),
-                RepairAction::Relocated { old, new } => format!("relocated {old} -> {new}"),
+                RepairAction::Unchanged { rva } => format!("unchanged at {rva}{by}"),
+                RepairAction::Relocated { old, new } => format!("relocated {old} -> {new}{by}"),
                 RepairAction::NeedsReview { reason, detail } => {
                     format!(
                         "NEEDS REVIEW ({}): {detail}",
@@ -208,27 +270,94 @@ fn cmd_repair(
     })
 }
 
-fn cmd_review_list(store: &Path) -> Result<u8> {
+fn cmd_review_list(store: &Path, all: bool) -> Result<u8> {
     let store = JsonFileStore::open(store)?;
-    let items = store.review_items();
+    let items: Vec<_> = store
+        .review_items()
+        .into_iter()
+        .filter(|i| all || i.status == ReviewStatus::Open)
+        .collect();
+    let open = items
+        .iter()
+        .filter(|i| i.status == ReviewStatus::Open)
+        .count();
     if items.is_empty() {
-        println!("review queue is empty ({})", store.path().display());
+        println!("no open review items ({})", store.path().display());
         return Ok(EXIT_OK);
     }
     for item in &items {
         let reason = serde_json::to_value(item.reason)?;
+        let status = serde_json::to_value(item.status)?;
         println!(
-            "{}\n  reason: {}\n  old:    {}\n  detail: {}\n  candidates: {}\n",
+            "{} [{}]\n  reason: {}\n  old:    {}\n  detail: {}",
             item.id,
+            status.as_str().unwrap_or("?"),
             reason.as_str().unwrap_or("?"),
             item.old
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "-".into()),
             item.detail,
-            item.candidates.len()
         );
+        if item.candidates.is_empty() {
+            println!("  candidates: none");
+        }
+        for c in &item.candidates {
+            println!(
+                "  candidate {:<10} {:<14} via {} (score {:.2})",
+                c.candidate.new.to_string(),
+                verdict_str(c.verdict),
+                source_str(&c.candidate.source),
+                c.candidate.score
+            );
+        }
+        for d in store.decisions().iter().filter(|d| d.review_id == item.id) {
+            let what = match &d.action {
+                DecisionAction::Accept { new } => format!("accepted {new}"),
+                DecisionAction::Reject { rejected } if rejected.is_empty() => {
+                    "rejected (no candidates)".to_owned()
+                }
+                DecisionAction::Reject { rejected } => format!(
+                    "rejected {}",
+                    rejected
+                        .iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            println!("  decision: {what} by {}", d.reviewer);
+        }
+        println!();
     }
-    Ok(EXIT_NEEDS_REVIEW)
+    Ok(if open > 0 { EXIT_NEEDS_REVIEW } else { EXIT_OK })
+}
+
+fn cmd_review_decide(
+    store: &Path,
+    id: &str,
+    reviewer: &str,
+    choice: Choice,
+    note: Option<String>,
+) -> Result<u8> {
+    let mut store = JsonFileStore::open(store)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let d = store.decide(id, reviewer, choice, note, now)?;
+    match &d.action {
+        DecisionAction::Accept { new } => println!(
+            "{id}: accepted {} -> {new}; the next `pbeta repair --store {}` uses it",
+            d.old,
+            store.path().display()
+        ),
+        DecisionAction::Reject { rejected } => println!(
+            "{id}: rejected {} candidate(s) for {}; they won't be proposed again",
+            rejected.len(),
+            d.old
+        ),
+    }
+    Ok(EXIT_OK)
 }
 
 fn verdict_str(v: Verdict) -> &'static str {

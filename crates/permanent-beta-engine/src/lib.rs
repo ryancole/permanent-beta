@@ -5,10 +5,12 @@
 use permanent_beta_match::{MatchOutcome, Matcher, default_matchers, run_passes};
 use permanent_beta_model::{
     Ambiguity, AnalysisExport, BuildId, Candidate, CandidateSource, Criticality, Decider, Evidence,
-    FunctionFeatures, HookManifest, HookSpec, Mapping, MappingStatus, ReviewItem, Rva,
-    VerificationReport,
+    FunctionFeatures, HookManifest, HookSpec, Mapping, MappingStatus, PriorDecisions, ReviewItem,
+    Rva, VerificationReport,
 };
-use permanent_beta_repair::{HookRepair, RepairAction, decide, review_items, rewrite_manifest};
+use permanent_beta_repair::{
+    HookRepair, RepairAction, decide, from_review, review_items, rewrite_manifest,
+};
 use permanent_beta_verify::{Policy, Verifier, VerifyContext};
 use serde::Serialize;
 
@@ -91,12 +93,25 @@ impl Engine {
         }
     }
 
-    /// Repair every hook in `manifest`, moving it from `old` to `new`.
+    /// Repair every hook in `manifest`, moving it from `old` to `new`, with no earlier review decisions.
     pub fn repair(
         &self,
         manifest: &HookManifest,
         old: &AnalysisExport,
         new: &AnalysisExport,
+    ) -> RepairReport {
+        self.repair_with(manifest, old, new, &PriorDecisions::default())
+    }
+
+    /// Repair every hook, honoring earlier review decisions for this build pair:
+    /// - a mapping a reviewer accepted resolves its hook (the reviewer decided on its verification report);
+    /// - an (old, new) pair a reviewer rejected is never used, as the candidate or as an alternative.
+    pub fn repair_with(
+        &self,
+        manifest: &HookManifest,
+        old: &AnalysisExport,
+        new: &AnalysisExport,
+        prior: &PriorDecisions,
     ) -> RepairReport {
         let outcome = run_passes(old, new, &self.matchers);
         let candidates = &outcome.candidates;
@@ -109,7 +124,20 @@ impl Engine {
             .map(|hook| {
                 // TODO: if hook.target.build != old.build.id, route to review instead of trusting the locator.
                 let old_fn = resolve_old(hook, old);
-                let cand = old_fn.and_then(|f| candidates.iter().find(|c| c.old == f.rva));
+                let reviewed = old_fn.and_then(|o| {
+                    let m = prior.accepted.iter().find(|m| m.old == o.rva)?;
+                    let Decider::Human { reviewer } = &m.decided_by else {
+                        return None;
+                    };
+                    Some((o, new.function(m.new)?, reviewer))
+                });
+                if let Some((o, n, reviewer)) = reviewed {
+                    return from_review(hook, o, n, reviewer);
+                }
+                let rejected = |c_old: Rva, c_new: Rva| prior.rejected.contains(&(c_old, c_new));
+                let cand = old_fn
+                    .and_then(|f| candidates.iter().find(|c| c.old == f.rva))
+                    .filter(|c| !rejected(c.old, c.new));
                 let new_fn = cand.and_then(|c| new.function(c.new));
                 let policy = Policy::for_criticality(hook.criticality);
                 let report = match (cand, old_fn, new_fn) {
@@ -118,14 +146,32 @@ impl Engine {
                     }
                     _ => None,
                 };
-                let alternatives = match (cand, old_fn) {
+                let mut alternatives = match (cand, old_fn) {
                     (None, Some(o)) => self.alternatives(&ctx, &outcome, o, new, policy),
                     _ => Vec::new(),
                 };
-                decide(hook, old_fn, report, new_fn, alternatives)
+                alternatives.retain(|a| !rejected(a.candidate.old, a.candidate.new));
+                let mut repair = decide(hook, old_fn, report, new_fn, alternatives);
+                let refused: Vec<String> = old_fn
+                    .map(|o| {
+                        prior
+                            .rejected
+                            .iter()
+                            .filter(|(r_old, _)| *r_old == o.rva)
+                            .map(|(_, r_new)| r_new.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let RepairAction::NeedsReview { detail, .. } = &mut repair.action {
+                    if !refused.is_empty() {
+                        detail.push_str(&format!(" (a reviewer rejected {})", refused.join(", ")));
+                    }
+                }
+                repair
             })
             .collect();
 
+        // Engine decisions only: a reviewer's mapping is already in the store (its `verification` is None).
         let mappings = repairs
             .iter()
             .filter(|r| r.is_resolved())
@@ -217,4 +263,176 @@ fn resolve_old<'a>(hook: &HookSpec, old: &'a AnalysisExport) -> Option<&'a Funct
                 .as_deref()
                 .and_then(|s| old.function_by_name(s))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use permanent_beta_model::{
+        ANALYSIS_SCHEMA_VERSION, BuildInfo, Machine, Producer, ReviewReason, TargetLocator,
+    };
+
+    fn func(rva: u64, hash: &str) -> FunctionFeatures {
+        FunctionFeatures {
+            rva: Rva(rva),
+            size: 64,
+            name: None,
+            name_source: None,
+            normalized_hash: Some(hash.to_owned()),
+            mnemonic_hash: None,
+            inferred_args: None,
+            entry: None,
+            basic_blocks: None,
+            edges: None,
+            callees: vec![],
+            strings: vec![],
+            constants: vec![],
+            imports: vec![],
+            signature: None,
+            mnemonic_counts: Default::default(),
+        }
+    }
+
+    fn export(id: &str, functions: Vec<FunctionFeatures>) -> AnalysisExport {
+        AnalysisExport {
+            schema_version: ANALYSIS_SCHEMA_VERSION,
+            build: BuildInfo {
+                id: BuildId(id.to_owned()),
+                file_name: "t.exe".into(),
+                version: None,
+                machine: Machine::X64,
+                pdb: None,
+            },
+            producer: Producer {
+                tool: "test".into(),
+                version: "0".into(),
+            },
+            functions,
+        }
+    }
+
+    fn manifest() -> HookManifest {
+        HookManifest {
+            hooks: vec![HookSpec {
+                name: "H".into(),
+                detour: None,
+                criticality: Criticality::Normal,
+                prototype: None,
+                target: TargetLocator {
+                    build: BuildId("a".into()),
+                    rva: Some(Rva(0x10)),
+                    symbol: None,
+                    pattern: None,
+                },
+            }],
+        }
+    }
+
+    /// The hook target 0x10 has two identical copies in the new build: the engine refuses to pick.
+    fn ambiguous_pair() -> (AnalysisExport, AnalysisExport) {
+        (
+            export("a", vec![func(0x10, "k")]),
+            export("b", vec![func(0x110, "k"), func(0x120, "k")]),
+        )
+    }
+
+    fn human(new: u64) -> Mapping {
+        Mapping {
+            from_build: BuildId("a".into()),
+            to_build: BuildId("b".into()),
+            old: Rva(0x10),
+            new: Rva(new),
+            decided_by: Decider::Human {
+                reviewer: "ryan".into(),
+            },
+            source: CandidateSource::Deterministic {
+                matcher: "normalized-hash".into(),
+            },
+            score: 0.0,
+            evidence: vec![],
+            checks: vec![],
+            status: MappingStatus::Accepted,
+        }
+    }
+
+    #[test]
+    fn without_decisions_an_ambiguous_hook_needs_review() {
+        let (old, new) = ambiguous_pair();
+        let r = Engine::with_defaults().repair(&manifest(), &old, &new);
+        assert!(r.needs_review());
+        assert_eq!(r.review_items[0].reason, ReviewReason::Ambiguous);
+    }
+
+    #[test]
+    fn a_reviewer_accepted_mapping_resolves_the_hook() {
+        let (old, new) = ambiguous_pair();
+        let prior = PriorDecisions {
+            accepted: vec![human(0x120)],
+            rejected: vec![],
+        };
+        let r = Engine::with_defaults().repair_with(&manifest(), &old, &new, &prior);
+        assert!(!r.needs_review(), "{:?}", r.review_items);
+        assert_eq!(
+            r.repairs[0].action,
+            RepairAction::Relocated {
+                old: Rva(0x10),
+                new: Rva(0x120)
+            }
+        );
+        assert_eq!(r.repairs[0].reviewed_by.as_deref(), Some("ryan"));
+        assert!(
+            r.mappings.is_empty(),
+            "the reviewer mapping is already stored"
+        );
+        assert_eq!(r.updated_manifest.hooks[0].target.rva, Some(Rva(0x120)));
+    }
+
+    #[test]
+    fn an_engine_mapping_in_prior_decisions_does_not_resolve_a_hook() {
+        // Only human decisions short-circuit repair; engine mappings are recomputed every run.
+        let (old, new) = ambiguous_pair();
+        let mut engine_made = human(0x120);
+        engine_made.decided_by = Decider::Engine;
+        let prior = PriorDecisions {
+            accepted: vec![engine_made],
+            rejected: vec![],
+        };
+        let r = Engine::with_defaults().repair_with(&manifest(), &old, &new, &prior);
+        assert!(r.needs_review());
+    }
+
+    #[test]
+    fn a_rejected_candidate_is_never_used_again() {
+        // The engine matches 0x10 to 0x110 uniquely; the reviewer said that is wrong.
+        let old = export("a", vec![func(0x10, "k")]);
+        let new = export("b", vec![func(0x110, "k")]);
+        let prior = PriorDecisions {
+            accepted: vec![],
+            rejected: vec![(Rva(0x10), Rva(0x110))],
+        };
+        let r = Engine::with_defaults().repair_with(&manifest(), &old, &new, &prior);
+        assert!(r.needs_review());
+        assert!(r.mappings.is_empty());
+        let RepairAction::NeedsReview { detail, .. } = &r.repairs[0].action else {
+            panic!("{:?}", r.repairs[0].action);
+        };
+        assert!(detail.contains("reviewer rejected 0x110"), "{detail}");
+        assert!(r.review_items[0].candidates.is_empty());
+    }
+
+    #[test]
+    fn rejected_alternatives_are_dropped_from_review() {
+        let (old, new) = ambiguous_pair();
+        let prior = PriorDecisions {
+            accepted: vec![],
+            rejected: vec![(Rva(0x10), Rva(0x110))],
+        };
+        let r = Engine::with_defaults().repair_with(&manifest(), &old, &new, &prior);
+        let news: Vec<Rva> = r.review_items[0]
+            .candidates
+            .iter()
+            .map(|c| c.candidate.new)
+            .collect();
+        assert_eq!(news, vec![Rva(0x120)]);
+    }
 }

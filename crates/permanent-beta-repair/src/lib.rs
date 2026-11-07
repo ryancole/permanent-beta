@@ -35,6 +35,9 @@ pub struct HookRepair {
     /// evidence; never accepted automatically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alternatives: Vec<VerificationReport>,
+    /// Set when a reviewer decided this hook's target (an accepted human mapping) instead of the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_by: Option<String>,
 }
 
 impl HookRepair {
@@ -62,6 +65,7 @@ pub fn decide(
         action: RepairAction::NeedsReview { reason, detail },
         verification: report,
         alternatives: Vec::new(),
+        reviewed_by: None,
     };
 
     let Some(old_fn) = old_fn else {
@@ -166,8 +170,34 @@ pub fn decide(
                 action,
                 verification: Some(report),
                 alternatives: Vec::new(),
+                reviewed_by: None,
             }
         }
+    }
+}
+
+/// A hook whose target a reviewer already decided (an accepted human mapping for this build pair). Not
+/// re-verified here: the reviewer decided on a verification report, which is stored with the mapping.
+pub fn from_review(
+    hook: &HookSpec,
+    old_fn: &FunctionFeatures,
+    new_fn: &FunctionFeatures,
+    reviewer: &str,
+) -> HookRepair {
+    HookRepair {
+        hook: hook.name.clone(),
+        old: Some(old_fn.rva),
+        action: if old_fn.rva == new_fn.rva {
+            RepairAction::Unchanged { rva: new_fn.rva }
+        } else {
+            RepairAction::Relocated {
+                old: old_fn.rva,
+                new: new_fn.rva,
+            }
+        },
+        verification: None,
+        alternatives: Vec::new(),
+        reviewed_by: Some(reviewer.to_owned()),
     }
 }
 
@@ -225,6 +255,7 @@ pub fn review_items(repairs: &[HookRepair], from: &BuildId, to: &BuildId) -> Vec
                     .chain(&r.alternatives)
                     .cloned()
                     .collect(),
+                status: Default::default(),
             }),
             _ => None,
         })

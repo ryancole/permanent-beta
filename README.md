@@ -65,6 +65,19 @@ Expected `repair` outcome for the demo: `ParseConfig` relocated; `CreateDocument
 no behavioral tests yet); `SaveDocument` needs review (parameter count changed); `ChecksumBlock` needs review as
 ambiguous (two identical functions exist in v2, and both are listed in its review item). Exit code `1` = some hooks need review.
 
+Decide a review item, then repair again: the decision is honored and `ChecksumBlock` is relocated, marked as
+decided by the reviewer.
+
+```bash
+cargo run -p permanent-beta-cli -- review accept ChecksumBlock:111111111111:222222222222 --candidate 0x2700 --reviewer you --store target/demo-store.json
+```
+
+`review accept` takes one of the item's verified candidates (`--candidate` is required when there are several;
+`--force` is required for one that verification rejected) and records a mapping decided by the reviewer.
+`review reject` says none of the candidates is the counterpart: they're never proposed for that function again,
+and the item stays closed until new candidates appear. The hook itself stays unresolved until its manifest entry
+is fixed by hand. Decisions are append-only.
+
 ## Exit codes
 
 | Code | Meaning |

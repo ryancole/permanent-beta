@@ -449,6 +449,14 @@ Principles:
 - **Transitive chains.** v1→v3 can be composed from v1→v2→v3, but a composed mapping is a *candidate*, not an
   accepted mapping. It still goes through verification against v3.
 - **Human decisions are training data.** Review decisions become labeled ground truth for calibration (§10).
+- **Review decisions (implemented in `JsonFileStore`).** An append-only decision log. *Accept* takes one of the
+  item's verified candidates and records a mapping decided by the reviewer, keeping its verification report; a
+  candidate that verification rejected needs an explicit `--force`, and a new function another live mapping
+  already claims is refused (one-to-one). *Reject* records every listed candidate as "not the counterpart" and
+  revokes any live mapping onto them. `repair --store` honors both: a reviewer's mapping resolves its hook, and a
+  rejected pair is never used again, as the candidate or as an alternative. A rejected item stays resolved while
+  a rerun offers nothing new and reopens when a new candidate appears. Not yet: revoking a reviewer's own
+  mapping, and accepting a function that isn't among the candidates (it would need its own verification).
 
 ### 9.2 Storage backends **[Provisional]**
 
@@ -550,7 +558,9 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 pbeta analyze <binary> --out a.json                       # native PE x64 analyzer
 pbeta match   --old a.json --new b.json [--json]
 pbeta repair  --old a.json --new b.json --hooks hooks.toml [--out hooks.new.toml] [--store path] [--json]
-pbeta review  list [--store path]
+pbeta review  list [--store path] [--all]
+pbeta review  accept <id> --reviewer <name> [--candidate <rva>] [--force] [--note text] [--store path]
+pbeta review  reject <id> --reviewer <name> [--note text] [--store path]
 ```
 
 Exit codes: `0` everything resolved · `1` some hooks need review · `2` error. That makes
