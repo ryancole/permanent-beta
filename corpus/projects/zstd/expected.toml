@@ -18,11 +18,16 @@
 # BIT_reloadDStreamFast, whose body became BIT_reloadDStream_internal (declared as a per-object rename); and
 # one real split: 1.5.6 moved ZSTD_findFrameCompressedSize's body into a new _advanced behind a wrapper, now
 # an ambiguity via the wrapper guard.
+# 2026-11-07, mnemonic-hash pass (same instruction sequence, operands changed; gated on size and an agreeing
+# matched neighbour): /O2 627 and 672, /O2+ICF 614 and 654, /Od 1697 and 1738, 0 wrong. It also takes about 60
+# functions per /O2 variant that similarity had sent to review and accepts them.
 
+# 2026-11-07, similarity margin calibrated 0.1 -> 0.05 (pbeta-corpus sweep): /O2 667 and 676, /O2+ICF 653 and 662,
+# /Od 1700 and 1738, 0 wrong.
 [gate.min_correct]
-"o2__v1.5.5__v1.5.6" = 623
-"o2__v1.5.6__v1.5.7" = 669
-"o2-icf__v1.5.5__v1.5.6" = 611
-"o2-icf__v1.5.6__v1.5.7" = 651
-"od__v1.5.5__v1.5.6" = 1674
-"od__v1.5.6__v1.5.7" = 1731
+"o2__v1.5.5__v1.5.6" = 667
+"o2__v1.5.6__v1.5.7" = 676
+"o2-icf__v1.5.5__v1.5.6" = 653
+"o2-icf__v1.5.6__v1.5.7" = 662
+"od__v1.5.5__v1.5.6" = 1700
+"od__v1.5.6__v1.5.7" = 1738

@@ -10,6 +10,9 @@ use crate::truth::GroundTruth;
 use anyhow::{Context, Result};
 use permanent_beta_analysis::{Analyzer, native::NativePeAnalyzer};
 use permanent_beta_engine::Engine;
+use permanent_beta_engine::permanent_beta_match::{SimilarityParams, matchers_with_similarity};
+use permanent_beta_engine::permanent_beta_verify::Verifier;
+use permanent_beta_model::AnalysisExport;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +24,19 @@ pub struct VariantScore {
 
 /// Analyze both builds natively, match them with the default engine, and score against the answer key.
 pub fn score_variant(dir: &Path, flags: &str, expected: &Expected) -> Result<VariantScore> {
+    let (truth, old, new) = load_variant(dir)?;
+    let report = Engine::with_defaults().match_builds(&old, &new);
+    let card = score(&truth, &report.reports, &report.ambiguities);
+    let evaluation = expected.evaluate(flags, &card);
+    Ok(VariantScore {
+        flags: flags.to_owned(),
+        card,
+        evaluation,
+    })
+}
+
+/// A variant's answer key and both builds' native analyses.
+pub fn load_variant(dir: &Path) -> Result<(GroundTruth, AnalysisExport, AnalysisExport)> {
     let truth_path = dir.join("truth.json");
     let truth: GroundTruth =
         serde_json::from_str(&std::fs::read_to_string(&truth_path).with_context(|| {
@@ -37,15 +53,49 @@ pub fn score_variant(dir: &Path, flags: &str, expected: &Expected) -> Result<Var
             .analyze(&exe)
             .with_context(|| format!("analyzing {}", exe.display()))
     };
-    let (old, new) = (analyze("v1")?, analyze("v2")?);
-    let report = Engine::with_defaults().match_builds(&old, &new);
-    let card = score(&truth, &report.reports, &report.ambiguities);
-    let evaluation = expected.evaluate(flags, &card);
-    Ok(VariantScore {
-        flags: flags.to_owned(),
-        card,
-        evaluation,
-    })
+    Ok((truth, analyze("v1")?, analyze("v2")?))
+}
+
+/// One point of a similarity-threshold sweep on one variant.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepPoint {
+    pub params: SimilarityParams,
+    /// Correct candidates (any verdict), and those accepted by the normal policy.
+    pub correct: u32,
+    pub accepted: u32,
+    pub wrong: u32,
+    /// The similarity pass's own share.
+    pub sim_correct: u32,
+    pub sim_wrong: u32,
+}
+
+/// Score the variant with each set of similarity thresholds (matching and verification as in the engine).
+pub fn sweep_variant(
+    truth: &GroundTruth,
+    old: &AnalysisExport,
+    new: &AnalysisExport,
+    grid: &[SimilarityParams],
+) -> Vec<SweepPoint> {
+    grid.iter()
+        .map(|&params| {
+            let engine = Engine::new(matchers_with_similarity(params), Verifier::with_defaults());
+            let report = engine.match_builds(old, new);
+            let card = score(truth, &report.reports, &report.ambiguities);
+            let sim = card
+                .by_pass()
+                .get("similarity")
+                .copied()
+                .unwrap_or_default();
+            SweepPoint {
+                params,
+                correct: card.totals.correct(),
+                accepted: card.totals.accepted,
+                wrong: card.totals.wrong,
+                sim_correct: sim.correct(),
+                sim_wrong: sim.wrong,
+            }
+        })
+        .collect()
 }
 
 fn single_exe(dir: &Path) -> Result<PathBuf> {

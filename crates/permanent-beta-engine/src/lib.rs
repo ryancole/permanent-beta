@@ -16,6 +16,7 @@ use permanent_beta_verify::{BehavioralRunner, Policy, Verifier, VerifyContext};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+pub use permanent_beta_match;
 pub use permanent_beta_repair;
 pub use permanent_beta_verify;
 

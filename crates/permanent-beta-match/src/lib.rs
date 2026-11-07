@@ -77,10 +77,19 @@ pub fn default_matchers() -> Vec<Box<dyn Matcher>> {
         Box::new(SymbolNameMatcher),
         Box::new(NormalizedHashMatcher),
         Box::new(UniqueStringsMatcher),
+        Box::new(MnemonicHashMatcher),
         Box::new(MatchedCalleesMatcher),
         Box::new(CallSequenceMatcher),
-        Box::new(SimilarityMatcher),
+        Box::new(SimilarityMatcher::default()),
     ]
+}
+
+/// The default passes with other similarity thresholds, for calibrating them on the corpus.
+pub fn matchers_with_similarity(params: SimilarityParams) -> Vec<Box<dyn Matcher>> {
+    let mut m = default_matchers();
+    m.pop();
+    m.push(Box::new(SimilarityMatcher { params }));
+    m
 }
 
 /// Run passes in order, repeating until no pass adds a candidate (so later passes can unlock earlier ones,
@@ -492,7 +501,117 @@ fn string_set_key(f: &FunctionFeatures) -> Option<String> {
     Some(s.join("\u{1f}"))
 }
 
-/// Pass 4: identical code that calls the same already-matched functions (design §5.1 pass 5a).
+/// Pass 4: the same instruction sequence (mnemonics only; operands may differ), unique on both sides, gated
+/// (design §5.1 pass 4). Catches a function whose code is unchanged except for operands: a changed constant,
+/// stack offset or struct field offset breaks the normalized hash but not the mnemonic sequence.
+///
+/// Uniqueness alone isn't safe: on short functions two unrelated ones can each have a unique sequence. So a
+/// unique pair becomes a candidate only if
+/// - both functions are at least [`MNEMONIC_MIN_SIZE`] bytes, and
+/// - a matched neighbour agrees: the old function calls a matched function whose counterpart the new function
+///   calls, or a matched caller's counterpart calls the new function. Without one it's a review suggestion.
+///
+/// Vetoed, like the strings pass, by a different register-argument count or by matched callers that disagree,
+/// and rechecked against the final matches.
+pub struct MnemonicHashMatcher;
+
+/// Smallest function the mnemonic pass matches, in bytes. [Guess] until calibrated: the `basic` fixture's
+/// smallest edited functions are around 20–40 bytes at /O2.
+pub const MNEMONIC_MIN_SIZE: u32 = 32;
+
+impl MnemonicHashMatcher {
+    /// A matched neighbour that agrees with pairing `old` with `new`, as evidence.
+    fn anchor(ctx: &MatchContext<'_>, old: Rva, new: Rva) -> Option<Evidence> {
+        let (o, n) = (ctx.old.function(old)?, ctx.new.function(new)?);
+        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|p| (p.old, p.new)).collect();
+        if let Some((oc, nc)) = o.callees.iter().filter(|c| **c != old).find_map(|c| {
+            map.get(c)
+                .filter(|m| n.callees.contains(m))
+                .map(|m| (*c, *m))
+        }) {
+            return Some(Evidence {
+                kind: evidence_kind::CALLEES.to_owned(),
+                detail: format!("both call matched {oc} -> {nc}"),
+            });
+        }
+        ctx.old
+            .functions
+            .iter()
+            .filter(|f| f.rva != old && f.callees.contains(&old))
+            .find_map(|caller| {
+                let nc = map.get(&caller.rva)?;
+                ctx.new
+                    .function(*nc)
+                    .filter(|f| f.callees.contains(&new))
+                    .map(|_| Evidence {
+                        kind: evidence_kind::CALL_SEQUENCE.to_owned(),
+                        detail: format!("called by matched {} -> {nc}", caller.rva),
+                    })
+            })
+    }
+}
+
+impl Matcher for MnemonicHashMatcher {
+    fn name(&self) -> &'static str {
+        "mnemonic-hash"
+    }
+
+    fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
+        let key = |f: &FunctionFeatures| {
+            (f.size >= MNEMONIC_MIN_SIZE)
+                .then(|| f.mnemonic_hash.clone())
+                .flatten()
+        };
+        let mut proposals = propose_by_key(
+            ctx,
+            self.name(),
+            0.8,
+            evidence_kind::MNEMONIC_HASH,
+            &key,
+            &|f: &FunctionFeatures| {
+                format!(
+                    "instruction sequence {}",
+                    f.mnemonic_hash.as_deref().unwrap_or("")
+                )
+            },
+        );
+        let mut kept = Vec::new();
+        for mut c in proposals.candidates {
+            let suggestion = |detail: String| Ambiguity {
+                matcher: self.name().to_owned(),
+                old: vec![c.old],
+                new: vec![c.new],
+                detail: format!("suggestion only: {detail}"),
+            };
+            if let Some(reason) = self.contradiction(ctx, &c) {
+                proposals.ambiguities.push(suggestion(reason));
+            } else if let Some(anchor) = Self::anchor(ctx, c.old, c.new) {
+                c.evidence.push(anchor);
+                kept.push(c);
+            } else {
+                proposals.ambiguities.push(suggestion(
+                    "same instruction sequence, but no matched neighbour agrees".into(),
+                ));
+            }
+        }
+        proposals.candidates = kept;
+        proposals
+    }
+
+    fn contradiction(&self, ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
+        let args = |e: &AnalysisExport, r| e.function(r).and_then(|f| f.inferred_args);
+        if let (Some(a), Some(b)) = (args(ctx.old, c.old), args(ctx.new, c.new)) {
+            if a != b {
+                return Some(format!(
+                    "same instruction sequence, but reads {a} -> {b} register arguments"
+                ));
+            }
+        }
+        callers_disagree(ctx, c).map(|r| format!("same instruction sequence, but {r}"))
+    }
+}
+
+/// Pass 5a: identical code that calls the same already-matched functions (design §5.1 pass 5a).
 ///
 /// Normalization masks call targets, so code that differs only in what it calls hashes the same, and the hash
 /// pass finds it ambiguous: e.g. zlib's `jmp`-only wrappers `adler32` → `adler32_z` and `crc32` → `crc32_z`.
@@ -823,13 +942,42 @@ impl Matcher for CallSequenceMatcher {
 ///   kind of edit this pass is for, and verification sends it to review.
 ///
 /// All thresholds and weights are [Guess] until calibrated against the corpus.
-pub struct SimilarityMatcher;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SimilarityMatcher {
+    pub params: SimilarityParams,
+}
 
-/// Minimum similarity score for a candidate. [Guess]
+/// The similarity pass's thresholds. `Default` is what the engine uses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimilarityParams {
+    pub min_score: f32,
+    pub min_margin: f32,
+    pub min_size: u32,
+}
+
+impl Default for SimilarityParams {
+    fn default() -> Self {
+        Self {
+            min_score: SIM_MIN_SCORE,
+            min_margin: SIM_MIN_MARGIN,
+            min_size: SIM_MIN_SIZE,
+        }
+    }
+}
+
+// Calibrated 2026-11-07 with `pbeta-corpus sweep` over the corpus (21 variants: basic, zlib, Lua, zstd):
+// - score: wrong matches appear at 0.70 (2, zstd 1.5.6 -> 1.5.7 /O2) and none at 0.75 or above, at any margin
+//   or size tried. So 0.75 is the lowest clean value, with no headroom below it.
+// - margin: no wrong match at any margin from 0.02 to 0.2 once the score is >= 0.75; 0.1 -> 0.05 adds 108
+//   correct (review) candidates. 0.05 sits halfway to the loosest clean value tried.
+// - size: 8 adds 11 correct over 16, 32 loses 21; kept at 16.
+// Calibrated on one small corpus: recheck with the sweep whenever the corpus grows.
+
+/// Minimum similarity score for a candidate. [Calibrated]
 pub const SIM_MIN_SCORE: f32 = 0.75;
-/// Minimum lead over the runner-up, on both sides. [Guess]
-pub const SIM_MIN_MARGIN: f32 = 0.1;
-/// Functions smaller than this (bytes) are left alone. [Guess]
+/// Minimum lead over the runner-up, on both sides. [Calibrated]
+pub const SIM_MIN_MARGIN: f32 = 0.05;
+/// Functions smaller than this (bytes) are left alone. [Calibrated]
 pub const SIM_MIN_SIZE: u32 = 16;
 /// Anchors shared by more functions than this are ignored when picking candidates. [Guess]
 pub const SIM_MAX_BUCKET: usize = 32;
@@ -937,7 +1085,7 @@ impl Matcher for SimilarityMatcher {
     fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
         let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|c| (c.old, c.new)).collect();
         let eligible =
-            |f: &FunctionFeatures| f.size >= SIM_MIN_SIZE && !f.mnemonic_counts.is_empty();
+            |f: &FunctionFeatures| f.size >= self.params.min_size && !f.mnemonic_counts.is_empty();
         let olds: Vec<&FunctionFeatures> = ctx
             .old
             .functions
@@ -1073,7 +1221,7 @@ impl Matcher for SimilarityMatcher {
         let mut proposals = Proposals::default();
         for (&o, ranked) in &by_old {
             let (best, n) = ranked[0];
-            if best < SIM_MIN_SCORE {
+            if best < self.params.min_score {
                 continue;
             }
             let theirs = &by_new[&n];
@@ -1104,7 +1252,10 @@ impl Matcher for SimilarityMatcher {
                         "similar code (best {best:.2}), but it's the only callee of an unmatched new                          function: the old code may have moved behind a new wrapper"
                     ),
                 });
-            } else if mutual && old_margin >= SIM_MIN_MARGIN && new_margin >= SIM_MIN_MARGIN {
+            } else if mutual
+                && old_margin >= self.params.min_margin
+                && new_margin >= self.params.min_margin
+            {
                 let s = &scored
                     .iter()
                     .find(|t| t.0 == o && t.1 == n)
@@ -1128,7 +1279,7 @@ impl Matcher for SimilarityMatcher {
             } else {
                 let close: Vec<Rva> = ranked
                     .iter()
-                    .filter(|x| x.0 >= best - SIM_MIN_MARGIN)
+                    .filter(|x| x.0 >= best - self.params.min_margin)
                     .take(3)
                     .map(|x| x.1)
                     .collect();
@@ -1385,6 +1536,124 @@ mod tests {
             .map(|(k, v)| (k.to_owned(), v))
             .collect();
         f
+    }
+
+    /// A function with a mnemonic sequence `mh` and normalized hash `nh`, `size` bytes, calling `callees`.
+    fn mnem(rva: u64, mh: &str, nh: &str, size: u32, callees: &[u64]) -> FunctionFeatures {
+        let mut f = func(rva, None, Some(nh));
+        f.mnemonic_hash = Some(mh.into());
+        f.size = size;
+        f.callees = callees.iter().map(|&r| Rva(r)).collect();
+        f
+    }
+
+    fn mnemonic_only() -> Vec<Box<dyn Matcher>> {
+        vec![
+            Box::new(SymbolNameMatcher),
+            Box::new(NormalizedHashMatcher),
+            Box::new(MnemonicHashMatcher),
+        ]
+    }
+
+    fn by(outcome: &MatchOutcome, matcher: &str) -> Vec<(u64, u64)> {
+        let mut v: Vec<_> = outcome
+            .candidates
+            .iter()
+            .filter(|c| matches!(&c.source, CandidateSource::Deterministic { matcher: m } if m == matcher))
+            .map(|c| (c.old.0, c.new.0))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// old: main -> f(0x10) -> leaf(0x40). new: main -> f'(0x110) -> leaf'(0x140). f and f' have the same
+    /// instruction sequence but different operands (different normalized hashes); main matches by name and
+    /// leaf by hash.
+    fn edited_operands(size: u32) -> (AnalysisExport, AnalysisExport) {
+        (
+            export(
+                "a",
+                vec![
+                    named_calling(0x1, "main", &[0x10]),
+                    mnem(0x10, "m-f", "old-f", size, &[0x40]),
+                    mnem(0x40, "m-leaf", "leaf", 48, &[]),
+                ],
+            ),
+            export(
+                "b",
+                vec![
+                    named_calling(0x101, "main", &[0x110]),
+                    mnem(0x110, "m-f", "new-f", size, &[0x140]),
+                    mnem(0x140, "m-leaf", "leaf", 48, &[]),
+                ],
+            ),
+        )
+    }
+
+    #[test]
+    fn an_operand_edit_is_matched_by_instruction_sequence_with_an_anchor() {
+        let (old, new) = edited_operands(64);
+        let out = run_passes(&old, &new, &mnemonic_only());
+        assert_eq!(by(&out, "mnemonic-hash"), vec![(0x10, 0x110)]);
+        let c = out.candidates.iter().find(|c| c.old == Rva(0x10)).unwrap();
+        let kinds: Vec<&str> = c.evidence.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![evidence_kind::MNEMONIC_HASH, evidence_kind::CALLEES]
+        );
+    }
+
+    #[test]
+    fn a_short_function_is_not_matched_by_instruction_sequence() {
+        let (old, new) = edited_operands(MNEMONIC_MIN_SIZE - 1);
+        let out = run_passes(&old, &new, &mnemonic_only());
+        assert!(by(&out, "mnemonic-hash").is_empty());
+    }
+
+    #[test]
+    fn without_an_agreeing_neighbour_it_is_only_a_suggestion() {
+        // Same sequence, both big enough, but nothing around them is matched.
+        let old = export("a", vec![mnem(0x10, "m-f", "old-f", 64, &[0x40])]);
+        let new = export("b", vec![mnem(0x110, "m-f", "new-f", 64, &[0x140])]);
+        let out = run_passes(&old, &new, &mnemonic_only());
+        assert!(out.candidates.is_empty());
+        assert!(
+            out.ambiguities
+                .iter()
+                .any(|a| a.matcher == "mnemonic-hash" && a.detail.contains("no matched neighbour")),
+            "{:?}",
+            out.ambiguities
+        );
+    }
+
+    #[test]
+    fn a_shared_instruction_sequence_is_ambiguous() {
+        let (old, mut new) = edited_operands(64);
+        new.functions
+            .push(mnem(0x180, "m-f", "other", 64, &[0x140]));
+        let out = run_passes(&old, &new, &mnemonic_only());
+        assert!(by(&out, "mnemonic-hash").is_empty());
+        assert!(
+            out.ambiguities
+                .iter()
+                .any(|a| a.matcher == "mnemonic-hash" && a.new == vec![Rva(0x110), Rva(0x180)])
+        );
+    }
+
+    #[test]
+    fn a_different_argument_count_or_disagreeing_caller_vetoes() {
+        let (mut old, new) = edited_operands(64);
+        let mut with_args = new.clone();
+        old.functions[1].inferred_args = Some(2);
+        with_args.functions[1].inferred_args = Some(3);
+        let out = run_passes(&old, &with_args, &mnemonic_only());
+        assert!(by(&out, "mnemonic-hash").is_empty());
+
+        // The callee agrees, but new main no longer calls f': its matched caller disagrees.
+        let (old, mut moved) = edited_operands(64);
+        moved.functions[0].callees = vec![Rva(0x140)];
+        let out = run_passes(&old, &moved, &mnemonic_only());
+        assert!(by(&out, "mnemonic-hash").is_empty(), "{:?}", out.candidates);
     }
 
     fn named_calling(rva: u64, name: &str, callees: &[u64]) -> FunctionFeatures {

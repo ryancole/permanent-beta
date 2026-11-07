@@ -1,6 +1,6 @@
 # Status — where we left off (2026-11-07)
 
-M2 (corpus) is done, M3's matching depth is done apart from the mnemonic-hash pass and the SQLite store, and **M4
+M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
@@ -29,6 +29,12 @@ What's new:
 - **Offsets header** (`pbeta header`): `hooks.gen.h` from the manifests; compiles as C and C++.
 - **Prototype proposals**: added register parameters (typed from the register class the analyzer now records,
   `inferred_arg_classes`) with a shim that keeps the existing detour unchanged.
+- **Mnemonic-hash pass** (M3, design §5.1 pass 4): same instruction sequence with changed operands, gated on size
+  (≥ 32 bytes) and an agreeing matched neighbour. 0 wrong; zstd up to +23 correct per variant and ~60 more
+  accepted per /O2 variant.
+- **Similarity thresholds calibrated** with the new `pbeta-corpus sweep` (a threshold grid scored over all 21
+  corpus variants): score 0.75 is the lowest with 0 wrong (0.70 gives 2), margin lowered 0.1 → 0.05 (+108
+  correct, 0 wrong), size kept at 16. Weights are still guesses. Baselines raised for Lua and zstd.
 - **Policy:** a behavioral pass now counts as one independent pass for low and normal criticality (design §6.3);
   high still needs 2 structural passes plus the behavioral pass. That resolves `apply_discount` (/O2) and
   `ship_order` (v2 → v3) through their trial runs, both correct per the answer key; hook-loop baselines raised.
@@ -61,8 +67,8 @@ What's new:
   pass's precision and recall.
   - Purpose-built fixture `basic` (`corpus/fixtures`): 3 flag sets.
   - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 159 of 163.
-  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 706–714 of ~735, /Od 1077–1085 of ~1095.
-  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 623–669 of ~729, /Od 1674–1731 of ~1879.
+  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 710–716 of ~735, /Od 1079–1085 of ~1095.
+  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 667–676 of ~729 (/O2+ICF 653–662), /Od 1700–1738 of ~1879.
   - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations,
     with trial runs, patterns, the header and proposed shims checked.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score`, `pwsh corpus/build-projects.ps1 -Score` and
@@ -88,12 +94,10 @@ What's new:
 1. **AI proposer** (M5, design §8): a local-model proposer for unmatched functions, through the same
    verification, measured separately on the corpus (precision, acceptance rate). The MCP server already takes
    proposals; this adds one that runs without an agent and gets scored.
-2. **Calibrate the similarity thresholds** (score 0.75, margin 0.1, size 16, weights; all [Guess]) from the
-   corpus: score distributions of correct vs ambiguous pairs. Fixture S3–S5 at /O2 are still unmatched.
-3. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.
-4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
+2. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.
+3. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
    proposals; both lean on PDB or Ghidra types.
-5. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
+4. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 
 ## Known rough edges
 

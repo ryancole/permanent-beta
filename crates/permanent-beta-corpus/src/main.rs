@@ -8,6 +8,7 @@ use permanent_beta_corpus::{
     fixture, hooks, map,
     truth::{GroundTruth, Scope},
 };
+use permanent_beta_engine::permanent_beta_match::SimilarityParams;
 use permanent_beta_model::{AnalysisExport, HookManifest};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -104,6 +105,27 @@ enum Command {
         #[arg(long)]
         step: Option<String>,
     },
+    /// Calibrate the similarity pass: score every built variant with a grid of thresholds (design §5.1 pass 6).
+    /// Prints, per setting, correct and wrong matches summed over all variants, and every variant with a wrong
+    /// match.
+    Sweep {
+        /// Built directories (like `score --built`). Repeatable.
+        #[arg(long, required = true)]
+        built: Vec<PathBuf>,
+        /// Minimum scores to try, comma-separated.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "0.6,0.65,0.7,0.75,0.8,0.85,0.9"
+        )]
+        scores: Vec<f32>,
+        /// Minimum margins to try.
+        #[arg(long, value_delimiter = ',', default_value = "0.02,0.05,0.1,0.15,0.2")]
+        margins: Vec<f32>,
+        /// Minimum sizes (bytes) to try.
+        #[arg(long, value_delimiter = ',', default_value = "8,16,32")]
+        sizes: Vec<u32>,
+    },
     /// Swap two hooks' RVAs: a deliberately wrong relocation for negative controls.
     HookSwap {
         #[arg(long)]
@@ -159,6 +181,90 @@ fn main() -> Result<ExitCode> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        Command::Sweep {
+            built,
+            scores,
+            margins,
+            sizes,
+        } => {
+            let mut grid = Vec::new();
+            for &min_size in &sizes {
+                for &min_score in &scores {
+                    for &min_margin in &margins {
+                        grid.push(SimilarityParams {
+                            min_score,
+                            min_margin,
+                            min_size,
+                        });
+                    }
+                }
+            }
+            let mut variants: Vec<PathBuf> = Vec::new();
+            for b in &built {
+                let mut v: Vec<PathBuf> = std::fs::read_dir(b)
+                    .with_context(|| format!("reading {}", b.display()))?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.join("truth.json").exists())
+                    .collect();
+                v.sort();
+                variants.extend(v);
+            }
+            anyhow::ensure!(!variants.is_empty(), "no built variants");
+            let mut sum: Vec<fixture::SweepPoint> = Vec::new();
+            let mut wrong_in: Vec<Vec<String>> = vec![Vec::new(); grid.len()];
+            for dir in &variants {
+                eprintln!("sweeping {}", dir.display());
+                let (truth, old, new) = fixture::load_variant(dir)?;
+                let points = fixture::sweep_variant(&truth, &old, &new, &grid);
+                for (i, p) in points.iter().enumerate() {
+                    if p.wrong > 0 {
+                        wrong_in[i].push(format!("{} ({})", dir.display(), p.wrong));
+                    }
+                }
+                if sum.is_empty() {
+                    sum = points;
+                } else {
+                    for (s, p) in sum.iter_mut().zip(&points) {
+                        s.correct += p.correct;
+                        s.accepted += p.accepted;
+                        s.wrong += p.wrong;
+                        s.sim_correct += p.sim_correct;
+                        s.sim_wrong += p.sim_wrong;
+                    }
+                }
+            }
+            println!(
+                "{} variants. Totals over all of them:\n{:>5} {:>6} {:>7} {:>8} {:>9} {:>6} {:>10} {:>9}",
+                variants.len(),
+                "size",
+                "score",
+                "margin",
+                "correct",
+                "accepted",
+                "wrong",
+                "sim-right",
+                "sim-wrong"
+            );
+            for (p, wrong) in sum.iter().zip(&wrong_in) {
+                println!(
+                    "{:>5} {:>6.2} {:>7.2} {:>8} {:>9} {:>6} {:>10} {:>9}{}",
+                    p.params.min_size,
+                    p.params.min_score,
+                    p.params.min_margin,
+                    p.correct,
+                    p.accepted,
+                    p.wrong,
+                    p.sim_correct,
+                    p.sim_wrong,
+                    if wrong.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  wrong in: {}", wrong.join(", "))
+                    }
+                );
+            }
+            Ok(ExitCode::SUCCESS)
         }
         Command::HookManifest {
             template,
