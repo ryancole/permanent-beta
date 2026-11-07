@@ -227,7 +227,7 @@ neighbourhood passes.
 | 4 | Mnemonic hash | `mnemonic_hash` unique | Deferred: on tiny functions, two unrelated functions can each have a unique mnemonic sequence, so uniqueness alone doesn't make it safe. Revisit with a minimum-size or similarity gate. |
 | 5a | Matched callees | `normalized_hash` + callee list mapped through earlier matches, unique on both sides | Implemented (`MatchedCalleesMatcher`). Normalization masks call targets, so code differing only in what it calls is hash-ambiguous (zlib's `adler32`/`crc32` `jmp` wrappers). Every callee must already be matched; no callees means no key. On zlib: /O2 61→63, /Od 150→154 and 152→156, 0 wrong. |
 | 5 | Call-graph propagation | Callees of matched callers | Implemented (`CallSequenceMatcher`), iterated to fixpoint. **Candidate** only when a callee's code occurs exactly once among the caller's unmatched callees in both builds, which doesn't depend on call order. Pairing by call *position* (or repeated identical code by order) is a **review suggestion** (an ambiguity), never a candidate: MSVC reorders calls to side-effect-free functions, and in the `basic` fixture that paired a deleted function with an edited one. The corpus gate caught it. |
-| 6 | Structural similarity | CFG fingerprint + feature vector, best-vs-second-best margin | Planned; this is where false positives live. |
+| 6 | Structural similarity | Weighted feature similarity among anchored pairs, best-vs-second-best margin on both sides | Implemented (`SimilarityMatcher`), a **weak** pass: it runs only once every stronger pass has stopped. Candidates share an anchor (matched callee or caller, string, constant, import). Score: weighted mean of code (mnemonic counts), shape (blocks, edges), size, matched callees and callers, strings, constants, imports. Candidate only if mutual best, score ≥ 0.75 and ≥ 0.1 ahead of the runner-up on both sides, size ≥ 16 bytes **[Guess]**. Vetoed by disagreeing matched callers; a new function that's the only callee of an unmatched new function gives an ambiguity (body moved behind a wrapper, zstd 1.5.6). Its evidence implies the neighbour, string, constant, import and size checks, so its matches go to review. On the corpus: 0 wrong; zstd /O2 433–511 → 623–669 correct, Lua /O2 642–667 → 706–714. |
 | 7 | AI proposer | Pseudocode comparison for leftovers | Optional (§8). |
 
 ### 5.2 Invariants
@@ -270,7 +270,8 @@ Implemented as small `StructuralCheck`s returning `pass | fail | inconclusive` w
 **Independence (implemented):** a check that measures what the candidate's evidence already established adds
 nothing, so its pass doesn't count (`CheckResult.counted = false`, visible to reviewers). Implied checks per
 evidence kind (`permanent_beta_verify::implied_checks`): normalized hash → string refs, size, constants and inferred
-args; strings → string refs; call sequence → callers; matched callees → callees. Failures always count, so evidence can't excuse a failing check.
+args; strings → string refs; call sequence → callers; matched callees → callees; similarity → string refs, size,
+callers, callees, constants and imports. Failures always count, so evidence can't excuse a failing check.
 
 ### 6.2 Behavioral checks
 
@@ -523,14 +524,15 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 
   | Project | Tags | /O2 correct | /Od correct |
   |---|---|---|---|
-  | zlib | v1.2.13 → v1.3 → v1.3.1 | 69 of 69 | 154–156 of 163 |
-  | Lua | v5.4.6 → v5.4.7 → v5.4.8 | 642–667 of ~735 | 1016–1045 of ~1095 |
-  | zstd | v1.5.5 → v1.5.6 → v1.5.7 | 433–511 of ~728 | 1283–1516 of ~1877 |
+  | zlib | v1.2.13 → v1.3 → v1.3.1 | 69 of 69 | 159 of 163 |
+  | Lua | v5.4.6 → v5.4.7 → v5.4.8 | 706–714 of ~735 | 1077–1085 of ~1095 |
+  | zstd | v1.5.5 → v1.5.6 → v1.5.7 | 623–669 of ~729 | 1674–1731 of ~1879 |
 
   The scorecard reports precision and recall per pass. The second and third projects each found a real false
   positive in the strings pass that zlib couldn't: a literal moved into a new helper (Lua 5.4.8), and a body
-  moved behind a wrapper (zstd 1.5.7). See §5.1 for the vetoes added. zstd's ~40% unmatched at /O2 is where
-  similarity matching (§5.1 pass 6) should be measured.
+  moved behind a wrapper (zstd 1.5.7). See §5.1 for the vetoes added. The similarity pass (§5.1 pass 6) then
+  found a split zlib and Lua don't have (zstd 1.5.6's ZSTD_findFrameCompressedSize) and several undeclared
+  renames.
 - **Answer-key pitfalls:** joining by name must survive linkage changes (zlib 1.3.1 made minigzip's helpers
   `static`) and functions moving between object files (`truth.rs`, two-stage join). Renames can't be inferred
   safely, so they're declared per project in `recipe.psd1` after checking the sources (Lua 5.4.7 renamed six

@@ -39,6 +39,12 @@ pub trait Matcher {
     fn contradiction(&self, _ctx: &MatchContext<'_>, _candidate: &Candidate) -> Option<String> {
         None
     }
+
+    /// A weak pass runs only once every other pass has stopped finding anything, so a weak guess never
+    /// claims a function that stronger evidence would have matched. Default: not weak.
+    fn weak(&self) -> bool {
+        false
+    }
 }
 
 /// Result of all passes.
@@ -73,6 +79,7 @@ pub fn default_matchers() -> Vec<Box<dyn Matcher>> {
         Box::new(UniqueStringsMatcher),
         Box::new(MatchedCalleesMatcher),
         Box::new(CallSequenceMatcher),
+        Box::new(SimilarityMatcher),
     ]
 }
 
@@ -137,49 +144,63 @@ struct Round {
     ambiguities: Vec<Ambiguity>,
 }
 
-/// One fixpoint of all passes, never accepting a banned pair.
+/// One fixpoint of all passes, never accepting a banned pair. The strong passes run to a fixpoint first; then
+/// the weak passes run one at a time, and anything a weak pass adds goes back to the strong passes.
 fn run_round(
     old: &AnalysisExport,
     new: &AnalysisExport,
     matchers: &[Box<dyn Matcher>],
     banned: &BTreeMap<(Rva, Rva), Ambiguity>,
 ) -> Round {
-    let mut matched_old = HashSet::new();
-    let mut matched_new = HashSet::new();
-    let mut accepted = Vec::new();
-    let mut ambiguities = Vec::new();
+    let mut round = Round {
+        candidates: Vec::new(),
+        matched_old: HashSet::new(),
+        matched_new: HashSet::new(),
+        ambiguities: Vec::new(),
+    };
+    let (weak, strong): (Vec<&dyn Matcher>, Vec<&dyn Matcher>) =
+        matchers.iter().map(|m| m.as_ref()).partition(|m| m.weak());
     loop {
-        let before = accepted.len();
-        for matcher in matchers {
-            let ctx = MatchContext {
-                old,
-                new,
-                matched_old: &matched_old,
-                matched_new: &matched_new,
-                pairs: &accepted,
-            };
-            let proposals = matcher.propose(&ctx);
-            for c in proposals.candidates {
-                if !matched_old.contains(&c.old)
-                    && !matched_new.contains(&c.new)
-                    && !banned.contains_key(&(c.old, c.new))
-                {
-                    matched_old.insert(c.old);
-                    matched_new.insert(c.new);
-                    accepted.push(c);
-                }
-            }
-            ambiguities.extend(proposals.ambiguities);
-        }
-        if accepted.len() == before {
-            break;
+        while strong
+            .iter()
+            .fold(false, |added, m| round.apply(*m, old, new, banned) | added)
+        {}
+        if !weak.iter().any(|m| round.apply(*m, old, new, banned)) {
+            return round;
         }
     }
-    Round {
-        candidates: accepted,
-        matched_old,
-        matched_new,
-        ambiguities,
+}
+
+impl Round {
+    /// Run one pass and accept its unclaimed, unbanned candidates. True if it added any.
+    fn apply(
+        &mut self,
+        matcher: &dyn Matcher,
+        old: &AnalysisExport,
+        new: &AnalysisExport,
+        banned: &BTreeMap<(Rva, Rva), Ambiguity>,
+    ) -> bool {
+        let ctx = MatchContext {
+            old,
+            new,
+            matched_old: &self.matched_old,
+            matched_new: &self.matched_new,
+            pairs: &self.candidates,
+        };
+        let proposals = matcher.propose(&ctx);
+        let before = self.candidates.len();
+        for c in proposals.candidates {
+            if !self.matched_old.contains(&c.old)
+                && !self.matched_new.contains(&c.new)
+                && !banned.contains_key(&(c.old, c.new))
+            {
+                self.matched_old.insert(c.old);
+                self.matched_new.insert(c.new);
+                self.candidates.push(c);
+            }
+        }
+        self.ambiguities.extend(proposals.ambiguities);
+        self.candidates.len() > before
     }
 }
 
@@ -433,26 +454,32 @@ impl Matcher for UniqueStringsMatcher {
                 ));
             }
         }
-        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|p| (p.old, p.new)).collect();
-        let mapped: Vec<Rva> = ctx
-            .old
-            .functions
-            .iter()
-            .filter(|f| f.rva != c.old && f.callees.contains(&c.old))
-            .filter_map(|f| map.get(&f.rva).copied())
-            .collect();
-        let agrees = mapped.iter().any(|&nc| {
-            ctx.new
-                .function(nc)
-                .is_some_and(|f| f.callees.contains(&c.new))
-        });
-        (!mapped.is_empty() && !agrees).then(|| {
-            format!(
-                "same strings, but none of the {} matched caller(s) calls the new function",
-                mapped.len()
-            )
-        })
+        callers_disagree(ctx, c).map(|r| format!("same strings, but {r}"))
     }
+}
+
+/// The old function has matched callers, and none of their counterparts calls the new function. A veto only
+/// costs recall, so one disagreeing caller is enough.
+fn callers_disagree(ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
+    let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|p| (p.old, p.new)).collect();
+    let mapped: Vec<Rva> = ctx
+        .old
+        .functions
+        .iter()
+        .filter(|f| f.rva != c.old && f.callees.contains(&c.old))
+        .filter_map(|f| map.get(&f.rva).copied())
+        .collect();
+    let agrees = mapped.iter().any(|&nc| {
+        ctx.new
+            .function(nc)
+            .is_some_and(|f| f.callees.contains(&c.new))
+    });
+    (!mapped.is_empty() && !agrees).then(|| {
+        format!(
+            "none of the {} matched caller(s) calls the new function",
+            mapped.len()
+        )
+    })
 }
 
 fn string_set_key(f: &FunctionFeatures) -> Option<String> {
@@ -778,6 +805,352 @@ impl Matcher for CallSequenceMatcher {
     }
 }
 
+/// Pass 6: structural similarity, for edited functions (design §5.1 pass 6). Weak: it runs only once every
+/// stronger pass has stopped.
+///
+/// - **Candidates** for an unmatched old function are the unmatched new functions that share an anchor with it:
+///   a matched callee or caller, a string, a constant or an import. Anchors held by more than
+///   [`SIM_MAX_BUCKET`] functions are too common to count.
+/// - **Score:** the weighted mean of the components both functions have data for: code (mnemonic counts,
+///   order-free), shape (blocks and edges), size, matched callees, matched callers, strings, constants and
+///   imports.
+/// - **Candidate** only if the pair is each function's best, scores at least [`SIM_MIN_SCORE`], and beats the
+///   runner-up on *both* sides by [`SIM_MIN_MARGIN`]. Otherwise an old function with a qualifying best is an
+///   ambiguity listing its closest competitors. Functions under [`SIM_MIN_SIZE`] bytes are skipped: small
+///   functions look alike.
+/// - **Vetoed** when the old function's matched callers don't call the new one (rechecked against the final
+///   matches). A different inferred argument count is *not* a veto here: an added parameter is exactly the
+///   kind of edit this pass is for, and verification sends it to review.
+///
+/// All thresholds and weights are [Guess] until calibrated against the corpus.
+pub struct SimilarityMatcher;
+
+/// Minimum similarity score for a candidate. [Guess]
+pub const SIM_MIN_SCORE: f32 = 0.75;
+/// Minimum lead over the runner-up, on both sides. [Guess]
+pub const SIM_MIN_MARGIN: f32 = 0.1;
+/// Functions smaller than this (bytes) are left alone. [Guess]
+pub const SIM_MIN_SIZE: u32 = 16;
+/// Anchors shared by more functions than this are ignored when picking candidates. [Guess]
+pub const SIM_MAX_BUCKET: usize = 32;
+
+/// Component weights. [Guess]
+const SIM_WEIGHTS: [(&str, f32); 8] = [
+    ("code", 3.0),
+    ("shape", 1.0),
+    ("size", 1.0),
+    ("callees", 2.0),
+    ("callers", 2.0),
+    ("strings", 2.0),
+    ("constants", 1.0),
+    ("imports", 1.0),
+];
+
+fn jaccard<T: Ord>(a: &BTreeSet<T>, b: &BTreeSet<T>) -> Option<f32> {
+    let union = a.union(b).count();
+    (union > 0).then(|| a.intersection(b).count() as f32 / union as f32)
+}
+
+fn ratio(a: u32, b: u32) -> f32 {
+    match a.max(b) {
+        0 => 1.0,
+        hi => a.min(b) as f32 / hi as f32,
+    }
+}
+
+/// Sum of minimum counts over sum of maximum counts.
+fn weighted_jaccard(a: &BTreeMap<String, u32>, b: &BTreeMap<String, u32>) -> Option<f32> {
+    let (mut lo, mut hi) = (0u32, 0u32);
+    for k in a.keys().chain(b.keys().filter(|k| !a.contains_key(*k))) {
+        let (x, y) = (
+            a.get(k).copied().unwrap_or(0),
+            b.get(k).copied().unwrap_or(0),
+        );
+        lo += x.min(y);
+        hi += x.max(y);
+    }
+    (hi > 0).then(|| lo as f32 / hi as f32)
+}
+
+struct Similarity {
+    score: f32,
+    parts: Vec<(&'static str, f32)>,
+}
+
+/// One side's view of a function for scoring: its neighbours, expressed in new-build addresses.
+struct Side<'a> {
+    f: &'a FunctionFeatures,
+    callees: BTreeSet<Rva>,
+    callers: BTreeSet<Rva>,
+}
+
+fn similarity(o: &Side<'_>, n: &Side<'_>) -> Option<Similarity> {
+    let code = weighted_jaccard(&o.f.mnemonic_counts, &n.f.mnemonic_counts)?;
+    let set = |v: &[String]| v.iter().cloned().collect::<BTreeSet<String>>();
+    let consts = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
+    let shape = match (o.f.basic_blocks, n.f.basic_blocks, o.f.edges, n.f.edges) {
+        (Some(a), Some(b), Some(c), Some(d)) => Some((ratio(a, b) + ratio(c, d)) / 2.0),
+        (Some(a), Some(b), _, _) => Some(ratio(a, b)),
+        _ => None,
+    };
+    let values = [
+        Some(code),
+        shape,
+        Some(ratio(o.f.size, n.f.size)),
+        jaccard(&o.callees, &n.callees),
+        jaccard(&o.callers, &n.callers),
+        jaccard(&set(&o.f.strings), &set(&n.f.strings)),
+        jaccard(&consts(&o.f.constants), &consts(&n.f.constants)),
+        jaccard(&set(&o.f.imports), &set(&n.f.imports)),
+    ];
+    let parts: Vec<(&'static str, f32)> = SIM_WEIGHTS
+        .iter()
+        .zip(values)
+        .filter_map(|(&(name, _), v)| Some((name, v?)))
+        .collect();
+    let (sum, weight) = parts.iter().fold((0.0, 0.0), |(s, w), &(name, v)| {
+        let wt = SIM_WEIGHTS
+            .iter()
+            .find(|x| x.0 == name)
+            .map_or(0.0, |x| x.1);
+        (s + wt * v, w + wt)
+    });
+    Some(Similarity {
+        score: sum / weight,
+        parts,
+    })
+}
+
+impl Matcher for SimilarityMatcher {
+    fn name(&self) -> &'static str {
+        "similarity"
+    }
+
+    fn weak(&self) -> bool {
+        true
+    }
+
+    fn contradiction(&self, ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
+        callers_disagree(ctx, c).map(|r| format!("similar code, but {r}"))
+    }
+
+    fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
+        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|c| (c.old, c.new)).collect();
+        let eligible =
+            |f: &FunctionFeatures| f.size >= SIM_MIN_SIZE && !f.mnemonic_counts.is_empty();
+        let olds: Vec<&FunctionFeatures> = ctx
+            .old
+            .functions
+            .iter()
+            .filter(|f| !ctx.matched_old.contains(&f.rva) && eligible(f))
+            .collect();
+        let news: Vec<&FunctionFeatures> = ctx
+            .new
+            .functions
+            .iter()
+            .filter(|f| !ctx.matched_new.contains(&f.rva) && eligible(f))
+            .collect();
+        if olds.is_empty() || news.is_empty() {
+            return Proposals::default();
+        }
+        let callers_of = |e: &AnalysisExport| {
+            let mut out: HashMap<Rva, Vec<Rva>> = HashMap::new();
+            for f in &e.functions {
+                for &c in &f.callees {
+                    if c != f.rva {
+                        out.entry(c).or_default().push(f.rva);
+                    }
+                }
+            }
+            out
+        };
+        let (old_callers, new_callers) = (callers_of(ctx.old), callers_of(ctx.new));
+        // Neighbours in new-build addresses: (callees, callers).
+        let old_neighbours = |f: &FunctionFeatures| -> (BTreeSet<Rva>, BTreeSet<Rva>) {
+            let callees = f
+                .callees
+                .iter()
+                .filter_map(|c| map.get(c).copied())
+                .collect();
+            let callers = old_callers
+                .get(&f.rva)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| map.get(c).copied())
+                .collect();
+            (callees, callers)
+        };
+        let new_neighbours = |f: &FunctionFeatures| -> (BTreeSet<Rva>, BTreeSet<Rva>) {
+            let callees = f
+                .callees
+                .iter()
+                .copied()
+                .filter(|c| ctx.matched_new.contains(c))
+                .collect();
+            let callers = new_callers
+                .get(&f.rva)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|c| ctx.matched_new.contains(c))
+                .collect();
+            (callees, callers)
+        };
+        let new_sides: HashMap<Rva, Side<'_>> = news
+            .iter()
+            .map(|&f| {
+                let (callees, callers) = new_neighbours(f);
+                (
+                    f.rva,
+                    Side {
+                        f,
+                        callees,
+                        callers,
+                    },
+                )
+            })
+            .collect();
+
+        // Anchor buckets over the unmatched new functions.
+        let mut by_anchor: HashMap<String, Vec<Rva>> = HashMap::new();
+        for (rva, s) in &new_sides {
+            let mut anchors: BTreeSet<String> = BTreeSet::new();
+            anchors.extend(s.callees.iter().map(|c| format!("callee:{c}")));
+            anchors.extend(s.callers.iter().map(|c| format!("caller:{c}")));
+            anchors.extend(s.f.strings.iter().map(|x| format!("string:{x}")));
+            anchors.extend(s.f.constants.iter().map(|x| format!("constant:{x}")));
+            anchors.extend(s.f.imports.iter().map(|x| format!("import:{x}")));
+            for a in anchors {
+                by_anchor.entry(a).or_default().push(*rva);
+            }
+        }
+
+        // Score every anchored pair.
+        let mut scored: Vec<(Rva, Rva, Similarity)> = Vec::new();
+        for &f in &olds {
+            let (callees, callers) = old_neighbours(f);
+            let o = Side {
+                f,
+                callees,
+                callers,
+            };
+            let mut anchors: BTreeSet<String> = BTreeSet::new();
+            anchors.extend(o.callees.iter().map(|c| format!("callee:{c}")));
+            anchors.extend(o.callers.iter().map(|c| format!("caller:{c}")));
+            anchors.extend(f.strings.iter().map(|x| format!("string:{x}")));
+            anchors.extend(f.constants.iter().map(|x| format!("constant:{x}")));
+            anchors.extend(f.imports.iter().map(|x| format!("import:{x}")));
+            let candidates: BTreeSet<Rva> = anchors
+                .iter()
+                .filter_map(|a| by_anchor.get(a))
+                .filter(|b| b.len() <= SIM_MAX_BUCKET)
+                .flatten()
+                .copied()
+                .collect();
+            for n in candidates {
+                if let Some(s) = similarity(&o, &new_sides[&n]) {
+                    scored.push((f.rva, n, s));
+                }
+            }
+        }
+
+        // Best and runner-up per function on each side (ties broken by address, so they stay ties in margin).
+        let rank = |key: &dyn Fn(&(Rva, Rva, Similarity)) -> Rva| {
+            let mut out: BTreeMap<Rva, Vec<(f32, Rva)>> = BTreeMap::new();
+            for t in &scored {
+                let other = if key(t) == t.0 { t.1 } else { t.0 };
+                out.entry(key(t)).or_default().push((t.2.score, other));
+            }
+            for v in out.values_mut() {
+                v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            }
+            out
+        };
+        let by_old = rank(&|t| t.0);
+        let by_new = rank(&|t| t.1);
+        let runner_up = |v: &[(f32, Rva)]| v.get(1).map_or(0.0, |x| x.0);
+
+        let mut proposals = Proposals::default();
+        for (&o, ranked) in &by_old {
+            let (best, n) = ranked[0];
+            if best < SIM_MIN_SCORE {
+                continue;
+            }
+            let theirs = &by_new[&n];
+            let mutual = theirs[0].1 == o;
+            let old_margin = best - runner_up(ranked);
+            let new_margin = best - runner_up(theirs);
+            // Body moved behind a new wrapper (zstd 1.5.6's ZSTD_findFrameCompressedSize, now a wrapper around
+            // a new _advanced): the new function is the only callee of an unmatched new function, so the old
+            // one may correspond to either.
+            let wrapper = new_callers
+                .get(&n)
+                .into_iter()
+                .flatten()
+                .copied()
+                .find(|&w| {
+                    !ctx.matched_new.contains(&w)
+                        && ctx
+                            .new
+                            .function(w)
+                            .is_some_and(|f| f.callees.as_slice() == [n])
+                });
+            if let Some(w) = wrapper {
+                proposals.ambiguities.push(Ambiguity {
+                    matcher: self.name().to_owned(),
+                    old: vec![o],
+                    new: vec![w, n],
+                    detail: format!(
+                        "similar code (best {best:.2}), but it's the only callee of an unmatched new                          function: the old code may have moved behind a new wrapper"
+                    ),
+                });
+            } else if mutual && old_margin >= SIM_MIN_MARGIN && new_margin >= SIM_MIN_MARGIN {
+                let s = &scored
+                    .iter()
+                    .find(|t| t.0 == o && t.1 == n)
+                    .expect("ranked pairs come from `scored`")
+                    .2;
+                let parts: Vec<String> =
+                    s.parts.iter().map(|(k, v)| format!("{k} {v:.2}")).collect();
+                proposals.candidates.push(candidate(
+                    self.name(),
+                    o,
+                    n,
+                    best,
+                    evidence_kind::SIMILARITY,
+                    format!(
+                        "similarity {best:.2} (runner-up {:.2} / {:.2}): {}",
+                        runner_up(ranked),
+                        runner_up(theirs),
+                        parts.join(", ")
+                    ),
+                ));
+            } else {
+                let close: Vec<Rva> = ranked
+                    .iter()
+                    .filter(|x| x.0 >= best - SIM_MIN_MARGIN)
+                    .take(3)
+                    .map(|x| x.1)
+                    .collect();
+                proposals.ambiguities.push(Ambiguity {
+                    matcher: self.name().to_owned(),
+                    old: vec![o],
+                    detail: format!(
+                        "similar code, best {best:.2}, but {}",
+                        if mutual {
+                            "not clearly ahead of the runner-up"
+                        } else {
+                            "the new function is closer to another old one"
+                        }
+                    ),
+                    new: if close.contains(&n) { close } else { vec![n] },
+                });
+            }
+        }
+        proposals
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +1167,7 @@ mod tests {
             inferred_args: None,
             entry: None,
             basic_blocks: None,
+            mnemonic_counts: Default::default(),
             edges: None,
             callees: vec![],
             strings: vec![],
@@ -995,6 +1369,198 @@ mod tests {
     fn a_string_match_its_matched_caller_agrees_with_is_kept() {
         let (old, new) = moved_body(0x200);
         assert!(pairs(&old, &new).contains(&(0x10, 0x200)));
+    }
+
+    // Similarity pass. `main` and `x` are matched by name; f is edited (different hash, similar code).
+
+    fn body(rva: u64, hash: &str, adds: u32, callees: &[u64], size: u32) -> FunctionFeatures {
+        let mut f = func(rva, None, Some(hash));
+        f.size = size;
+        f.basic_blocks = Some(3);
+        f.edges = Some(3);
+        f.callees = callees.iter().map(|&r| Rva(r)).collect();
+        f.mnemonic_counts = [("Mov", 10), ("Add", adds), ("Ret", 1)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        f
+    }
+
+    fn named_calling(rva: u64, name: &str, callees: &[u64]) -> FunctionFeatures {
+        let mut f = func(rva, Some(name), None);
+        f.callees = callees.iter().map(|&r| Rva(r)).collect();
+        f
+    }
+
+    /// old: main → f(0x10) → x. new: main → `main_callees`, plus `rest`.
+    fn edited(
+        main_callees: &[u64],
+        rest: Vec<FunctionFeatures>,
+    ) -> (AnalysisExport, AnalysisExport) {
+        let old = export(
+            "a",
+            vec![
+                named_calling(1, "main", &[0x10]),
+                named_calling(0x50, "x", &[]),
+                body(0x10, "h1", 5, &[0x50], 64),
+            ],
+        );
+        let mut new_fns = vec![
+            named_calling(2, "main", main_callees),
+            named_calling(0x150, "x", &[]),
+        ];
+        new_fns.extend(rest);
+        (old, export("b", new_fns))
+    }
+
+    #[test]
+    fn an_edited_function_is_matched_by_similarity() {
+        let (old, new) = edited(&[0x110], vec![body(0x110, "h2", 6, &[0x150], 66)]);
+        assert!(pairs(&old, &new).contains(&(0x10, 0x110)));
+        assert_eq!(matcher_of(&old, &new, 0x10).as_deref(), Some("similarity"));
+    }
+
+    #[test]
+    fn two_equally_similar_candidates_give_no_candidate() {
+        // Two near-identical edited copies, both called by main: no margin, so review gets both.
+        let (old, new) = edited(
+            &[0x110, 0x120],
+            vec![
+                body(0x110, "h2", 6, &[0x150], 66),
+                body(0x120, "h3", 6, &[0x150], 66),
+            ],
+        );
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(!got.candidates.iter().any(|c| c.old == Rva(0x10)));
+        assert!(
+            got.competitors(Rva(0x10)).contains(&Rva(0x110))
+                && got.competitors(Rva(0x10)).contains(&Rva(0x120)),
+            "{:?}",
+            got.ambiguities
+        );
+    }
+
+    #[test]
+    fn similar_code_with_nothing_in_common_is_not_a_candidate() {
+        // Same shape, but no shared matched callee, caller, string, constant or import: no anchor.
+        let old = export("a", vec![body(0x10, "h1", 5, &[], 64)]);
+        let new = export("b", vec![body(0x110, "h2", 6, &[], 66)]);
+        assert!(pairs(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn tiny_functions_are_left_alone() {
+        let old = export(
+            "a",
+            vec![
+                named_calling(1, "main", &[0x10]),
+                named_calling(0x50, "x", &[]),
+                body(0x10, "h1", 5, &[0x50], 8),
+            ],
+        );
+        let new = export(
+            "b",
+            vec![
+                named_calling(2, "main", &[0x110]),
+                named_calling(0x150, "x", &[]),
+                body(0x110, "h2", 6, &[0x150], 9),
+            ],
+        );
+        assert!(!pairs(&old, &new).iter().any(|&(o, _)| o == 0x10));
+    }
+
+    #[test]
+    fn a_body_behind_a_new_wrapper_is_an_ambiguity() {
+        // zstd 1.5.6: main now calls a new wrapper w, and the edited body sits behind it.
+        let (old, new) = edited(
+            &[0x130],
+            vec![
+                body(0x130, "hw", 0, &[0x110], 8),
+                body(0x110, "h2", 6, &[0x150], 66),
+            ],
+        );
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x10)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(
+            got.ambiguities
+                .iter()
+                .any(|a| a.old == vec![Rva(0x10)] && a.new == vec![Rva(0x130), Rva(0x110)]),
+            "{:?}",
+            got.ambiguities
+        );
+    }
+
+    /// Proposes fixed pairs; `after` makes it wait until that old function is matched.
+    struct Fixed {
+        name: &'static str,
+        weak: bool,
+        pair: (u64, u64),
+        after: Option<u64>,
+    }
+
+    impl Matcher for Fixed {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn weak(&self) -> bool {
+            self.weak
+        }
+        fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
+            if self
+                .after
+                .is_some_and(|a| !ctx.matched_old.contains(&Rva(a)))
+            {
+                return Proposals::default();
+            }
+            Proposals {
+                candidates: vec![candidate(
+                    self.name,
+                    Rva(self.pair.0),
+                    Rva(self.pair.1),
+                    0.5,
+                    "test",
+                    String::new(),
+                )],
+                ambiguities: vec![],
+            }
+        }
+    }
+
+    #[test]
+    fn a_weak_pass_waits_for_the_strong_passes_to_finish() {
+        // Listed first, the weak pass would claim 1 → 100 at once. Strong pass A only finds 1 → 200 after
+        // strong pass B has matched 2, in the second iteration; it must still win.
+        let matchers: Vec<Box<dyn Matcher>> = vec![
+            Box::new(Fixed {
+                name: "weak",
+                weak: true,
+                pair: (1, 100),
+                after: None,
+            }),
+            Box::new(Fixed {
+                name: "a",
+                weak: false,
+                pair: (1, 200),
+                after: Some(2),
+            }),
+            Box::new(Fixed {
+                name: "b",
+                weak: false,
+                pair: (2, 300),
+                after: None,
+            }),
+        ];
+        let empty = export("x", vec![]);
+        let got: Vec<(u64, u64)> = run_passes(&empty, &empty, &matchers)
+            .candidates
+            .iter()
+            .map(|c| (c.old.0, c.new.0))
+            .collect();
+        assert_eq!(got, vec![(2, 300), (1, 200)]);
     }
 
     // Call-sequence pass. `main` is matched by name; its callees are given in call order.

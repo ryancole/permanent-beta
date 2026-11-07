@@ -268,6 +268,7 @@ mod tests {
             inferred_args: None,
             entry: None,
             basic_blocks: None,
+            mnemonic_counts: Default::default(),
             edges: None,
             callees: vec![],
             strings: vec![],

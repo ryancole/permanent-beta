@@ -12,11 +12,17 @@
 # ZSTD_entropyCompressSeqStore_wExtLitBuffer behind a wrapper, and the strings pass paired the old function
 # with the new body. String matches are now rechecked against the final matches and vetoed when the old
 # function's matched callers don't call the new one. It also found four renames, declared in recipe.psd1.
+# 2026-11-06, similarity pass: /O2 623 of 726 and 669 of 731, /O2+ICF 611 of 696 and 651 of 701,
+# /Od 1674 of 1866 and 1731 of 1892. Its first run flagged five functions as wrong: three undeclared renames
+# (badusage, ZSTD_copySequencesToSeqStoreExplicitBlockDelim, ZSTDMT_serialState_update; now in recipe.psd1);
+# BIT_reloadDStreamFast, whose body became BIT_reloadDStream_internal (declared as a per-object rename); and
+# one real split: 1.5.6 moved ZSTD_findFrameCompressedSize's body into a new _advanced behind a wrapper, now
+# an ambiguity via the wrapper guard.
 
 [gate.min_correct]
-"o2__v1.5.5__v1.5.6" = 433
-"o2__v1.5.6__v1.5.7" = 511
-"o2-icf__v1.5.5__v1.5.6" = 426
-"o2-icf__v1.5.6__v1.5.7" = 508
-"od__v1.5.5__v1.5.6" = 1283
-"od__v1.5.6__v1.5.7" = 1516
+"o2__v1.5.5__v1.5.6" = 623
+"o2__v1.5.6__v1.5.7" = 669
+"o2-icf__v1.5.5__v1.5.6" = 611
+"o2-icf__v1.5.6__v1.5.7" = 651
+"od__v1.5.5__v1.5.6" = 1674
+"od__v1.5.6__v1.5.7" = 1731

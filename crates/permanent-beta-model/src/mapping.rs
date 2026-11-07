@@ -34,6 +34,8 @@ pub mod evidence_kind {
     pub const CALL_SEQUENCE: &str = "call_sequence";
     /// Calls the same already-matched functions, in the same order (paired with identical normalized code).
     pub const CALLEES: &str = "callees";
+    /// Similar code, shape and neighbourhood, clearly closer than any alternative (an edited function).
+    pub const SIMILARITY: &str = "similarity";
     /// One of several equally plausible competitors (review evidence only, never accepted).
     pub const AMBIGUOUS: &str = "ambiguous";
 }

@@ -17,16 +17,24 @@
         'lib/common/*.c', 'lib/compress/*.c', 'lib/decompress/*.c', 'lib/dictBuilder/*.c', 'programs/*.c'
     )
     # Functions renamed between releases, keyed by the newer tag (old name = new name), each checked by hand
-    # against the sources (same parameters and body). Only renames the engine actually matched are listed so
-    # far; an undeclared rename shows up as a "wrong" match and gets checked and added here.
+    # against the sources. Only renames the engine actually matched are listed so far; an undeclared rename
+    # shows up as a "wrong" match and gets checked and added here.
     Renames  = @{
         'v1.5.6' = @{
-            'usage_advanced' = 'usageAdvanced'
+            'usage_advanced'        = 'usageAdvanced'
+            'badusage'              = 'badUsage'
+            # The body became BIT_reloadDStream_internal and BIT_reloadDStream's call was retargeted to it; a
+            # new thin BIT_reloadDStreamFast wrapper exists only in objects that call it. Joined per object:
+            # where the new wrapper exists, the old function is joined to it by name instead.
+            'BIT_reloadDStreamFast' = 'BIT_reloadDStream_internal'
         }
         'v1.5.7' = @{
-            'ZSTD_cwksp_reserve_aligned'               = 'ZSTD_cwksp_reserve_aligned64'
-            'ZSTD_copySequencesToSeqStoreNoBlockDelim' = 'ZSTD_transferSequences_noDelim'
-            'init_nbThreads'                           = 'default_nbThreads'
+            'ZSTD_cwksp_reserve_aligned'                     = 'ZSTD_cwksp_reserve_aligned64'
+            'ZSTD_copySequencesToSeqStoreNoBlockDelim'       = 'ZSTD_transferSequences_noDelim'
+            'ZSTD_copySequencesToSeqStoreExplicitBlockDelim' = 'ZSTD_transferSequences_wBlockDelim'
+            # Same call site and role; the unused cctx parameter was dropped.
+            'ZSTDMT_serialState_update'                      = 'ZSTDMT_serialState_genSequences'
+            'init_nbThreads'                                 = 'default_nbThreads'
         }
     }
     Include  = @('lib', 'lib/common')

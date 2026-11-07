@@ -10,11 +10,12 @@
 # luaD_seterrorobj into the new luaD_errerr, and the strings pass paired them. The strings pass now refuses a
 # pair whose inferred argument counts differ (3 vs 1 here). It also found six renames in 5.4.7, declared in
 # recipe.psd1 so the answer key doesn't score correct matches as wrong.
+# 2026-11-06, similarity pass: /O2 706 of 733 and 714 of 736, /Od 1077 of 1094 and 1085 of 1096.
 
 [gate.min_correct]
-"o2__v5.4.6__v5.4.7" = 642
-"o2__v5.4.7__v5.4.8" = 667
-"o2-icf__v5.4.6__v5.4.7" = 642
-"o2-icf__v5.4.7__v5.4.8" = 667
-"od__v5.4.6__v5.4.7" = 1016
-"od__v5.4.7__v5.4.8" = 1045
+"o2__v5.4.6__v5.4.7" = 706
+"o2__v5.4.7__v5.4.8" = 714
+"o2-icf__v5.4.6__v5.4.7" = 706
+"o2-icf__v5.4.7__v5.4.8" = 714
+"od__v5.4.6__v5.4.7" = 1077
+"od__v5.4.7__v5.4.8" = 1085

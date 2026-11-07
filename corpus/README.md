@@ -26,9 +26,9 @@ pwsh corpus/build-projects.ps1 -Score
 
 | Project | Tags | Program | Gate (`expected.toml`) |
 |---|---|---|---|
-| zlib | v1.2.13, v1.3, v1.3.1 | `minigzip` with zlib compiled in | 0 wrong; /O2 69 of 69 correct, /Od 154–156 of 163 |
-| lua | v5.4.6, v5.4.7, v5.4.8 | `lua` interpreter with the libraries compiled in | 0 wrong; /O2 642–667 of ~735, /Od 1016–1045 of ~1095 |
-| zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 433–511 of ~728, /Od 1283–1516 of ~1877 |
+| zlib | v1.2.13, v1.3, v1.3.1 | `minigzip` with zlib compiled in | 0 wrong; /O2 69 of 69 correct, /Od 159 of 163 |
+| lua | v5.4.6, v5.4.7, v5.4.8 | `lua` interpreter with the libraries compiled in | 0 wrong; /O2 706–714 of ~735, /Od 1077–1085 of ~1095 |
+| zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 623–669 of ~729, /Od 1674–1731 of ~1879 |
 
 The scorecard also reports each pass's precision (correct share of its own candidates) and recall (its correct
 matches over the functions present in both builds).

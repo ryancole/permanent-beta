@@ -92,6 +92,15 @@ pub fn implied_checks(kind: &str) -> &'static [&'static str] {
         evidence_kind::CALL_SEQUENCE => &["callers"],
         // Paired because both call the same matched functions.
         evidence_kind::CALLEES => &["callees"],
+        // The similarity score already weighed strings, size, neighbours, constants and imports.
+        evidence_kind::SIMILARITY => &[
+            "string-refs",
+            "size-ratio",
+            "callees",
+            "callers",
+            "constants",
+            "imports",
+        ],
         _ => &[],
     }
 }
@@ -507,6 +516,7 @@ mod tests {
             inferred_args: None,
             entry: None,
             basic_blocks: None,
+            mnemonic_counts: Default::default(),
             edges: None,
             callees: vec![],
             strings: strings.iter().map(|s| s.to_string()).collect(),
@@ -782,6 +792,33 @@ mod tests {
         assert_eq!(callees.outcome, CheckOutcome::Pass);
         assert!(!callees.counted);
         assert_eq!(r.verdict, Verdict::NeedsReview, "{:?}", r.checks);
+    }
+
+    #[test]
+    fn similarity_candidates_go_to_review_even_with_agreeing_neighbours() {
+        // The similarity score already used callers and callees, so their passes don't count.
+        let (old, new) = call_graph(vec![Rva(0x110), Rva(0x120)]);
+        let candidates = [
+            cand(0x1, 0x101, evidence_kind::SIMILARITY),
+            cand(0x10, 0x110, evidence_kind::NAME),
+            cand(0x20, 0x120, evidence_kind::NAME),
+        ];
+        let ctx = VerifyContext::new(&old, &new, &candidates);
+        let r = Verifier::with_defaults().verify(
+            &ctx,
+            &candidates[0],
+            &old.functions[0],
+            &new.functions[0],
+            Policy::for_criticality(Criticality::Low),
+        );
+        assert!(
+            r.checks
+                .iter()
+                .all(|c| !c.counted || c.outcome != CheckOutcome::Pass),
+            "{:?}",
+            r.checks
+        );
+        assert_eq!(r.verdict, Verdict::NeedsReview);
     }
 
     #[test]

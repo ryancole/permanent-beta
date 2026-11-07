@@ -148,36 +148,47 @@ impl GroundTruth {
             }
         }
 
-        // Stage 3: declared renames. Skipped where either side has no such function (an optimized build can
-        // inline a new static away). An error if the old name still exists in the new build (stale
-        // declaration) or a name is held by more than one unjoined function (can't say which was renamed).
+        // Stage 3: declared renames, per unjoined old function. A partner in the same object file wins (header
+        // statics exist once per object); otherwise the new name must be unique. Skipped where the new build has
+        // no such function (an optimized build can inline a new static away). Errors: a stale declaration (the
+        // old name still exists and every old copy was already joined by name), or more than one candidate.
         let mut old_used = vec![false; old_unjoined.len()];
         for (from, to) in renames {
-            if new_syms.iter().any(|s| s.name == *from) {
+            let olds: Vec<usize> = (0..old_unjoined.len())
+                .filter(|&i| old_unjoined[i].name == *from)
+                .collect();
+            if olds.is_empty() && new_syms.iter().any(|s| s.name == *from) {
                 return Err(format!(
                     "rename {from} -> {to} is stale: {from} still exists in the new build"
                 ));
             }
-            let olds: Vec<usize> = (0..old_unjoined.len())
-                .filter(|&i| !old_used[i] && old_unjoined[i].name == *from)
-                .collect();
-            let news: Vec<usize> = (0..new_left.len())
-                .filter(|&i| !new_left_used[i] && new_left[i].name == *to)
-                .collect();
-            match (olds.as_slice(), news.as_slice()) {
-                ([o], [n]) => {
-                    old_used[*o] = true;
-                    new_left_used[*n] = true;
-                    joined.push((Some(old_unjoined[*o]), Some(new_left[*n])));
-                }
-                ([], _) | (_, []) => {}
-                _ => {
-                    return Err(format!(
-                        "rename {from} -> {to} is ambiguous: {} unjoined old function(s) named {from}, \
-                         {} unjoined new function(s) named {to}",
-                        olds.len(),
-                        news.len()
-                    ));
+            for &o in &olds {
+                let free = |i: &usize| !new_left_used[*i] && new_left[*i].name == *to;
+                let same_object: Vec<usize> = (0..new_left.len())
+                    .filter(free)
+                    .filter(|&i| new_left[i].object == old_unjoined[o].object)
+                    .collect();
+                let anywhere: Vec<usize> = (0..new_left.len()).filter(free).collect();
+                let partner = match (same_object.as_slice(), anywhere.as_slice()) {
+                    ([n], _) => Some(*n),
+                    ([], []) => None,
+                    ([], [n]) if olds.len() == 1 => Some(*n),
+                    _ => {
+                        return Err(format!(
+                            "rename {from} -> {to} is ambiguous for {from} in {}: {} candidate(s) named {to}",
+                            old_unjoined[o].object,
+                            if same_object.is_empty() {
+                                anywhere.len()
+                            } else {
+                                same_object.len()
+                            }
+                        ));
+                    }
+                };
+                if let Some(n) = partner {
+                    old_used[o] = true;
+                    new_left_used[n] = true;
+                    joined.push((Some(old_unjoined[o]), Some(new_left[n])));
                 }
             }
         }
@@ -376,8 +387,8 @@ mod tests {
 
     #[test]
     fn an_ambiguous_rename_is_an_error() {
-        // Two unjoined new functions named g (different objects): which one f became is unknown.
-        let old = map(vec![sym("f", 0x10, "a.obj", false)]);
+        // Two unjoined new functions named g, neither in f's object: which one f became is unknown.
+        let old = map(vec![sym("f", 0x10, "c.obj", false)]);
         let new = map(vec![
             sym("g", 0x90, "a.obj", true),
             sym("g", 0xa0, "b.obj", true),
@@ -385,6 +396,38 @@ mod tests {
         let r = renames(&[("f", "g")]);
         assert!(
             GroundTruth::from_maps_with_renames(&old, &new, &Scope::ProjectObjects, &r).is_err()
+        );
+    }
+
+    #[test]
+    fn a_rename_joins_per_object_when_the_old_name_lives_on_elsewhere() {
+        // zstd 1.5.6: BIT_reloadDStreamFast's body became BIT_reloadDStream_internal, and a new Fast wrapper
+        // appears only where something calls it. a.obj keeps a Fast (joined by name); in b.obj the old Fast's
+        // counterpart is _internal.
+        let old = map(vec![
+            sym("Fast", 0x10, "a.obj", true),
+            sym("Fast", 0x20, "b.obj", true),
+        ]);
+        let new = map(vec![
+            sym("Fast", 0x110, "a.obj", true),
+            sym("internal", 0x120, "a.obj", true),
+            sym("internal", 0x220, "b.obj", true),
+        ]);
+        let r = renames(&[("Fast", "internal")]);
+        let t =
+            GroundTruth::from_maps_with_renames(&old, &new, &Scope::ProjectObjects, &r).unwrap();
+        let pairs: Vec<_> = t.functions.iter().map(|e| (e.old, e.new)).collect();
+        assert!(
+            pairs.contains(&(Some(Rva(0x10)), Some(Rva(0x110)))),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&(Some(Rva(0x20)), Some(Rva(0x220)))),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&(None, Some(Rva(0x120)))),
+            "a.obj's _internal is new: {pairs:?}"
         );
     }
 

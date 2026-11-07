@@ -14,11 +14,13 @@
 # misses were called (or had their address taken) only from chained fragments, which weren't decoded.
 # The remaining /Od misses include four functions nothing references (compressBound, get_crc_table,
 # zlibVersion, zError): dead code without .pdata, invisible to discovery.
+# 2026-11-06, similarity pass: /Od 159 of 163 in both pairs (edited functions such as deflateBound and
+# inflatePrime now reach review). The 4 left are the unreferenced dead code above.
 
 [gate.min_correct]
 "o2__v1.2.13__v1.3" = 69
 "o2__v1.3__v1.3.1" = 69
 "o2-icf__v1.2.13__v1.3" = 69
 "o2-icf__v1.3__v1.3.1" = 69
-"od__v1.2.13__v1.3" = 154
-"od__v1.3__v1.3.1" = 156
+"od__v1.2.13__v1.3" = 159
+"od__v1.3__v1.3.1" = 159

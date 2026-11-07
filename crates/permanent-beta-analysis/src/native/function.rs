@@ -22,7 +22,7 @@ use iced_x86::{
 };
 use permanent_beta_model::{EntryInfo, FunctionFeatures, Rva};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FunctionRange {
@@ -226,9 +226,13 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
     let mut imports = BTreeSet::new();
     let mut leaders: BTreeSet<u64> = segments.iter().map(|&(s, _)| s).collect();
     let mut internal_targets = BTreeSet::new();
+    let mut mnemonic_counts: BTreeMap<String, u32> = BTreeMap::new();
 
     for (i, ins) in insns.iter().enumerate() {
         mh.update((ins.mnemonic() as u16).to_le_bytes());
+        *mnemonic_counts
+            .entry(format!("{:?}", ins.mnemonic()))
+            .or_default() += 1;
         nh.update((ins.code() as u16).to_le_bytes());
 
         for op in 0..ins.op_count() {
@@ -315,7 +319,34 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
 
     // Only leaders that are actual instruction starts (a branch into the middle of an instruction is noise).
     let starts: BTreeSet<u64> = insns.iter().map(Instruction::ip).collect();
-    let basic_blocks = leaders.intersection(&starts).count() as u32;
+    let block_starts: BTreeSet<u64> = leaders.intersection(&starts).copied().collect();
+    let basic_blocks = block_starts.len() as u32;
+
+    // Control-flow edges between this function's blocks: taken branches to internal targets, plus
+    // fall-through into the next block. Tail jumps, indirect jumps and returns leave the function.
+    let mut edges = 0u32;
+    for (i, ins) in insns.iter().enumerate() {
+        let has_next = i + 1 < insns.len();
+        let internal_branch = || {
+            (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)))
+                && internal(ins.near_branch_target()).is_some()
+        };
+        match ins.flow_control() {
+            FlowControl::ConditionalBranch => {
+                edges += u32::from(internal_branch()) + u32::from(has_next);
+            }
+            FlowControl::UnconditionalBranch => edges += u32::from(internal_branch()),
+            FlowControl::IndirectBranch | FlowControl::Return => {}
+            _ => {
+                if insns
+                    .get(i + 1)
+                    .is_some_and(|n| block_starts.contains(&n.ip()))
+                {
+                    edges += 1;
+                }
+            }
+        }
+    }
 
     FunctionFeatures {
         rva: Rva(range.start as u64),
@@ -325,7 +356,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         normalized_hash: (!insns.is_empty()).then(|| short_hash(nh, "nh")),
         mnemonic_hash: (!insns.is_empty()).then(|| short_hash(mh, "mh")),
         basic_blocks: Some(basic_blocks),
-        edges: None,
+        edges: Some(edges),
         callees,
         strings: strings.into_iter().collect(),
         constants: constants.into_iter().collect(),
@@ -333,6 +364,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         signature: None,
         inferred_args: (!insns.is_empty()).then(|| inferred_args(&insns)),
         entry: (!insns.is_empty()).then(|| entry_info(&insns, start_va, &internal_targets)),
+        mnemonic_counts,
     }
 }
 
@@ -664,6 +696,24 @@ mod tests {
             .unwrap();
         assert!(e.branch_into_patch);
         assert!(!e.hazards().is_empty());
+    }
+
+    #[test]
+    fn counts_blocks_edges_and_mnemonics() {
+        // 0x1000: test ecx, ecx; 0x1002: je 0x1006; 0x1004: mov eax, ecx; 0x1006: ret
+        //   blocks {0x1000, 0x1004, 0x1006}: je taken + fall-through, mov falls into ret = 3 edges
+        let f = analyze(&[0x85, 0xc9, 0x74, 0x02, 0x8b, 0xc1, 0xc3]);
+        assert_eq!(f.basic_blocks, Some(3));
+        assert_eq!(f.edges, Some(3));
+        assert_eq!(f.mnemonic_counts.get("Mov"), Some(&1));
+        assert_eq!(f.mnemonic_counts.values().sum::<u32>(), 4);
+    }
+
+    #[test]
+    fn tail_jumps_and_returns_add_no_edges() {
+        // jmp rel32 out of the function: one block, no edges.
+        let f = analyze(&[0xe9, 0x10, 0x00, 0x00, 0x00]);
+        assert_eq!((f.basic_blocks, f.edges), (Some(1), Some(0)));
     }
 
     #[test]

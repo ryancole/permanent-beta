@@ -1,15 +1,16 @@
 # Status — where we left off (2026-11-06)
 
-M2 (corpus) is done: three real-world projects plus the `basic` fixture, per-pass precision and recall, 0 wrong
-matches everywhere. CI was green through `86de0b1`; the M2 work hasn't been through CI yet.
+M2 (corpus) is done and green in CI (`c104289`). Latest work: the similarity pass (design §5.1 pass 6), which
+completes M3's matching depth apart from the mnemonic-hash pass and the SQLite store. 0 wrong matches on every
+corpus variant; not yet through CI.
 
 ## What works
 
 - **`pbeta analyze`** reads PE x64 executables with no symbols: functions from `.pdata`, call targets and
   address-taken code, with chained `.pdata` fragments merged into their parent; normalized and mnemonic hashes,
   callees in call order, strings, constants, imports, inferred register arguments, and entry hookability.
-- **`pbeta match` / `repair` / `review list`**: five matching passes (name, normalized hash, strings, matched
-  callees, call graph); string matches are vetoed when argument counts or matched callers contradict them,
+- **`pbeta match` / `repair` / `review list`**: six matching passes (name, normalized hash, strings, matched
+  callees, call graph, and a weak similarity pass for edited functions); string matches are vetoed when argument counts or matched callers contradict them,
   rechecked against the final matches. Verification on parameters, strings, size, callers, callees, constants,
   imports and inferred arguments, counting only evidence independent of the match; repair with review reasons
   (unmatched, ambiguous, verification failed, insufficient evidence, signature changed, not hookable); exit codes
@@ -17,9 +18,9 @@ matches everywhere. CI was green through `86de0b1`; the M2 work hasn't been thro
 - **Corpus gate** (CI, Windows): zero wrong matches, plus correct-match baselines. Each scorecard lists every
   pass's precision and recall.
   - Purpose-built fixture `basic` (`corpus/fixtures`): 3 flag sets.
-  - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 154–156 of 163.
-  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 642–667 of ~735, /Od 1016–1045 of ~1095.
-  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 433–511 of ~728, /Od 1283–1516 of ~1877.
+  - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 159 of 163.
+  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 706–714 of ~735, /Od 1077–1085 of ~1095.
+  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 623–669 of ~729, /Od 1674–1731 of ~1879.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score` and `pwsh corpus/build-projects.ps1 -Score`. Add
     `--misses` to `pbeta-corpus score` to list misses.
 
@@ -38,12 +39,12 @@ matches everywhere. CI was green through `86de0b1`; the M2 work hasn't been thro
 
 ## Suggested next steps
 
-1. **Similarity matching for edited functions** (design §5.1 pass 6, rest of M3), with a best-vs-second-best
-   margin. zstd is the yardstick: ~40% of /O2 functions present in both builds aren't matched. Fixture scenarios
-   S3–S5 are still ambiguous or unmatched. Expect it to find false positives the corpus will catch.
-2. **End-to-end Detours repair** (M4): a real hook DLL against the fixture's v1, repaired to v2 and run. That
+1. **End-to-end Detours repair** (M4): a real hook DLL against the fixture's v1, repaired to v2 and run. That
    starts the behavioral harness (goal 4).
-3. **Review-queue actions** (accept, reject, pick a candidate), then the MCP server.
+2. **Review-queue actions** (accept, reject, pick a candidate), then the MCP server. Similarity matches all
+   land in review, so this is where they become usable.
+3. **Calibrate the similarity thresholds** (score 0.75, margin 0.1, size 16, weights; all [Guess]) from the
+   corpus: score distributions of correct vs ambiguous pairs. Fixture S3–S5 at /O2 are still unmatched.
 4. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.
 5. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 

@@ -2,6 +2,7 @@
 
 use crate::ids::{BuildId, Rva};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Bump on any breaking change to [`AnalysisExport`].
 pub const ANALYSIS_SCHEMA_VERSION: u32 = 1;
@@ -83,6 +84,10 @@ pub struct FunctionFeatures {
     /// parameters and stack arguments are invisible. Capped at 4. Inferred from code; no symbols needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inferred_args: Option<u8>,
+    /// How often each instruction mnemonic occurs (e.g. `"Mov" → 12`). Order-free, so it survives small
+    /// edits and reordering; used by similarity matching. Empty if the analyzer didn't compute it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mnemonic_counts: BTreeMap<String, u32>,
     /// What a Detours-style entry patch would overwrite. `None` if the analyzer didn't compute it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<EntryInfo>,
