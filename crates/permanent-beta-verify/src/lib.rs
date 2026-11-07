@@ -544,6 +544,7 @@ mod tests {
             entry: None,
             basic_blocks: None,
             mnemonic_counts: Default::default(),
+            pseudocode: None,
             edges: None,
             callees: vec![],
             strings: strings.iter().map(|s| s.to_string()).collect(),

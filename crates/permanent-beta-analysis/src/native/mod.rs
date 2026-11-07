@@ -7,14 +7,14 @@
 //! `.pdata` isn't found, and `edges` isn't computed. Address-taken functions (`lea` of code), code pointers in
 //! data (base relocations) and chained `.pdata` fragments are handled (see `function`).
 
-mod function;
-mod image;
+pub(crate) mod function;
+pub(crate) mod image;
 pub mod pattern;
 
 use crate::{AnalysisError, Analyzer};
 use permanent_beta_model::{
     ANALYSIS_SCHEMA_VERSION, AnalysisExport, BuildId, BuildInfo, Machine, NameSource, PdbInfo,
-    Producer,
+    Producer, Rva,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -62,12 +62,56 @@ pub fn build_id(bytes: &[u8]) -> BuildId {
 /// Analyze an in-memory PE x64 image.
 pub fn analyze_bytes(bytes: &[u8], file_name: &str) -> Result<AnalysisExport, BytesError> {
     let image = image::Image::parse(bytes).map_err(BytesError::Invalid)?;
+    let ranges = function::discover(&image);
+    Ok(analyze_ranges(
+        &image,
+        bytes,
+        file_name,
+        ranges,
+        Producer {
+            tool: PRODUCER.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+    ))
+}
+
+/// A function's entry and its code ranges `[start, end)`.
+pub type FunctionBody = (Rva, Vec<(Rva, Rva)>);
+
+/// Each function the native analyzer discovers, as its entry and code ranges `[start, end)`: the main range
+/// first, then its chained `.pdata` fragments. The same shape as a Ghidra export's bodies.
+pub fn function_bodies(bytes: &[u8]) -> Result<Vec<FunctionBody>, BytesError> {
+    let image = image::Image::parse(bytes).map_err(BytesError::Invalid)?;
+    Ok(function::discover(&image)
+        .iter()
+        .map(|r| {
+            let rva = |x: u32| Rva(u64::from(x));
+            (
+                rva(r.start),
+                std::iter::once((r.start, r.end))
+                    .chain(r.fragments.iter().copied())
+                    .map(|(s, e)| (rva(s), rva(e)))
+                    .collect(),
+            )
+        })
+        .collect())
+}
+
+/// Features for function boundaries found by any analyzer (native discovery, or a Ghidra export), named from
+/// the image's exports. Every hash comes from here, so analyses from different sources stay comparable.
+pub(crate) fn analyze_ranges(
+    image: &image::Image,
+    bytes: &[u8],
+    file_name: &str,
+    ranges: Vec<function::FunctionRange>,
+    producer: Producer,
+) -> AnalysisExport {
     let build_id = build_id(bytes).0;
 
-    let functions = function::discover(&image)
+    let functions = ranges
         .into_iter()
         .map(|range| {
-            let mut f = function::features(&image, &range);
+            let mut f = function::features(image, &range);
             if let Some((_, name)) = image.exports.iter().find(|e| e.0 == range.start) {
                 f.name = Some(name.clone());
                 f.name_source = Some(NameSource::Export);
@@ -76,21 +120,18 @@ pub fn analyze_bytes(bytes: &[u8], file_name: &str) -> Result<AnalysisExport, By
         })
         .collect();
 
-    Ok(AnalysisExport {
+    AnalysisExport {
         schema_version: ANALYSIS_SCHEMA_VERSION,
         build: BuildInfo {
             id: BuildId(build_id),
             file_name: file_name.to_owned(),
             version: None,
             machine: Machine::X64,
-            pdb: image.pdb.map(|(guid, age)| PdbInfo { guid, age }),
+            pdb: image.pdb.clone().map(|(guid, age)| PdbInfo { guid, age }),
         },
-        producer: Producer {
-            tool: PRODUCER.to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        },
+        producer,
         functions,
-    })
+    }
 }
 
 #[cfg(test)]

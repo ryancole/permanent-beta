@@ -20,10 +20,11 @@
 # 2026-11-07, function starts from code pointers in data (base relocations; design §4.4): functions reached only
 # through function tables (arith_*, str_find, ...) are found instead of absorbed: /O2 and /O2+ICF 726 and 732,
 # /Od unchanged, 0 wrong.
+# 2026-11-07, function starts after int3 padding (design §4.4): /Od 1087 and 1093, /O2 unchanged, 0 wrong.
 [gate.min_correct]
 "o2__v5.4.6__v5.4.7" = 726
 "o2__v5.4.7__v5.4.8" = 732
 "o2-icf__v5.4.6__v5.4.7" = 726
 "o2-icf__v5.4.7__v5.4.8" = 732
-"od__v5.4.6__v5.4.7" = 1086
-"od__v5.4.7__v5.4.8" = 1092
+"od__v5.4.6__v5.4.7" = 1087
+"od__v5.4.7__v5.4.8" = 1093

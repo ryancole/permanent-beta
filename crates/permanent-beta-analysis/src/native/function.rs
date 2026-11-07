@@ -5,8 +5,9 @@
 //! exports and code pointers stored in data (base relocations: function tables, callbacks in initialized
 //! structs), then extended to a fixpoint with direct call/jump targets and RIP-relative `lea` operands (an
 //! address taken, e.g. a callback) that land in executable code outside any known function. A function without
-//! `.pdata` ends at the next known start (trailing `int3` padding trimmed), so a function that no start reaches
-//! is taken into the one before it.
+//! `.pdata` ends at the next known start (trailing `int3` padding trimmed). Once nothing else is found, code
+//! that starts on a 16-byte boundary after `int3` padding is a start too (dead code nothing references; see
+//! `padding_starts`), so it isn't taken into the function before it.
 //!
 //! Chained `.pdata` entries are fragments of another function: at /O2 MSVC splits bodies into chained
 //! fragments (shrink-wrapping), and these hold much of the code. Each fragment belongs to the function its chain
@@ -147,10 +148,111 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
             }
         }
         if found.is_empty() {
-            return ranges;
+            // Nothing reaches the rest: look for code that starts after padding (dead code, design §4.4).
+            found = padding_starts(image, &ranges, &starts);
+            if found.is_empty() {
+                return ranges;
+            }
         }
         starts.extend(found);
     }
+}
+
+/// Alignment MSVC gives function starts (`/ALIGN` default for x64 code is 16, padded with `int3`).
+const FUNCTION_ALIGN: u32 = 16;
+
+/// Function starts that nothing references, found by layout: MSVC pads between functions with `int3` up to a
+/// 16-byte boundary. A start is the first byte after at least one `int3`, on a 16-byte boundary, that isn't
+/// `int3` itself and decodes as an instruction, either
+///
+/// - in a gap no function or `.pdata` entry covers, or
+/// - inside a function without `.pdata`, right after an instruction that doesn't fall through (`ret`, `jmp`,
+///   `int3`), when no branch in that function targets it.
+///
+/// Inside a function, code after `int3` can be its own block (after a call that doesn't return), which is why
+/// the padding, the alignment and the absence of an internal branch to it are all required. Functions with
+/// `.pdata` are never split: their bounds are exact.
+fn padding_starts(image: &Image, ranges: &[FunctionRange], starts: &BTreeSet<u32>) -> Vec<u32> {
+    let mut covered: Vec<(u32, u32)> = ranges.iter().flat_map(|r| r.segments()).collect();
+    covered.extend(image.pdata.iter().map(|r| (r.begin, r.end)));
+    covered.sort_unstable();
+
+    let mut found = Vec::new();
+    let candidate = |at: u32, found: &mut Vec<u32>| {
+        if at % FUNCTION_ALIGN == 0
+            && image.is_executable(at)
+            && !starts.contains(&at)
+            && image.bytes(at, 1).is_some_and(|b| b[0] != 0xcc)
+            && image
+                .section_end(at)
+                .is_some_and(|end| !decode(image, at, end.min(at + 16)).is_empty())
+        {
+            found.push(at);
+        }
+    };
+
+    // Gaps between covered code, within each executable section.
+    for section in image.sections.iter().filter(|s| s.executable) {
+        let Some(section_end) = image.section_end(section.rva) else {
+            continue;
+        };
+        let mut at = section.rva;
+        for &(s, e) in covered
+            .iter()
+            .filter(|&&(s, _)| s >= section.rva && s < section_end)
+        {
+            if s > at {
+                gap_start(image, at, s)
+                    .into_iter()
+                    .for_each(|c| candidate(c, &mut found));
+            }
+            at = at.max(e);
+        }
+        if section_end > at {
+            gap_start(image, at, section_end)
+                .into_iter()
+                .for_each(|c| candidate(c, &mut found));
+        }
+    }
+
+    // Inside functions without .pdata.
+    for r in ranges.iter().filter(|r| !r.from_pdata) {
+        let insns = decode(image, r.start, r.end);
+        let targets: BTreeSet<u64> = insns
+            .iter()
+            .filter(|i| (0..i.op_count()).any(|op| is_near_branch(i.op_kind(op))))
+            .map(Instruction::near_branch_target)
+            .collect();
+        let mut after_stop = false;
+        let mut padding = 0;
+        for ins in &insns {
+            let rva = (ins.ip() - image.base) as u32;
+            if ins.mnemonic() == Mnemonic::Int3 {
+                padding += 1;
+                continue;
+            }
+            if after_stop && padding > 0 && !targets.contains(&ins.ip()) {
+                candidate(rva, &mut found);
+            }
+            after_stop = matches!(
+                ins.flow_control(),
+                FlowControl::Return
+                    | FlowControl::UnconditionalBranch
+                    | FlowControl::IndirectBranch
+            );
+            padding = 0;
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// In an uncovered gap `[from, to)`: the first byte after a run of at least one `int3`, if there is one.
+fn gap_start(image: &Image, from: u32, to: u32) -> Option<u32> {
+    let bytes = image.bytes(from, (to - from) as usize)?;
+    let pad = bytes.iter().take_while(|&&b| b == 0xcc).count();
+    (pad > 0 && pad < bytes.len()).then_some(from + pad as u32)
 }
 
 /// Boundaries for each start: exact from `.pdata`, otherwise up to the next start (or any `.pdata` begin,
@@ -389,6 +491,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         inferred_args: (!insns.is_empty()).then_some(args.0),
         inferred_arg_classes: args.1,
         entry: (!insns.is_empty()).then(|| entry_info(&insns, start_va, &internal_targets)),
+        pseudocode: None,
         mnemonic_counts,
     }
 }
@@ -689,7 +792,8 @@ mod tests {
         let mut code = vec![0x48, 0x8d, 0x0d];
         code.extend((target as i32 - 0x1007).to_le_bytes());
         code.push(0xc3);
-        code.resize(0x10, 0xcc);
+        // nop filler, not int3 padding: these cases are about address-taken code, not layout.
+        code.resize(0x10, 0x90);
         code.extend([0x33, 0xc0, 0xc3]);
         code.resize(0x20, 0xcc);
         let mut img = image(&code, &[]);
@@ -719,7 +823,8 @@ mod tests {
         let mut code = vec![0x33, 0xc0, 0xc3];
         code.resize(0x10, 0xcc);
         code.extend([0xb8, 1, 0, 0, 0, 0xc3]);
-        code.resize(0x20, 0xcc);
+        // nop filler before 0x1020, so only the table can make it a start (not int3 padding).
+        code.resize(0x20, 0x90);
         code.extend([0xb8, 1, 0, 0, 0, 0xc3]);
         code.resize(0x30, 0xcc);
         let mut img = image(&code, &[]);
@@ -739,7 +844,7 @@ mod tests {
         );
         assert_eq!(
             table_image(vec![0x1020]),
-            vec![(0x1000, 0x1010), (0x1010, 0x1016), (0x1020, 0x1026)]
+            vec![(0x1000, 0x1010), (0x1010, 0x1020), (0x1020, 0x1026)]
         );
     }
 
@@ -749,6 +854,71 @@ mod tests {
         assert_eq!(
             table_image(vec![0x1002]),
             vec![(0x1000, 0x1010), (0x1010, 0x1026)]
+        );
+    }
+
+    /// Discover functions in `code` (at 0x1000), with an export at 0x1000 and the given .pdata entries.
+    fn starts_in(code: &[u8], pdata_entries: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let mut img = image(code, &[]);
+        img.pdata = pdata_entries
+            .iter()
+            .map(|&(b, e)| pdata(b, e, None))
+            .collect();
+        img.exports = vec![(0x1000, "f".into())];
+        discover(&img).iter().map(|r| (r.start, r.end)).collect()
+    }
+
+    /// `prefix` at 0x1000, `int3` padding up to `at`, then `mov eax, 1; ret`.
+    fn padded(prefix: &[u8], at: usize) -> Vec<u8> {
+        let mut c = prefix.to_vec();
+        c.resize(at - 0x1000, 0xcc);
+        c.extend([0xb8, 1, 0, 0, 0, 0xc3]);
+        c
+    }
+
+    const XOR_RET: [u8; 3] = [0x33, 0xc0, 0xc3];
+
+    #[test]
+    fn unreferenced_code_after_padding_in_a_gap_is_a_function() {
+        // A .pdata function, padding, then dead code nothing calls (zlib /Od's compressBound).
+        let code = padded(&XOR_RET, 0x1010);
+        assert_eq!(
+            starts_in(&code, &[(0x1000, 0x1003)]),
+            vec![(0x1000, 0x1003), (0x1010, 0x1016)]
+        );
+    }
+
+    #[test]
+    fn unreferenced_code_after_padding_is_not_absorbed() {
+        // No .pdata: without the padding rule 0x1000 would run to the end (zstd /Od's FSE_compressBound).
+        let code = padded(&XOR_RET, 0x1010);
+        assert_eq!(
+            starts_in(&code, &[]),
+            vec![(0x1000, 0x1003), (0x1010, 0x1016)]
+        );
+    }
+
+    #[test]
+    fn a_block_its_function_branches_to_is_not_split_off() {
+        // Negative case: `test ecx, ecx; je 0x1010; ret`, padding, then the je's target. One function.
+        let code = padded(&[0x85, 0xc9, 0x74, 0x0c, 0xc3], 0x1010);
+        assert_eq!(starts_in(&code, &[]), vec![(0x1000, 0x1016)]);
+    }
+
+    #[test]
+    fn unaligned_code_after_padding_is_not_a_start() {
+        // Negative case: padding that ends off a 16-byte boundary isn't function alignment.
+        let code = padded(&XOR_RET, 0x100c);
+        assert_eq!(starts_in(&code, &[]), vec![(0x1000, 0x1012)]);
+    }
+
+    #[test]
+    fn a_pdata_function_is_never_split_by_padding() {
+        // Negative case: .pdata says 0x1000..0x1016 is one function, padding inside or not.
+        let code = padded(&XOR_RET, 0x1010);
+        assert_eq!(
+            starts_in(&code, &[(0x1000, 0x1016)]),
+            vec![(0x1000, 0x1016)]
         );
     }
 

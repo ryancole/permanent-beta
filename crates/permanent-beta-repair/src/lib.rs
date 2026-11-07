@@ -475,6 +475,7 @@ mod tests {
             entry: None,
             basic_blocks: None,
             mnemonic_counts: Default::default(),
+            pseudocode: None,
             edges: None,
             callees: vec![],
             strings: vec![],

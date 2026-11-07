@@ -204,6 +204,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
                 inferred_args: None,
                 inferred_arg_classes: vec![],
                 mnemonic_counts: Default::default(),
+                pseudocode: None,
                 entry: None,
             }
         })

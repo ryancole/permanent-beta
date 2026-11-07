@@ -209,3 +209,63 @@ fn pdb_names_agree_with_the_answer_key() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs corpus/build-fixtures.ps1"]
+fn ghidra_boundaries_equal_to_native_give_native_hashes() {
+    use permanent_beta_analysis::ghidra::{self, GhidraExport, GhidraFunction};
+    for flags in FLAG_SETS {
+        let b = load(flags);
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/fixtures/basic")
+            .join(flags);
+        let bytes = std::fs::read(dir.join("v1/fixture.exe")).unwrap();
+        // An export listing exactly the native analyzer's bodies, fragments included.
+        let bodies = permanent_beta_analysis::native::function_bodies(&bytes).unwrap();
+        let export = |sha: &str| GhidraExport {
+            producer: ghidra::PRODUCER.into(),
+            ghidra_version: "test".into(),
+            sha256: sha.into(),
+            image_base: Rva(0x1_4000_0000),
+            functions: bodies
+                .iter()
+                .map(|(entry, body)| GhidraFunction {
+                    entry: *entry,
+                    body: body.clone(),
+                    name: None,
+                    name_source: "DEFAULT".into(),
+                    thunk: false,
+                    signature_source: "ANALYSIS".into(),
+                    calling_convention: None,
+                    return_type: None,
+                    params: vec![],
+                    pseudocode: None,
+                })
+                .collect(),
+        };
+        let (g, report) =
+            ghidra::analyze(&bytes, "fixture.exe", &export(&b.old.build.id.0)).unwrap();
+        assert!(
+            report.outside_code.is_empty(),
+            "[{flags}] {:?}",
+            report.outside_code
+        );
+        // Same boundaries, same features: Ghidra-based and native analyses must be comparable hash for hash.
+        let native = permanent_beta_analysis::diff::diff(&b.old, &g);
+        assert!(
+            native.only_a.is_empty()
+                && native.only_b.is_empty()
+                && native.size_differs.is_empty()
+                && native.hash_differs.is_empty(),
+            "[{flags}] {native:?}"
+        );
+        assert_eq!(native.agreeing, b.old.functions.len(), "[{flags}]");
+        assert!(
+            g.functions.iter().all(|f| f.signature.is_none()),
+            "inferred signatures used"
+        );
+
+        // Negative case: an export of another file (v2) must be refused for v1.
+        assert!(ghidra::analyze(&bytes, "fixture.exe", &export(&b.new.build.id.0)).is_err());
+    }
+}

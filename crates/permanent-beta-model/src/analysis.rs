@@ -98,6 +98,11 @@ pub struct FunctionFeatures {
     /// What a Detours-style entry patch would overwrite. `None` if the analyzer didn't compute it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<EntryInfo>,
+    /// Decompiler output (Ghidra), for people reviewing a candidate and for AI prompts. Never matched on: it
+    /// names other functions by address, which changes between builds. Optional, so adding it didn't change
+    /// the schema version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pseudocode: Option<String>,
 }
 
 /// Which register of a Win64 argument slot carries a value: rcx/rdx/r8/r9 or xmm0–3.

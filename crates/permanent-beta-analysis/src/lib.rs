@@ -4,6 +4,7 @@
 //!   discovery, `iced-x86` for features). Uses no symbols beyond exports.
 //! - [`symbols`]: names and signatures from an MSVC PDB, added to an analysis only when asked for.
 //! - [`diff`]: compare two analyses of the same build (native vs Ghidra, or vs a PDB's procedures).
+//! - [`ghidra`]: native features for the function boundaries in a Ghidra headless export.
 //! - [`export`]: load and save `AnalysisExport` JSON, e.g. as written by the Ghidra headless exporter.
 
 use permanent_beta_model::AnalysisExport;
@@ -11,6 +12,7 @@ use std::path::Path;
 
 pub mod diff;
 pub mod export;
+pub mod ghidra;
 pub mod native;
 pub mod symbols;
 

@@ -386,6 +386,7 @@ mod tests {
             imports: vec![],
             signature: None,
             mnemonic_counts: Default::default(),
+            pseudocode: None,
         }
     }
 

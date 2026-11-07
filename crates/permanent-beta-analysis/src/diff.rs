@@ -26,7 +26,8 @@ pub struct AnalysisDiff {
     pub only_b: Vec<Unpaired>,
     /// Same entry, different size.
     pub size_differs: Vec<SizeDiff>,
-    /// Same entry, both emit a hash, and the hashes differ.
+    /// Same entry and size, both emit a hash, and the hashes differ. (Different sizes nearly always mean
+    /// different hashes, so those are only listed under `size_differs`.)
     pub hash_differs: Vec<HashDiff>,
     /// Same entry, both name it, and the names differ.
     pub name_differs: Vec<NameDiff>,
@@ -105,7 +106,8 @@ pub fn diff(a: &AnalysisExport, b: &AnalysisExport) -> AnalysisDiff {
             continue;
         };
         let mut agrees = true;
-        if fa.size != fb.size {
+        let same_size = fa.size == fb.size;
+        if !same_size {
             agrees = false;
             out.size_differs.push(SizeDiff {
                 rva: *rva,
@@ -123,6 +125,7 @@ pub fn diff(a: &AnalysisExport, b: &AnalysisExport) -> AnalysisDiff {
             (HashKind::Mnemonic, &fa.mnemonic_hash, &fb.mnemonic_hash),
         ] {
             if let (Some(ha), Some(hb)) = (ha, hb)
+                && same_size
                 && ha != hb
             {
                 agrees = false;
@@ -210,6 +213,7 @@ mod tests {
             inferred_args: None,
             inferred_arg_classes: vec![],
             mnemonic_counts: Default::default(),
+            pseudocode: None,
             entry: None,
         }
     }
@@ -296,6 +300,16 @@ mod tests {
             }]
         );
         assert_eq!(d.name_differs.len(), 1);
+    }
+
+    #[test]
+    fn a_size_difference_is_not_also_a_hash_difference() {
+        let a = export("b", "x", vec![func(0x1000, 0x20, Some("h1"), None)]);
+        let b = export("b", "y", vec![func(0x1000, 0x10, Some("h2"), None)]);
+        let d = diff(&a, &b);
+        assert_eq!(d.size_differs.len(), 1);
+        assert!(d.hash_differs.is_empty());
+        assert!(!d.is_clean());
     }
 
     #[test]

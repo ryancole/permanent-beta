@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use permanent_beta_analysis::{
-    Analyzer, diff, export,
+    Analyzer, diff, export, ghidra,
     native::{NativePeAnalyzer, pattern::PatternIndex},
     symbols,
 };
@@ -52,6 +52,11 @@ enum Command {
         /// comparing function boundaries with `pbeta analysis-diff`.
         #[arg(long, requires = "pdb")]
         pdb_functions: Option<PathBuf>,
+        /// Take function boundaries from a Ghidra export (integrations/ghidra/scripts/ExportFunctions.java)
+        /// instead of native discovery. Hashes and features are still computed natively. Refused unless the
+        /// export is of this file.
+        #[arg(long)]
+        functions_from: Option<PathBuf>,
     },
     /// Compare two analyses of the same build: functions only one found, different sizes, hashes or names.
     /// Exit code 1 if they disagree at all.
@@ -259,7 +264,14 @@ fn run(cli: Cli) -> Result<u8> {
             out,
             pdb,
             pdb_functions,
-        } => cmd_analyze(&binary, &out, pdb.as_deref(), pdb_functions.as_deref()),
+            functions_from,
+        } => cmd_analyze(
+            &binary,
+            &out,
+            pdb.as_deref(),
+            pdb_functions.as_deref(),
+            functions_from.as_deref(),
+        ),
         Command::AnalysisDiff { a, b, json, limit } => cmd_analysis_diff(&a, &b, json, limit),
         Command::Match { old, new, json } => cmd_match(&old, &new, json),
         Command::Repair {
@@ -697,8 +709,33 @@ fn cmd_analyze(
     out: &Path,
     pdb: Option<&Path>,
     pdb_functions: Option<&Path>,
+    functions_from: Option<&Path>,
 ) -> Result<u8> {
-    let mut analysis = NativePeAnalyzer.analyze(binary)?;
+    let mut analysis = match functions_from {
+        None => NativePeAnalyzer.analyze(binary)?,
+        Some(path) => {
+            let bytes =
+                std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
+            let file_name = binary
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (analysis, r) = ghidra::analyze(&bytes, &file_name, &ghidra::load(path)?)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            eprintln!(
+                "Ghidra: {} functions, {} analyzed; {} outside code, {} duplicate entries; names ignored {}; signatures used {}, ignored {}; pseudocode {}",
+                r.exported,
+                r.analyzed,
+                r.outside_code.len(),
+                r.duplicates,
+                r.names_ignored,
+                r.signatures_used,
+                r.signatures_inferred,
+                r.with_pseudocode
+            );
+            analysis
+        }
+    };
     if let Some(pdb) = pdb {
         let symbols = symbols::read(pdb)?;
         let report = symbols::apply(&mut analysis, &symbols)

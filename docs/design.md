@@ -181,7 +181,9 @@ Target: PE x64. Implemented in `permanent-beta-analysis/src/native` (M1, first v
 - Function starts: non-chained `.pdata` entries, the entry point, exports and code pointers stored in data
   (`DIR64` base relocations in non-executable sections whose value points into code outside any `.pdata` range:
   function tables, callbacks in initialized structs; §4.4), then direct call/jump targets found by disassembly,
-  iterated to a fixpoint. This matters more than expected: at `/O2`, MSVC emits no `.pdata` for
+  iterated to a fixpoint. When nothing more is found, code on a 16-byte boundary right after `int3` padding is a
+  start too (dead code; in a gap no function covers, or inside a function without `.pdata` after an instruction
+  that doesn't fall through, and only if no branch in that function targets it), and the fixpoint resumes. This matters more than expected: at `/O2`, MSVC emits no `.pdata` for
   leaf functions that don't touch the stack, which was most of the fixture's test functions. Functions without
   `.pdata` end at the next known start, minus `int3` padding. RIP-relative `lea` of code outside any known
   function also starts one (an address taken, e.g. zlib's `zcalloc`/`zcfree` callbacks).
@@ -197,8 +199,8 @@ Target: PE x64. Implemented in `permanent-beta-analysis/src/native` (M1, first v
 - Scored against the fixture answer keys (`permanent-beta-corpus/tests/native_fixtures.rs`): every answer-key
   function is found in all three flag sets.
 
-Known gaps: PDB names and signatures only when asked for (§4.4), dead code without `.pdata` is missed (and
-absorbed into the function before it), and `edges` isn't computed. Vtables are found through base relocations
+Known gaps: PDB names and signatures only when asked for (§4.4), dead code is found only when it follows `int3`
+padding on a 16-byte boundary (true for all of it on the corpus), and `edges` isn't computed. Vtables are found through base relocations
 like any function table, but no C++ project is in the corpus yet. **[Validate]** the discovery approach on real targets with indirect calls and jump tables.
 
 What it won't do: decompilation or type recovery. That comes from the Ghidra export.
@@ -213,7 +215,17 @@ The two analyzers must agree on function identity (RVA) and on any hash they bot
 are always computed by the Rust normalizer, even for Ghidra exports (Ghidra provides boundaries and bytes; Rust
 hashes). **[Provisional]**
 
----
+**Implemented (M1, 2026-11-07), Ghidra 12.2:** `integrations/ghidra/scripts/` (README there). `DisablePdb.java`
+turns the PDB analyzers off (Ghidra finds a PDB through the debug directory's path even for a copied .exe), and
+`ExportFunctions.java` writes each function's entry, body ranges, name and signature with Ghidra's source for each,
+and optionally pseudocode. `pbeta analyze --functions-from` (`permanent-beta-analysis::ghidra`) computes every
+feature natively from those boundaries, after cutting Ghidra's ranges at the binary's `.pdata` boundaries (Ghidra
+merges touching ranges, the native analyzer keeps chained fragments as segments, and the hash records segments).
+A fixture test gives the Ghidra path the native bodies and requires identical hashes for every function. Ghidra's
+names are never used: `DEFAULT` names are placeholders, `ANALYSIS` names are Function ID guesses, and the name pass
+trusts any name. Its signatures are used only when not inferred and not on a guessed name (library prototypes on
+import thunks qualify; `__security_check_cookie`, named by Function ID, doesn't). Pseudocode is stored
+(`FunctionFeatures::pseudocode`, optional, so the schema version didn't change) and never matched on. Results: §4.4.
 
 ### 4.4 PDB names and signatures; the M1 diff report
 
@@ -265,10 +277,55 @@ whose value points into code outside a `.pdata` range is a function start (§4.2
 Every /O2 build now finds every function the PDB lists, and no function is absorbed at /O2. What's left is dead
 code at /Od (zlib's `compressBound`, `get_crc_table`, `gz_intmax`, `zlibVersion`; Lua's `lua_setallocf`; zstd's
 `*_versionNumber`, `*_compressBound`, `ZSTD_defaultCLevel`, `ZSTD_getDictID_fromCDict`), two of which zstd /Od
-still absorbs into the previous function, and the CRT stub. Nothing references those, so only symbols (or
-Ghidra's heuristics) can find them. Corpus: 0 wrong; Lua /O2 and /O2+ICF +10 correct per variant (all ten
+still absorbs into the previous function, and the CRT stub. Nothing references those (found later from
+layout; see "function starts after padding" below). Corpus: 0 wrong; Lua /O2 and /O2+ICF +10 correct per variant (all ten
 previously unmatched), zstd /O2 +3 to +4; zlib and every /Od variant unchanged. The fixture scorecard and the
 hook loop are unchanged.
+
+**Native vs Ghidra (2026-11-07, `corpus/ghidra-diff.ps1`, Ghidra 12.2 with its PDB analyzers off), judged by the
+PDB.** Same-size functions never differ in hash, so every disagreement is about boundaries:
+
+| Build | Functions (native, Ghidra) | Agree | In the PDB, only native found | In the PDB, only Ghidra found | Size differs: native right / Ghidra right / no PDB entry | Ghidra time |
+|---|---|---|---|---|---|---|
+| zlib /O2 | 151, 149 | 135 | 1 | 0 | 12 / 1 / 1 | 15 s |
+| zlib /O2+ICF | 141, 140 | 126 | 0 | 0 | 12 / 0 / 2 | 12 s |
+| zlib /Od | 245, 243 | 223 | 1 | 0 | 18 / 1 / 1 | 16 s |
+| Lua /O2 | 843, 820 | 656 | 19 | 0 | 162 / 1 / 1 | 18 s |
+| Lua /O2+ICF | 833, 811 | 647 | 18 | 0 | 162 / 0 / 2 | 19 s |
+| Lua /Od | 1198, 1194 | 991 | 3 | 0 | 201 / 1 / 1 | 30 s |
+| zstd /O2 | 830, 822 | 714 | 7 | 0 | 106 / 1 / 1 | 36 s |
+| zstd /O2+ICF | 787, 780 | 672 | 6 | 0 | 106 / 0 / 2 | 36 s |
+| zstd /Od | 2024, 2025 | 1830 | 1 | 3 | 188 / 3 / 1 | 46 s |
+
+- **Ghidra's bodies come up short.** Of 975 size disagreements with a PDB entry, the native size is the PDB's in 967
+  and Ghidra's in 8. Some are a padding byte left out between two parts (`lua_error`: 48 vs 49), others whole tails
+  (`lua_gc`: 644 vs 692, zstd's `ERR_getErrorString`: 446 vs 717). The cause isn't confirmed; likely code
+  reached only through jump tables, or after a call Ghidra takes as non-returning.
+- **Functions in data tables:** Ghidra misses the ones base relocations find (Lua's `arith_*`, `f_call`,
+  `dothecall`, ...; zstd's block-compressor table), and the CRT's `_matherr`.
+- **Dead code:** Ghidra finds three unreferenced zstd /Od functions native missed (`FSE_compressBound`,
+  `HUF_compressBound`, `ZSTD_getDictID_fromCDict`), and gets the size right for two functions native absorbed
+  code into (`BIT_getLowerBits`, `ZSTD_maxCLevel`) plus the CRT stub. It doesn't find zlib /Od's or Lua /Od's dead
+  code either. (Since fixed natively; see below.)
+- **Native only, not in the PDB:** the 6-byte import thunk Ghidra doesn't list as a function, and Lua /O2's three
+  1-byte starts (unexplained, see above).
+
+**Fixed the same day: function starts after padding.** All 12 unreferenced functions the PDB listed and native
+missed sat on a 16-byte boundary right after `int3` padding: 10 in gaps between functions, 2 inside a function
+without `.pdata` that had absorbed them. Once nothing else is found, such code is a start (§4.2), unless a branch
+in the function it sits in targets it (code after a call that doesn't return), and functions with `.pdata` are
+never split. Native vs PDB after it: every build finds every function the PDB lists, no native-only start was
+added, and the only size disagreement left is the CRT's 3-byte `__scrt_stub_for_acrt_uninitialize` (32 bytes
+natively). Corpus: 0 wrong; /Od +1 to +6 correct per variant (zlib 161 and 160, Lua 1087 and 1093, zstd 1705 and
+1744; zstd accepts 2 fewer per variant, now in review); /O2, the fixture and the hook loop unchanged.
+
+**Decision (answers §13 question 7 for v1): the native analyzer stays the source of boundaries.** On this
+corpus it is right far more often than Ghidra, needs no JVM, and is seconds instead of up to 46 s per build.
+Ghidra's value is what the native analyzer can't produce: pseudocode now, types later (struct layouts, §7.2). Its
+boundaries are a cross-check through `pbeta analysis-diff`, not an input. **[Provisional]**: one compiler and
+three C projects.
+
+---
 
 ## 5. Matching
 
@@ -697,9 +754,9 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 
   | Project | Tags | /O2 correct | /Od correct |
   |---|---|---|---|
-  | zlib | v1.2.13 → v1.3 → v1.3.1 | 69 of 69 | 159 of 163 |
-  | Lua | v5.4.6 → v5.4.7 → v5.4.8 | 726–732 of ~735 | 1086–1092 of ~1095 |
-  | zstd | v1.5.5 → v1.5.6 → v1.5.7 | 671–679 of ~729 | 1700–1738 of ~1879 |
+  | zlib | v1.2.13 → v1.3 → v1.3.1 | 69 of 69 | 160–161 of 163 |
+  | Lua | v5.4.6 → v5.4.7 → v5.4.8 | 726–732 of ~735 | 1087–1093 of ~1095 |
+  | zstd | v1.5.5 → v1.5.6 → v1.5.7 | 671–679 of ~729 | 1705–1744 of ~1879 |
 
   The scorecard reports precision and recall per pass. The second and third projects each found a real false
   positive in the strings pass that zlib couldn't: a literal moved into a new helper (Lua 5.4.8), and a body
@@ -722,7 +779,8 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 ### 11.1 CLI (skeleton implements `match`, `repair`, `review list`)
 
 ```
-pbeta analyze <binary> --out a.json [--pdb b.pdb [--pdb-functions p.json]]   # native PE x64 analyzer (§4.4)
+pbeta analyze <binary> --out a.json [--pdb b.pdb [--pdb-functions p.json]] [--functions-from ghidra.json]
+                                                          # native PE x64 analyzer (§4.3, §4.4)
 pbeta analysis-diff a.json b.json [--json] [--limit n]    # two analyses of one build (§4.4)
 pbeta match   --old a.json --new b.json [--json]
 pbeta repair  --old a.json --new b.json --hooks hooks.toml [--earlier older.json]... [--out hooks.new.toml]
@@ -833,7 +891,9 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 6. Will customer targets usually have PDBs? (Changes everything about type and struct repair.)
 
 **Analysis and matching**
-7. Hybrid analysis vs Ghidra-only for v1? Is a JVM on CI agents acceptable to target customers?
+7. Hybrid analysis vs Ghidra-only for v1? Is a JVM on CI agents acceptable to target customers? (Provisional,
+   from M1: native boundaries, Ghidra for pseudocode and types only, §4.4. The JVM question stays open; the
+   Ghidra diff runs locally only.)
 8. Reuse vs reimplement: BinDiff (open-sourced by Google in 2023; license **[Validate]**, believed Apache-2.0),
    Diaphora (believed AGPL-3.0 **[Validate]**, so its *code* can't be mixed into proprietary parts and maybe not
    into the Apache core), Ghidra Version Tracking and BSim (Apache-2.0). Options: reimplement the published ideas,
@@ -874,7 +934,7 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | Milestone | Scope | Exit criteria |
 |---|---|---|
 | **M0 Skeleton** (this commit) | Crate boundaries, model types, 3 matching passes, 3 structural checks, policy, repair decisions, JSON store, CLI, demo fixtures | `cargo test` green; demo `repair` produces expected outcomes |
-| **M1 Spikes** | Native PE x64 analyzer on one real binary; Ghidra headless exporter; `pdb` crate on MSVC PDBs | Both analyzers export the same functions for a sample binary (diff report). Native analyzer, `pdb` crate (names and signatures, §4.4) and `pbeta analysis-diff` done 2026-11-07, with a native-vs-PDB diff report on every corpus variant. Ghidra exporter not started (no JDK or Ghidra installed yet) |
+| **M1 Spikes** (done 2026-11-07) | Native PE x64 analyzer on one real binary; Ghidra headless exporter; `pdb` crate on MSVC PDBs | Both analyzers export the same functions for a sample binary (diff report). Native analyzer, `pdb` crate (names and signatures), Ghidra headless exporter (§4.3) and `pbeta analysis-diff`, with a three-way diff report (native, Ghidra, PDB) on the newest tag of every corpus project and flag set (§4.4). Native stays the source of boundaries |
 | **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression. Done 2026-11-07 apart from the SQLite store (deferred until history size or the hosted service needs it) |
 | **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (at /O2 7 of 8 hooks resolved v1 → v2 and 6 of 8 v2 → v3, at /Od 6 and 5, including a high-criticality hook and two hooks without structural evidence through their trial runs; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Not built: the recording harness (per-call test cases) and struct-layout proposals |
