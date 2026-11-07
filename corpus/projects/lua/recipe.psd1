@@ -1,0 +1,37 @@
+# Build recipe for Lua (https://www.lua.org, MIT license). Read by corpus/build-projects.ps1.
+#
+# Builds the standalone `lua` interpreter with the core and standard libraries compiled in, from the official
+# GitHub mirror of Lua's development repository. Left out: onelua.c (all sources #included into one file) and
+# ltests.c (internal test library, empty unless LUA_DEBUG is defined). Sources are cloned at build time into
+# target/corpus-src/ and are never committed here.
+@{
+    Name     = 'lua'
+    Repo     = 'https://github.com/lua/lua.git'
+    License  = 'MIT'
+    # Consecutive pairs are scored: v5.4.6 -> v5.4.7 and v5.4.7 -> v5.4.8 (bug-fix releases with real code
+    # changes in the parser, GC and libraries).
+    Versions = @('v5.4.6', 'v5.4.7', 'v5.4.8')
+    Exe      = 'lua'
+    Sources  = @(
+        'lapi.c', 'lauxlib.c', 'lbaselib.c', 'lcode.c', 'lcorolib.c', 'lctype.c', 'ldblib.c', 'ldebug.c',
+        'ldo.c', 'ldump.c', 'lfunc.c', 'lgc.c', 'linit.c', 'liolib.c', 'llex.c', 'lmathlib.c', 'lmem.c',
+        'loadlib.c', 'lobject.c', 'lopcodes.c', 'loslib.c', 'lparser.c', 'lstate.c', 'lstring.c', 'lstrlib.c',
+        'ltable.c', 'ltablib.c', 'ltm.c', 'lua.c', 'lundump.c', 'lutf8lib.c', 'lvm.c', 'lzio.c'
+    )
+    # Functions renamed between releases, keyed by the newer tag (old name = new name). Each was checked by
+    # hand against the sources; the answer key joins functions by name and would score these as wrong.
+    Renames  = @{
+        # 5.4.7 made five internal functions static and dropped their prefix (same bodies and signatures), and
+        # renamed ldebug.c's gxf to isEnv (same signature; it now calls basicgetobjname).
+        'v5.4.7' = @{
+            'luaD_tryfuncTM' = 'tryfuncTM'
+            'luaE_freeCI'    = 'freeCI'
+            'luaK_codeAsBx'  = 'codeAsBx'
+            'luaK_exp2RK'    = 'exp2RK'
+            'luaK_isKint'    = 'isKint'
+            'gxf'            = 'isEnv'
+        }
+    }
+    Defines  = @('_CRT_SECURE_NO_WARNINGS')
+    Cl       = @('/W3')
+}

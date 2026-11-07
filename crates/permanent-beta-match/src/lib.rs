@@ -32,6 +32,13 @@ pub struct Proposals {
 pub trait Matcher {
     fn name(&self) -> &'static str;
     fn propose(&self, ctx: &MatchContext<'_>) -> Proposals;
+
+    /// Recheck one of this pass's candidates against the final matches (`ctx.pairs`, which includes it).
+    /// `Some(reason)` means other evidence contradicts it: [`run_passes`] bans the pair, reruns every pass
+    /// without it, and keeps it as a review suggestion. Default: never contradicted.
+    fn contradiction(&self, _ctx: &MatchContext<'_>, _candidate: &Candidate) -> Option<String> {
+        None
+    }
 }
 
 /// Result of all passes.
@@ -71,11 +78,72 @@ pub fn default_matchers() -> Vec<Box<dyn Matcher>> {
 
 /// Run passes in order, repeating until no pass adds a candidate (so later passes can unlock earlier ones,
 /// which matters once call-graph propagation exists).
+///
+/// Then each candidate is rechecked by its pass against the final matches ([`Matcher::contradiction`]). If any
+/// is contradicted, those pairs are banned and everything reruns from scratch, so nothing built on a vetoed
+/// pair survives. Each round bans at least one new pair, so this terminates.
 pub fn run_passes(
     old: &AnalysisExport,
     new: &AnalysisExport,
     matchers: &[Box<dyn Matcher>],
 ) -> MatchOutcome {
+    let mut banned: BTreeMap<(Rva, Rva), Ambiguity> = BTreeMap::new();
+    loop {
+        let round = run_round(old, new, matchers, &banned);
+        let ctx = MatchContext {
+            old,
+            new,
+            matched_old: &round.matched_old,
+            matched_new: &round.matched_new,
+            pairs: &round.candidates,
+        };
+        let vetoed: Vec<Ambiguity> = round
+            .candidates
+            .iter()
+            .filter_map(|c| {
+                let CandidateSource::Deterministic { matcher } = &c.source else {
+                    return None;
+                };
+                let m = matchers.iter().find(|m| m.name() == matcher)?;
+                let reason = m.contradiction(&ctx, c)?;
+                Some(Ambiguity {
+                    matcher: matcher.clone(),
+                    old: vec![c.old],
+                    new: vec![c.new],
+                    detail: format!("suggestion only: {reason}"),
+                })
+            })
+            .collect();
+        if vetoed.is_empty() {
+            let mut ambiguities = round.ambiguities;
+            ambiguities.extend(banned.into_values());
+            return finish(
+                round.candidates,
+                &round.matched_old,
+                &round.matched_new,
+                ambiguities,
+            );
+        }
+        for v in vetoed {
+            banned.insert((v.old[0], v.new[0]), v);
+        }
+    }
+}
+
+struct Round {
+    candidates: Vec<Candidate>,
+    matched_old: HashSet<Rva>,
+    matched_new: HashSet<Rva>,
+    ambiguities: Vec<Ambiguity>,
+}
+
+/// One fixpoint of all passes, never accepting a banned pair.
+fn run_round(
+    old: &AnalysisExport,
+    new: &AnalysisExport,
+    matchers: &[Box<dyn Matcher>],
+    banned: &BTreeMap<(Rva, Rva), Ambiguity>,
+) -> Round {
     let mut matched_old = HashSet::new();
     let mut matched_new = HashSet::new();
     let mut accepted = Vec::new();
@@ -92,7 +160,10 @@ pub fn run_passes(
             };
             let proposals = matcher.propose(&ctx);
             for c in proposals.candidates {
-                if !matched_old.contains(&c.old) && !matched_new.contains(&c.new) {
+                if !matched_old.contains(&c.old)
+                    && !matched_new.contains(&c.new)
+                    && !banned.contains_key(&(c.old, c.new))
+                {
                     matched_old.insert(c.old);
                     matched_new.insert(c.new);
                     accepted.push(c);
@@ -104,7 +175,20 @@ pub fn run_passes(
             break;
         }
     }
+    Round {
+        candidates: accepted,
+        matched_old,
+        matched_new,
+        ambiguities,
+    }
+}
 
+fn finish(
+    accepted: Vec<Candidate>,
+    matched_old: &HashSet<Rva>,
+    matched_new: &HashSet<Rva>,
+    mut ambiguities: Vec<Ambiguity>,
+) -> MatchOutcome {
     // Drop functions a pass matched after the ambiguity was recorded, then groups left empty on a side.
     for a in &mut ambiguities {
         a.old.retain(|r| !matched_old.contains(r));
@@ -304,7 +388,7 @@ impl Matcher for UniqueStringsMatcher {
     }
 
     fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
-        propose_by_key(
+        let mut proposals = propose_by_key(
             ctx,
             self.name(),
             0.7,
@@ -314,7 +398,60 @@ impl Matcher for UniqueStringsMatcher {
                 let key = string_set_key(f).unwrap_or_default();
                 format!("referenced-string set [{}]", key.replace('\u{1f}', ", "))
             },
-        )
+        );
+        // Contradicted pairs are dropped now, and rechecked against the final matches too, because the callers
+        // may only be matched later.
+        let mut kept = Vec::new();
+        for c in proposals.candidates {
+            match self.contradiction(ctx, &c) {
+                None => kept.push(c),
+                Some(reason) => proposals.ambiguities.push(Ambiguity {
+                    matcher: self.name().to_owned(),
+                    old: vec![c.old],
+                    new: vec![c.new],
+                    detail: format!("suggestion only: {reason}"),
+                }),
+            }
+        }
+        proposals.candidates = kept;
+        proposals
+    }
+
+    /// Moving a literal, or a whole body, into a new function is a common refactor: Lua 5.4.8 moved
+    /// "error in error handling" from luaD_seterrorobj into the new luaD_errerr, and zstd 1.5.7 moved
+    /// ZSTD_entropyCompressSeqStore's body into a new ZSTD_entropyCompressSeqStore_wExtLitBuffer behind a
+    /// wrapper. So strings alone don't decide when other evidence contradicts them:
+    /// - a different register-argument count, or
+    /// - callers: the old function has matched callers, and none of their counterparts calls the new function.
+    ///   A veto only costs recall, so one disagreeing caller is enough.
+    fn contradiction(&self, ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
+        let args = |e: &AnalysisExport, r| e.function(r).and_then(|f| f.inferred_args);
+        if let (Some(a), Some(b)) = (args(ctx.old, c.old), args(ctx.new, c.new)) {
+            if a != b {
+                return Some(format!(
+                    "same strings, but reads {a} -> {b} register arguments"
+                ));
+            }
+        }
+        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|p| (p.old, p.new)).collect();
+        let mapped: Vec<Rva> = ctx
+            .old
+            .functions
+            .iter()
+            .filter(|f| f.rva != c.old && f.callees.contains(&c.old))
+            .filter_map(|f| map.get(&f.rva).copied())
+            .collect();
+        let agrees = mapped.iter().any(|&nc| {
+            ctx.new
+                .function(nc)
+                .is_some_and(|f| f.callees.contains(&c.new))
+        });
+        (!mapped.is_empty() && !agrees).then(|| {
+            format!(
+                "same strings, but none of the {} matched caller(s) calls the new function",
+                mapped.len()
+            )
+        })
     }
 }
 
@@ -752,6 +889,112 @@ mod tests {
         let got = run_passes(&old, &new, &default_matchers()).candidates;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].new, Rva(0x100));
+    }
+
+    fn with_strings(rva: u64, hash: &str, strings: &[&str], args: Option<u8>) -> FunctionFeatures {
+        let mut f = func(rva, None, Some(hash));
+        f.strings = strings.iter().map(|s| s.to_string()).collect();
+        f.inferred_args = args;
+        f
+    }
+
+    #[test]
+    fn a_moved_literal_with_a_different_argument_count_is_not_a_string_match() {
+        // The only string moved from a 3-argument function into a new 1-argument helper.
+        let old = export(
+            "a",
+            vec![with_strings(
+                0x10,
+                "h1",
+                &["error in error handling"],
+                Some(3),
+            )],
+        );
+        let new = export(
+            "b",
+            vec![
+                with_strings(0x100, "h2", &[], Some(3)),
+                with_strings(0x200, "h3", &["error in error handling"], Some(1)),
+            ],
+        );
+        assert!(pairs(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn string_match_survives_unknown_or_equal_argument_counts() {
+        for (a, b) in [(Some(2), Some(2)), (None, Some(1)), (Some(1), None)] {
+            let old = export("a", vec![with_strings(0x10, "h1", &["config.ini"], a)]);
+            let new = export("b", vec![with_strings(0x100, "h2", &["config.ini"], b)]);
+            assert_eq!(pairs(&old, &new), vec![(0x10, 0x100)], "{a:?} {b:?}");
+        }
+    }
+
+    /// The old caller (matched by name) calls f, which holds the string. In the new build the caller calls
+    /// `new_callee`; the string sits in 0x200.
+    fn moved_body(new_callee: u64) -> (AnalysisExport, AnalysisExport) {
+        let mut caller_old = func(1, Some("caller"), None);
+        caller_old.callees = vec![Rva(0x10)];
+        let mut caller_new = func(2, Some("caller"), None);
+        caller_new.callees = vec![Rva(new_callee)];
+        let mut wrapper = with_strings(0x100, "hw", &[], None);
+        wrapper.callees = vec![Rva(0x200)];
+        (
+            export(
+                "a",
+                vec![
+                    caller_old,
+                    with_strings(0x10, "h1", &["compress failed"], None),
+                ],
+            ),
+            export(
+                "b",
+                vec![
+                    caller_new,
+                    wrapper,
+                    with_strings(0x200, "h2", &["compress failed"], None),
+                ],
+            ),
+        )
+    }
+
+    #[test]
+    fn a_body_moved_behind_a_wrapper_is_not_a_string_match() {
+        // zstd 1.5.7: the matched caller now calls a wrapper, and the string moved into the wrapped function.
+        let (old, new) = moved_body(0x100);
+        let got = pairs(&old, &new);
+        assert!(!got.iter().any(|&(o, _)| o == 0x10), "{got:?}");
+    }
+
+    #[test]
+    fn a_contradiction_found_only_after_later_passes_still_vetoes() {
+        // Strings run before the caller is matched (here by a name pass placed after it), so only the recheck
+        // against the final matches sees the disagreement. The pair is banned, kept as a suggestion.
+        let (old, new) = moved_body(0x100);
+        let late: Vec<Box<dyn Matcher>> =
+            vec![Box::new(UniqueStringsMatcher), Box::new(SymbolNameMatcher)];
+        let got = run_passes(&old, &new, &late);
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x10)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(
+            got.candidates.iter().any(|c| c.old == Rva(1)),
+            "caller still matched"
+        );
+        assert!(
+            got.ambiguities
+                .iter()
+                .any(|a| a.old == vec![Rva(0x10)] && a.new == vec![Rva(0x200)]),
+            "{:?}",
+            got.ambiguities
+        );
+    }
+
+    #[test]
+    fn a_string_match_its_matched_caller_agrees_with_is_kept() {
+        let (old, new) = moved_body(0x200);
+        assert!(pairs(&old, &new).contains(&(0x10, 0x200)));
     }
 
     // Call-sequence pass. `main` is matched by name; its callees are given in call order.

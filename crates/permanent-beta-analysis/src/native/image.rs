@@ -27,6 +27,8 @@ pub(crate) struct RuntimeFunction {
     pub end: u32,
     /// A fragment of another function, not a function start.
     pub chained: bool,
+    /// For a chained fragment: the start of the function the chain leads back to, if it could be followed.
+    pub parent: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -221,19 +223,48 @@ impl Image {
             if begin == 0 || end <= begin {
                 continue;
             }
-            // Low bit set: UnwindData points at another RUNTIME_FUNCTION (an indirect chain).
-            let chained = unwind & 1 != 0
-                || self
-                    .bytes(unwind, 1)
-                    .is_some_and(|b| (b[0] >> 3) & UNW_FLAG_CHAININFO != 0);
+            let chained = self.chain_link(unwind).is_some();
             out.push(RuntimeFunction {
                 begin,
                 end,
                 chained,
+                parent: chained.then(|| self.chain_root(unwind)).flatten(),
             });
         }
         out.sort_by_key(|r| r.begin);
         out
+    }
+
+    /// If the unwind data at `unwind` is chained, the RVA of the RUNTIME_FUNCTION it chains to.
+    ///
+    /// Two encodings: low bit set means UnwindData itself points (minus 1) at a RUNTIME_FUNCTION; otherwise an
+    /// UNWIND_INFO with `UNW_FLAG_CHAININFO` stores the RUNTIME_FUNCTION after its unwind codes (padded to an
+    /// even count).
+    fn chain_link(&self, unwind: u32) -> Option<u32> {
+        if unwind & 1 != 0 {
+            return Some(unwind & !1);
+        }
+        let header = self.bytes(unwind, 4)?;
+        if (header[0] >> 3) & UNW_FLAG_CHAININFO == 0 {
+            return None;
+        }
+        let codes = u32::from(header[2]).next_multiple_of(2);
+        Some(unwind + 4 + codes * 2)
+    }
+
+    /// Follow a chain to the function that isn't itself chained, and return its start.
+    fn chain_root(&self, unwind: u32) -> Option<u32> {
+        let mut link = self.chain_link(unwind)?;
+        // Real chains are one or two links long; the limit only guards against cycles in a malformed file.
+        for _ in 0..32 {
+            let begin = self.u32_at(link)?;
+            let next_unwind = self.u32_at(link + 8)?;
+            match self.chain_link(next_unwind) {
+                Some(next) => link = next,
+                None => return Some(begin),
+            }
+        }
+        None
     }
 
     fn parse_imports(&self, rva: u32) -> HashMap<u32, String> {
@@ -325,6 +356,47 @@ pub(crate) mod tests {
         assert_eq!(img.string_literal(0x2000), None, "too short");
         assert_eq!(img.string_literal(0x2003), None, "not printable");
         assert_eq!(img.string_literal(0x1000), None, "executable section");
+    }
+
+    /// pdata table at 0x2000: f at 0x1000..0x1010 (plain unwind info at 0x2100) and a fragment at
+    /// 0x1010..0x1020 whose unwind info at 0x2110 chains back to f.
+    fn chained_image(fragment_unwind: u32) -> Image {
+        let mut data = vec![0u8; 0x200];
+        let entry = |d: &mut Vec<u8>, at: usize, b: u32, e: u32, u: u32| {
+            d[at..at + 4].copy_from_slice(&b.to_le_bytes());
+            d[at + 4..at + 8].copy_from_slice(&e.to_le_bytes());
+            d[at + 8..at + 12].copy_from_slice(&u.to_le_bytes());
+        };
+        entry(&mut data, 0, 0x1000, 0x1010, 0x2100);
+        entry(&mut data, 12, 0x1010, 0x1020, fragment_unwind);
+        // Version 1, no flags, 1 unwind code (then padding to an even count).
+        data[0x100..0x104].copy_from_slice(&[0x01, 0x04, 0x01, 0x00]);
+        // Version 1 | UNW_FLAG_CHAININFO, no codes; the RUNTIME_FUNCTION of f follows.
+        data[0x110..0x114].copy_from_slice(&[0x01 | (UNW_FLAG_CHAININFO << 3), 0, 0, 0]);
+        entry(&mut data, 0x114, 0x1000, 0x1010, 0x2100);
+        image(&[0xc3], &data)
+    }
+
+    #[test]
+    fn chained_fragments_lead_back_to_their_function() {
+        let img = chained_image(0x2110);
+        let p = img.parse_pdata(0x2000, 24);
+        assert_eq!((p[0].chained, p[0].parent), (false, None));
+        assert_eq!((p[1].chained, p[1].parent), (true, Some(0x1000)));
+    }
+
+    #[test]
+    fn indirect_chain_pointer_is_followed() {
+        // Low bit set: UnwindData points straight at f's RUNTIME_FUNCTION (at 0x2000).
+        let p = chained_image(0x2001).parse_pdata(0x2000, 24);
+        assert_eq!((p[1].chained, p[1].parent), (true, Some(0x1000)));
+    }
+
+    #[test]
+    fn unchained_entries_have_no_parent() {
+        // Both entries use plain unwind info: two separate functions.
+        let p = chained_image(0x2100).parse_pdata(0x2000, 24);
+        assert!(p.iter().all(|r| !r.chained && r.parent.is_none()));
     }
 
     #[test]

@@ -67,13 +67,7 @@ fn single_exe(dir: &Path) -> Result<PathBuf> {
 /// Human-readable scorecard for one variant.
 pub fn render(v: &VariantScore) -> String {
     let t = &v.card.totals;
-    // Functions that exist in both builds: the most a matcher could get right.
-    let in_both = v
-        .card
-        .functions
-        .iter()
-        .filter(|f| f.old.is_some() && !f.truth.is_empty())
-        .count();
+    let in_both = v.card.in_both();
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -86,6 +80,25 @@ pub fn render(v: &VariantScore) -> String {
         t.unmatched,
         t.wrong
     );
+    // Per pass: precision over its own candidates, recall as its share of the functions present in both builds.
+    for (pass, p) in v.card.by_pass() {
+        let precision = p
+            .precision()
+            .map(|x| format!("{:.1}%", x * 100.0))
+            .unwrap_or_else(|| "-".into());
+        let recall = if in_both > 0 {
+            f64::from(p.correct()) / f64::from(in_both) * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            out,
+            "  pass {pass:<16} correct {:>4} (accepted {:>4}), wrong {:>2}, precision {precision:>6}, recall {recall:>5.1}%",
+            p.correct(),
+            p.accepted,
+            p.wrong
+        );
+    }
     for s in &v.evaluation.scenarios {
         let actual = s
             .actual

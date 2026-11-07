@@ -11,6 +11,10 @@
 //! 2. leftovers by name alone, when the name is unique among the leftovers on both sides. This catches a
 //!    function whose linkage changed (zlib 1.3.1 made minigzip's helpers `static`) or that moved to another
 //!    object file. Without it, both look like deleted + added, and correct matches get scored as wrong.
+//! 3. declared renames (old name → new name), checked by hand against the sources and listed in the project's
+//!    recipe. Lua 5.4.7 renamed `luaK_exp2RK` to a static `exp2RK`: without the declaration, matching the two
+//!    is scored as wrong. A declaration whose old name still exists in the new build is an error, so the list
+//!    can't go stale.
 
 use crate::map::{MapFile, MapSymbol};
 use permanent_beta_model::Rva;
@@ -66,10 +70,25 @@ pub struct TruthEntry {
     /// Internal linkage (listed under `Static symbols`) in either build.
     #[serde(rename = "static")]
     pub is_static: bool,
+    /// The new build's name, when it differs from `names` because of a declared rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_to: Option<String>,
 }
 
 impl GroundTruth {
     pub fn from_maps(old: &MapFile, new: &MapFile, scope: &Scope) -> Self {
+        Self::from_maps_with_renames(old, new, scope, &[])
+            .expect("no renames declared, so none can fail to apply")
+    }
+
+    /// Like [`Self::from_maps`], then joins declared renames `(old name, new name)` among the leftovers. Errors
+    /// if a rename doesn't name exactly one unjoined function on each side.
+    pub fn from_maps_with_renames(
+        old: &MapFile,
+        new: &MapFile,
+        scope: &Scope,
+        renames: &[(String, String)],
+    ) -> Result<Self, String> {
         let in_scope = |map: &'_ MapFile| -> Vec<MapSymbol> {
             map.symbols
                 .iter()
@@ -113,6 +132,7 @@ impl GroundTruth {
         }
         let (old_count, new_count) = (count(&old_left), count(&new_left));
         let mut new_left_used = vec![false; new_left.len()];
+        let mut old_unjoined: Vec<&MapSymbol> = Vec::new();
         for o in old_left {
             let unique =
                 old_count[o.name.as_str()] == 1 && new_count.get(o.name.as_str()) == Some(&1);
@@ -124,7 +144,46 @@ impl GroundTruth {
                     new_left_used[i] = true;
                     joined.push((Some(o), Some(new_left[i])));
                 }
-                None => joined.push((Some(o), None)),
+                None => old_unjoined.push(o),
+            }
+        }
+
+        // Stage 3: declared renames. Skipped where either side has no such function (an optimized build can
+        // inline a new static away). An error if the old name still exists in the new build (stale
+        // declaration) or a name is held by more than one unjoined function (can't say which was renamed).
+        let mut old_used = vec![false; old_unjoined.len()];
+        for (from, to) in renames {
+            if new_syms.iter().any(|s| s.name == *from) {
+                return Err(format!(
+                    "rename {from} -> {to} is stale: {from} still exists in the new build"
+                ));
+            }
+            let olds: Vec<usize> = (0..old_unjoined.len())
+                .filter(|&i| !old_used[i] && old_unjoined[i].name == *from)
+                .collect();
+            let news: Vec<usize> = (0..new_left.len())
+                .filter(|&i| !new_left_used[i] && new_left[i].name == *to)
+                .collect();
+            match (olds.as_slice(), news.as_slice()) {
+                ([o], [n]) => {
+                    old_used[*o] = true;
+                    new_left_used[*n] = true;
+                    joined.push((Some(old_unjoined[*o]), Some(new_left[*n])));
+                }
+                ([], _) | (_, []) => {}
+                _ => {
+                    return Err(format!(
+                        "rename {from} -> {to} is ambiguous: {} unjoined old function(s) named {from}, \
+                         {} unjoined new function(s) named {to}",
+                        olds.len(),
+                        news.len()
+                    ));
+                }
+            }
+        }
+        for (o, used) in old_unjoined.iter().zip(&old_used) {
+            if !used {
+                joined.push((Some(o), None));
             }
         }
         for (n, used) in new_left.iter().zip(&new_left_used) {
@@ -133,32 +192,39 @@ impl GroundTruth {
             }
         }
 
-        let mut groups: BTreeMap<AddressPair, (Vec<String>, bool)> = BTreeMap::new();
+        let mut groups: BTreeMap<AddressPair, (Vec<String>, bool, Option<String>)> =
+            BTreeMap::new();
         for (o, n) in joined {
             let addresses = (o.map(|s| s.rva), n.map(|s| s.rva));
             let is_static = o.is_some_and(|s| s.is_static) || n.is_some_and(|s| s.is_static);
             let name = o.or(n).map(|s| s.name.clone()).unwrap_or_default();
             let entry = groups.entry(addresses).or_default();
+            if let (Some(o), Some(n)) = (o, n) {
+                if o.name != n.name {
+                    entry.2 = Some(n.name.clone());
+                }
+            }
             entry.0.push(name);
             entry.1 |= is_static;
         }
 
-        GroundTruth {
+        Ok(GroundTruth {
             schema_version: TRUTH_SCHEMA_VERSION,
             object: scope.describe(),
             functions: groups
                 .into_iter()
-                .map(|((old, new), (mut names, is_static))| {
+                .map(|((old, new), (mut names, is_static, renamed_to))| {
                     names.sort();
                     TruthEntry {
                         names,
                         old,
                         new,
                         is_static,
+                        renamed_to,
                     }
                 })
                 .collect(),
-        }
+        })
     }
 
     pub fn entry(&self, name: &str) -> Option<&TruthEntry> {
@@ -255,5 +321,82 @@ mod tests {
                 (Some(Rva(0x20)), Some(Rva(0x120)))
             ]
         );
+    }
+
+    fn renames(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|&(a, b)| (a.to_owned(), b.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn declared_rename_joins_old_and_new_names() {
+        // Lua 5.4.7: luaK_exp2RK became static exp2RK.
+        let old = map(vec![sym("luaK_exp2RK", 0x10, "lcode.obj", false)]);
+        let new = map(vec![sym("exp2RK", 0x90, "lcode.obj", true)]);
+        let t = GroundTruth::from_maps_with_renames(
+            &old,
+            &new,
+            &Scope::ProjectObjects,
+            &renames(&[("luaK_exp2RK", "exp2RK")]),
+        )
+        .unwrap();
+        let e = t.entry("luaK_exp2RK").unwrap();
+        assert_eq!((e.old, e.new), (Some(Rva(0x10)), Some(Rva(0x90))));
+        assert_eq!(e.renamed_to.as_deref(), Some("exp2RK"));
+        assert_eq!(t.functions.len(), 1);
+    }
+
+    #[test]
+    fn without_a_declaration_a_rename_is_deleted_plus_added() {
+        let old = map(vec![sym("luaK_exp2RK", 0x10, "lcode.obj", false)]);
+        let new = map(vec![sym("exp2RK", 0x90, "lcode.obj", true)]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert!(
+            t.functions
+                .iter()
+                .all(|e| e.old.is_none() || e.new.is_none())
+        );
+    }
+
+    #[test]
+    fn a_stale_rename_is_an_error() {
+        // The function kept its name: the declaration is out of date.
+        let old = map(vec![sym("f", 0x10, "a.obj", false)]);
+        let new = map(vec![
+            sym("f", 0x90, "a.obj", false),
+            sym("g", 0xa0, "a.obj", false),
+        ]);
+        let r = renames(&[("f", "g")]);
+        assert!(
+            GroundTruth::from_maps_with_renames(&old, &new, &Scope::ProjectObjects, &r).is_err()
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_rename_is_an_error() {
+        // Two unjoined new functions named g (different objects): which one f became is unknown.
+        let old = map(vec![sym("f", 0x10, "a.obj", false)]);
+        let new = map(vec![
+            sym("g", 0x90, "a.obj", true),
+            sym("g", 0xa0, "b.obj", true),
+        ]);
+        let r = renames(&[("f", "g")]);
+        assert!(
+            GroundTruth::from_maps_with_renames(&old, &new, &Scope::ProjectObjects, &r).is_err()
+        );
+    }
+
+    #[test]
+    fn a_rename_whose_new_function_was_inlined_away_is_skipped() {
+        // /O2 inlined the new static freeCI, so it has no symbol: the old function stays deleted.
+        let old = map(vec![sym("luaE_freeCI", 0x10, "lstate.obj", false)]);
+        let new = map(vec![sym("other", 0x90, "lstate.obj", false)]);
+        let r = renames(&[("luaE_freeCI", "freeCI")]);
+        let t =
+            GroundTruth::from_maps_with_renames(&old, &new, &Scope::ProjectObjects, &r).unwrap();
+        let e = t.entry("luaE_freeCI").unwrap();
+        assert_eq!((e.old, e.new), (Some(Rva(0x10)), None));
     }
 }

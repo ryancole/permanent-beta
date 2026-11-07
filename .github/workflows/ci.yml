@@ -36,7 +36,7 @@ jobs:
       - name: corpus gate (analyzer checks + zero wrong matches + correct-match baseline)
         if: runner.os == 'Windows'
         run: cargo test -p permanent-beta-corpus -- --ignored --nocapture
-      - name: real-world corpus gate (clone, build and score zlib across release tags)
+      - name: real-world corpus gate (clone, build and score zlib, lua and zstd across release tags)
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./corpus/build-projects.ps1 -Score

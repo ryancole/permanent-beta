@@ -33,6 +33,10 @@ enum Command {
         /// object file linked directly (the project's own code), excluding library members.
         #[arg(long)]
         object: Option<String>,
+        /// A function renamed between the builds, as `old=new`. Repeatable. Checked against the sources by
+        /// hand; an error if it doesn't name exactly one otherwise-unjoined function on each side.
+        #[arg(long = "rename", value_parser = parse_rename)]
+        renames: Vec<(String, String)>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -98,10 +102,13 @@ fn main() -> Result<ExitCode> {
             old,
             new,
             object,
+            renames,
             out,
         } => {
             let scope = object.map(Scope::Object).unwrap_or(Scope::ProjectObjects);
-            let truth = GroundTruth::from_maps(&load(&old)?, &load(&new)?, &scope);
+            let truth =
+                GroundTruth::from_maps_with_renames(&load(&old)?, &load(&new)?, &scope, &renames)
+                    .map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
                 !truth.functions.is_empty(),
                 "no in-scope functions ({}) found in either map file",
@@ -111,6 +118,13 @@ fn main() -> Result<ExitCode> {
                 .with_context(|| format!("writing {}", out.display()))?;
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+fn parse_rename(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((a, b)) if !a.is_empty() && !b.is_empty() => Ok((a.to_owned(), b.to_owned())),
+        _ => Err(format!("expected old=new, got `{s}`")),
     }
 }
 

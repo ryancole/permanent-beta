@@ -152,6 +152,7 @@ mod tests {
                 truth: vec![Rva(2)],
                 outcome,
                 got: None,
+                matcher: None,
             }],
             totals: Totals {
                 accepted: correct,

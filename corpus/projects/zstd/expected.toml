@@ -1,0 +1,22 @@
+# Gate for the zstd corpus. Scored by `pwsh corpus/build-projects.ps1 -Project zstd -Score`
+# (add `--misses` to `pbeta-corpus score` to list what wasn't matched).
+#
+#   - zero wrong matches, always (not configurable);
+#   - at least `min_correct` correct matches per variant (<flags>__<old>__<new>), counting every function from
+#     zstd's own object files. Raise these when matching improves.
+#
+# Baseline 2026-11-06 (first run): /O2 433 of 725 and 511 of 730, /O2+ICF 426 of 695 and 508 of 700,
+# /Od 1283 of 1863 and 1516 of 1890. The most churn of any corpus project, and the most room for the
+# similarity pass: about 40% of /O2 functions present in both builds aren't matched yet.
+# The first run found one real false positive: 1.5.7 moved ZSTD_entropyCompressSeqStore's body into a new
+# ZSTD_entropyCompressSeqStore_wExtLitBuffer behind a wrapper, and the strings pass paired the old function
+# with the new body. String matches are now rechecked against the final matches and vetoed when the old
+# function's matched callers don't call the new one. It also found four renames, declared in recipe.psd1.
+
+[gate.min_correct]
+"o2__v1.5.5__v1.5.6" = 433
+"o2__v1.5.6__v1.5.7" = 511
+"o2-icf__v1.5.5__v1.5.6" = 426
+"o2-icf__v1.5.6__v1.5.7" = 508
+"od__v1.5.5__v1.5.6" = 1283
+"od__v1.5.6__v1.5.7" = 1516

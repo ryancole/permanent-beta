@@ -2,8 +2,13 @@
 //!
 //! Discovery: x64 `.pdata` lists every function that needs unwind info, but MSVC emits none for leaf functions
 //! that don't touch the stack, which is common at /O2. So starts are seeded from `.pdata`, the entry point and
-//! exports, then extended to a fixpoint with direct call/jump targets that land in executable code outside any
-//! known function. A function without `.pdata` ends at the next known start (trailing `int3` padding trimmed).
+//! exports, then extended to a fixpoint with direct call/jump targets and RIP-relative `lea` operands (an
+//! address taken, e.g. a callback) that land in executable code outside any known function. A function without
+//! `.pdata` ends at the next known start (trailing `int3` padding trimmed).
+//!
+//! Chained `.pdata` entries are fragments of another function: at /O2 MSVC splits bodies into chained
+//! fragments (shrink-wrapping), and these hold much of the code. Each fragment belongs to the function its chain
+//! leads back to: it's decoded with it, and its calls, strings and constants are that function's.
 //!
 //! Features: the normalized hash covers each instruction's opcode and operands but masks anything that moves
 //! when unrelated code moves: RIP-relative targets, branch targets outside the function, and immediates or
@@ -12,19 +17,28 @@
 
 use super::image::Image;
 use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, OpAccess, OpKind,
-    Register,
+    Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
+    OpKind, Register,
 };
 use permanent_beta_model::{EntryInfo, FunctionFeatures, Rva};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FunctionRange {
     pub start: u32,
     pub end: u32,
     /// Boundaries come from `.pdata` (exact) rather than "until the next known start" (heuristic).
     pub from_pdata: bool,
+    /// Chained `.pdata` fragments of this function, `[begin, end)`, in address order.
+    pub fragments: Vec<(u32, u32)>,
+}
+
+impl FunctionRange {
+    /// The function's code: its main range, then its fragments.
+    fn segments(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        std::iter::once((self.start, self.end)).chain(self.fragments.iter().copied())
+    }
 }
 
 /// Decode `[start, end)`. Stops early at the first invalid instruction.
@@ -78,19 +92,39 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
 
     loop {
         let mut found = Vec::new();
-        for range in ranges(image, &starts) {
-            for ins in decode(image, range.start, range.end) {
-                if !(0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op))) {
+        let ranges = ranges(image, &starts);
+        // Fragments whose chain couldn't be followed to a known start are still code worth scanning.
+        let owned: BTreeSet<(u32, u32)> = ranges.iter().flat_map(|r| r.fragments.clone()).collect();
+        let orphans = pdata
+            .iter()
+            .filter(|r| r.chained && !owned.contains(&(r.begin, r.end)))
+            .map(|r| (r.begin, r.end));
+        let segments: Vec<(u32, u32)> = ranges
+            .iter()
+            .flat_map(FunctionRange::segments)
+            .chain(orphans)
+            .collect();
+        for (seg_start, seg_end) in segments {
+            for ins in decode(image, seg_start, seg_end) {
+                let (t, is_call) = if (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)))
+                {
+                    (
+                        ins.near_branch_target(),
+                        ins.flow_control() == FlowControl::Call,
+                    )
+                } else if ins.mnemonic() == Mnemonic::Lea && ins.is_ip_rel_memory_operand() {
+                    // Address taken: treated like a jump (a new start only outside the current range).
+                    (ins.ip_rel_memory_address(), false)
+                } else {
                     continue;
-                }
-                let Some(t) = image.va_to_rva(ins.near_branch_target()) else {
+                };
+                let Some(t) = image.va_to_rva(t) else {
                     continue;
                 };
                 // A call target is a function start even inside the current range: a range without .pdata
                 // runs to the next *known* start, so it can still swallow functions not yet discovered.
                 // A jump inside the range is an ordinary branch.
-                let is_call = ins.flow_control() == FlowControl::Call;
-                let internal = range.start <= t && t < range.end;
+                let internal = seg_start <= t && t < seg_end;
                 if (is_call || !internal)
                     && image.is_executable(t)
                     && !starts.contains(&t)
@@ -101,7 +135,7 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
             }
         }
         if found.is_empty() {
-            return ranges(image, &starts);
+            return ranges;
         }
         starts.extend(found);
     }
@@ -112,6 +146,14 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
 fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
     let mut boundaries: BTreeSet<u32> = starts.clone();
     boundaries.extend(image.pdata.iter().map(|r| r.begin));
+    let fragments_of = |start: u32| -> Vec<(u32, u32)> {
+        image
+            .pdata
+            .iter()
+            .filter(|r| r.chained && r.parent == Some(start) && image.is_executable(r.begin))
+            .map(|r| (r.begin, r.end))
+            .collect()
+    };
 
     starts
         .iter()
@@ -121,6 +163,7 @@ fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
                     start,
                     end: r.end,
                     from_pdata: true,
+                    fragments: fragments_of(start),
                 });
             }
             let section_end = image.section_end(start)?;
@@ -137,6 +180,7 @@ fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
                 start,
                 end,
                 from_pdata: false,
+                fragments: fragments_of(start),
             })
         })
         .collect()
@@ -154,12 +198,24 @@ fn short_hash(h: Sha256, prefix: &str) -> String {
     format!("{prefix}:{hex}")
 }
 
-pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures {
-    let insns = decode(image, range.start, range.end);
-    let (start_va, end_va) = (
-        image.base + range.start as u64,
-        image.base + range.end as u64,
-    );
+pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures {
+    let segments: Vec<(u64, u64)> = range
+        .segments()
+        .map(|(s, e)| (image.base + s as u64, image.base + e as u64))
+        .collect();
+    let insns: Vec<Instruction> = range
+        .segments()
+        .flat_map(|(s, e)| decode(image, s, e))
+        .collect();
+    let start_va = segments[0].0;
+    // A branch into the function is hashed as (segment, offset within it): fragments can sit anywhere
+    // relative to the main range, so an offset from the start alone would move with unrelated code.
+    let internal = |t: u64| {
+        segments
+            .iter()
+            .position(|&(s, e)| (s..e).contains(&t))
+            .map(|i| (i as u8, (t - segments[i].0) as u32))
+    };
 
     let mut nh = Sha256::new();
     let mut mh = Sha256::new();
@@ -168,7 +224,7 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
     let mut strings = BTreeSet::new();
     let mut constants = BTreeSet::new();
     let mut imports = BTreeSet::new();
-    let mut leaders = BTreeSet::from([start_va]);
+    let mut leaders: BTreeSet<u64> = segments.iter().map(|&(s, _)| s).collect();
     let mut internal_targets = BTreeSet::new();
 
     for (i, ins) in insns.iter().enumerate() {
@@ -182,9 +238,10 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
                 OpKind::Register => nh.update((ins.op_register(op) as u16).to_le_bytes()),
                 k if is_near_branch(k) => {
                     let t = ins.near_branch_target();
-                    if (start_va..end_va).contains(&t) {
+                    if let Some((segment, offset)) = internal(t) {
                         nh.update(b"i");
-                        nh.update(((t - start_va) as u32).to_le_bytes());
+                        nh.update([segment]);
+                        nh.update(offset.to_le_bytes());
                         leaders.insert(t);
                         internal_targets.insert(t);
                     } else {
@@ -262,7 +319,7 @@ pub(crate) fn features(image: &Image, range: FunctionRange) -> FunctionFeatures 
 
     FunctionFeatures {
         rva: Rva(range.start as u64),
-        size: range.end - range.start,
+        size: range.segments().map(|(s, e)| e - s).sum(),
         name: None,
         name_source: None,
         normalized_hash: (!insns.is_empty()).then(|| short_hash(nh, "nh")),
@@ -366,6 +423,7 @@ mod tests {
             start,
             end,
             from_pdata: false,
+            fragments: vec![],
         }
     }
 
@@ -374,8 +432,8 @@ mod tests {
         // lea rcx, [rip+0x0ff9]; ret   vs   lea rcx, [rip+0x1ff9]; ret  (same code, data moved)
         let a = [0x48, 0x8d, 0x0d, 0xf9, 0x0f, 0x00, 0x00, 0xc3];
         let b = [0x48, 0x8d, 0x0d, 0xf9, 0x1f, 0x00, 0x00, 0xc3];
-        let fa = features(&image(&a, &[]), range(0x1000, 0x1008));
-        let fb = features(&image(&b, &[]), range(0x1000, 0x1008));
+        let fa = features(&image(&a, &[]), &range(0x1000, 0x1008));
+        let fb = features(&image(&b, &[]), &range(0x1000, 0x1008));
         assert_eq!(fa.normalized_hash, fb.normalized_hash);
     }
 
@@ -384,11 +442,11 @@ mod tests {
         // add eax, 5; ret   vs   add eax, 6; ret
         let fa = features(
             &image(&[0x83, 0xc0, 0x05, 0xc3], &[]),
-            range(0x1000, 0x1004),
+            &range(0x1000, 0x1004),
         );
         let fb = features(
             &image(&[0x83, 0xc0, 0x06, 0xc3], &[]),
-            range(0x1000, 0x1004),
+            &range(0x1000, 0x1004),
         );
         assert_ne!(fa.normalized_hash, fb.normalized_hash);
         assert_eq!(fa.mnemonic_hash, fb.mnemonic_hash, "same mnemonics");
@@ -399,11 +457,11 @@ mod tests {
         // mov eax, [rcx+4]; ret   vs   mov eax, [rcx+8]; ret  (fixture scenario S5)
         let fa = features(
             &image(&[0x8b, 0x41, 0x04, 0xc3], &[]),
-            range(0x1000, 0x1004),
+            &range(0x1000, 0x1004),
         );
         let fb = features(
             &image(&[0x8b, 0x41, 0x08, 0xc3], &[]),
-            range(0x1000, 0x1004),
+            &range(0x1000, 0x1004),
         );
         assert_ne!(fa.normalized_hash, fb.normalized_hash);
     }
@@ -412,7 +470,7 @@ mod tests {
     fn collects_string_references() {
         // lea rcx, [rip+0x0ff9] → 0x1007 + 0x0ff9 = 0x2000; ret
         let code = [0x48, 0x8d, 0x0d, 0xf9, 0x0f, 0x00, 0x00, 0xc3];
-        let f = features(&image(&code, b"pb-config.ini\0"), range(0x1000, 0x1008));
+        let f = features(&image(&code, b"pb-config.ini\0"), &range(0x1000, 0x1008));
         assert_eq!(f.strings, vec!["pb-config.ini".to_string()]);
     }
 
@@ -429,7 +487,7 @@ mod tests {
         let starts: Vec<u32> = found.iter().map(|r| r.start).collect();
         assert_eq!(starts, vec![0x1000, 0x1010]);
         assert_eq!(found[0].end, 0x1006, "trailing int3 padding trimmed");
-        let caller = features(&img, found[0]);
+        let caller = features(&img, &found[0]);
         assert_eq!(caller.callees, vec![Rva(0x1010)]);
     }
 
@@ -445,14 +503,101 @@ mod tests {
             begin: 0x1010,
             end: 0x1020,
             chained: false,
+            parent: None,
         }];
 
         let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
         assert_eq!(starts, vec![0x1000, 0x1010]);
     }
 
+    fn pdata(begin: u32, end: u32, parent: Option<u32>) -> crate::native::image::RuntimeFunction {
+        crate::native::image::RuntimeFunction {
+            begin,
+            end,
+            chained: parent.is_some(),
+            parent,
+        }
+    }
+
+    /// 0x1000: f, `jmp` to its chained fragment at `fragment`; 0x1010: a leaf without .pdata (`mov eax, 1; ret`);
+    /// the fragment: `call 0x1010; ret`. The leaf is called only from the fragment.
+    fn split_function(fragment: u32) -> Image {
+        let mut code = vec![0xe9];
+        code.extend((fragment as i32 - 0x1005).to_le_bytes());
+        code.resize(0x10, 0xcc);
+        code.extend([0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+        code.resize((fragment - 0x1000) as usize, 0xcc);
+        code.push(0xe8);
+        code.extend((0x1010 - (fragment as i32 + 5)).to_le_bytes());
+        code.push(0xc3);
+        let mut img = image(&code, &[]);
+        img.pdata = vec![
+            pdata(0x1000, 0x1005, None),
+            pdata(fragment, fragment + 6, Some(0x1000)),
+        ];
+        img
+    }
+
+    #[test]
+    fn chained_fragments_are_part_of_their_function() {
+        let img = split_function(0x1020);
+        let found = discover(&img);
+        let starts: Vec<u32> = found.iter().map(|r| r.start).collect();
+        assert_eq!(
+            starts,
+            vec![0x1000, 0x1010],
+            "leaf found through the fragment; the fragment itself is not a function"
+        );
+        assert_eq!(found[0].fragments, vec![(0x1020, 0x1026)]);
+        let f = features(&img, &found[0]);
+        assert_eq!(f.callees, vec![Rva(0x1010)], "the fragment's call is f's");
+        assert_eq!(f.size, 5 + 6);
+    }
+
+    #[test]
+    fn moving_a_fragment_does_not_change_the_hash() {
+        // Same code; only the distance from f to its fragment differs.
+        let (a, b) = (split_function(0x1020), split_function(0x1040));
+        let fa = features(&a, &discover(&a)[0]);
+        let fb = features(&b, &discover(&b)[0]);
+        assert_eq!(fa.normalized_hash, fb.normalized_hash);
+    }
+
+    /// 0x1000..0x1008 (.pdata): `lea rcx, [rip+d]; ret` taking the address `target`. 0x1010: `xor eax, eax; ret`,
+    /// then padding to 0x1020.
+    fn takes_address(target: u32, pdata_at_0x1010: bool) -> Vec<u32> {
+        let mut code = vec![0x48, 0x8d, 0x0d];
+        code.extend((target as i32 - 0x1007).to_le_bytes());
+        code.push(0xc3);
+        code.resize(0x10, 0xcc);
+        code.extend([0x33, 0xc0, 0xc3]);
+        code.resize(0x20, 0xcc);
+        let mut img = image(&code, &[]);
+        img.pdata = vec![pdata(0x1000, 0x1008, None)];
+        if pdata_at_0x1010 {
+            img.pdata.push(pdata(0x1010, 0x1020, None));
+        }
+        discover(&img).iter().map(|r| r.start).collect()
+    }
+
+    #[test]
+    fn address_taken_code_is_a_function_start() {
+        // A callback passed by address (zlib's zcalloc/zcfree): no .pdata, never called directly.
+        assert_eq!(takes_address(0x1010, false), vec![0x1000, 0x1010]);
+    }
+
+    #[test]
+    fn address_inside_a_known_function_is_not_a_start() {
+        // lea into the middle of a .pdata function, or into the lea's own function: not new functions.
+        assert_eq!(takes_address(0x1012, true), vec![0x1000, 0x1010]);
+        assert_eq!(takes_address(0x1003, false), vec![0x1000]);
+    }
+
     fn analyze(code: &[u8]) -> FunctionFeatures {
-        features(&image(code, &[]), range(0x1000, 0x1000 + code.len() as u32))
+        features(
+            &image(code, &[]),
+            &range(0x1000, 0x1000 + code.len() as u32),
+        )
     }
 
     #[test]

@@ -180,7 +180,12 @@ Target: PE x64. Implemented in `permanent-beta-analysis/src/native` (M1, first v
 - Function starts: non-chained `.pdata` entries, the entry point and exports, then direct call/jump targets found
   by disassembly, iterated to a fixpoint. This matters more than expected: at `/O2`, MSVC emits no `.pdata` for
   leaf functions that don't touch the stack, which was most of the fixture's test functions. Functions without
-  `.pdata` end at the next known start, minus `int3` padding.
+  `.pdata` end at the next known start, minus `int3` padding. RIP-relative `lea` of code outside any known
+  function also starts one (an address taken, e.g. zlib's `zcalloc`/`zcfree` callbacks).
+- Chained `.pdata` fragments are followed back to their root function and decoded as part of it: at `/O2`, MSVC
+  splits bodies into chained fragments, and their calls, strings and constants belong to the parent. Branches
+  into a fragment are hashed as (fragment, offset), so the hash doesn't move with the fragment. Before this, 6 of
+  zlib's 69 functions were invisible at /O2 (called only from fragments); after it, all 69 match.
 - Decode with `iced-x86`. Normalized hash (opcode and operands, with RIP-relative targets, external branch
   targets and in-image addresses masked; internal branch offsets kept), mnemonic hash, basic-block count,
   callees, string literals (ASCII and UTF-16) and imports referenced through RIP-relative operands, and
@@ -189,9 +194,8 @@ Target: PE x64. Implemented in `permanent-beta-analysis/src/native` (M1, first v
 - Scored against the fixture answer keys (`permanent-beta-corpus/tests/native_fixtures.rs`): every answer-key
   function is found in all three flag sets.
 
-Known gaps: no PDB names or types yet (`pdb` crate, planned), chained `.pdata` fragments aren't merged into their
-parent, functions reached only indirectly (vtables, callbacks) without `.pdata` are missed, and `edges` isn't
-computed. **[Validate]** the discovery approach on real targets with indirect calls and jump tables.
+Known gaps: no PDB names or types yet (`pdb` crate, planned), functions without `.pdata` reached only through
+data (vtables, function-pointer tables) or not at all (dead code) are missed, and `edges` isn't computed. **[Validate]** the discovery approach on real targets with indirect calls and jump tables.
 
 What it won't do: decompilation or type recovery. That comes from the Ghidra export.
 
@@ -219,7 +223,7 @@ neighbourhood passes.
 |---|---|---|---|
 | 1 | Symbol name | Export or PDB name unique on both sides | Implemented in the skeleton. |
 | 2 | Normalized hash | `normalized_hash` unique on both sides | Implemented. |
-| 3 | Unique string set | Sorted referenced strings, unique | Implemented. |
+| 3 | Unique string set | Sorted referenced strings, unique | Implemented. **Vetoed** when other evidence contradicts it: different inferred register-argument counts, or the old function has matched callers and none of their counterparts calls the new function. Vetoes are rechecked against the final matches (`Matcher::contradiction`): a contradicted pair is banned, all passes rerun without it, and it stays as a review suggestion. Found by Lua 5.4.8 (a literal moved into a new helper) and zstd 1.5.7 (a body moved behind a wrapper). |
 | 4 | Mnemonic hash | `mnemonic_hash` unique | Deferred: on tiny functions, two unrelated functions can each have a unique mnemonic sequence, so uniqueness alone doesn't make it safe. Revisit with a minimum-size or similarity gate. |
 | 5a | Matched callees | `normalized_hash` + callee list mapped through earlier matches, unique on both sides | Implemented (`MatchedCalleesMatcher`). Normalization masks call targets, so code differing only in what it calls is hash-ambiguous (zlib's `adler32`/`crc32` `jmp` wrappers). Every callee must already be matched; no callees means no key. On zlib: /O2 61→63, /Od 150→154 and 152→156, 0 wrong. |
 | 5 | Call-graph propagation | Callees of matched callers | Implemented (`CallSequenceMatcher`), iterated to fixpoint. **Candidate** only when a callee's code occurs exactly once among the caller's unmatched callees in both builds, which doesn't depend on call order. Pairing by call *position* (or repeated identical code by order) is a **review suggestion** (an ambiguity), never a candidate: MSVC reorders calls to side-effect-free functions, and in the `basic` fixture that paired a deleted function with an edited one. The corpus gate caught it. |
@@ -514,14 +518,23 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 - **CI gate:** any change to analysis, match or verify must not reduce accepted precision on the corpus.
   *Implemented for the purpose-built fixtures* (`pbeta-corpus score`, `corpus/fixtures/*/expected.toml`): zero
   wrong matches across every function in scope, and correct matches at or above a per-flag-set baseline that is
-  raised as matching improves. Per-scenario targets are reported as met or not yet. *Real-world, first project:*
-  zlib v1.2.13 → v1.3 → v1.3.1 (`corpus/projects/zlib`), cloned and built in CI. First result: 0 wrong in all
-  six variants; /O2 61 of 69 functions in both builds matched correctly (53 accepted), /Od 150–152 of 163.
-  Remaining misses are tiny wrappers (allocator shims, tail-call wrappers), which points at a callee-based pass
-  next.
-- **Answer-key pitfall found by zlib:** joining by name must survive linkage changes (1.3.1 made minigzip's
-  helpers `static`) and functions moving between object files. Otherwise correct matches get scored as wrong
-  (`truth.rs`, two-stage join).
+  raised as matching improves. Per-scenario targets are reported as met or not yet. *Real-world projects*
+  (`corpus/projects/`), cloned and built in CI, 0 wrong in every variant (2026-11-06):
+
+  | Project | Tags | /O2 correct | /Od correct |
+  |---|---|---|---|
+  | zlib | v1.2.13 → v1.3 → v1.3.1 | 69 of 69 | 154–156 of 163 |
+  | Lua | v5.4.6 → v5.4.7 → v5.4.8 | 642–667 of ~735 | 1016–1045 of ~1095 |
+  | zstd | v1.5.5 → v1.5.6 → v1.5.7 | 433–511 of ~728 | 1283–1516 of ~1877 |
+
+  The scorecard reports precision and recall per pass. The second and third projects each found a real false
+  positive in the strings pass that zlib couldn't: a literal moved into a new helper (Lua 5.4.8), and a body
+  moved behind a wrapper (zstd 1.5.7). See §5.1 for the vetoes added. zstd's ~40% unmatched at /O2 is where
+  similarity matching (§5.1 pass 6) should be measured.
+- **Answer-key pitfalls:** joining by name must survive linkage changes (zlib 1.3.1 made minigzip's helpers
+  `static`) and functions moving between object files (`truth.rs`, two-stage join). Renames can't be inferred
+  safely, so they're declared per project in `recipe.psd1` after checking the sources (Lua 5.4.7 renamed six
+  functions, zstd four so far). Otherwise correct matches get scored as wrong.
 - **Hook corpus:** a sample app plus a Detours hook DLL and recorded behavioral tests, rebuilt across versions, to
   test the full repair loop end to end.
 
@@ -655,7 +668,7 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 |---|---|---|
 | **M0 Skeleton** (this commit) | Crate boundaries, model types, 3 matching passes, 3 structural checks, policy, repair decisions, JSON store, CLI, demo fixtures | `cargo test` green; demo `repair` produces expected outcomes |
 | **M1 Spikes** | Native PE x64 analyzer on one real binary; Ghidra headless exporter; `pdb` crate on MSVC PDBs | Both analyzers export the same functions for a sample binary (diff report) |
-| **M2 Corpus** | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass |
+| **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression |
 | **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions |
 | **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus |

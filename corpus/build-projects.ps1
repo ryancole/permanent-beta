@@ -54,11 +54,24 @@ function Build-Version($recipe, [string] $tag, [string] $flagName) {
     Write-Host "building $($recipe.Name) $tag [$flagName]"
 
     $defines = @($recipe.Defines | ForEach-Object { "/D$_" })
-    $sources = @($recipe.Sources | ForEach-Object { Join-Path $src $_ })
+    $includes = @("/I$src") + @($recipe.Include | Where-Object { $_ } | ForEach-Object { "/I$(Join-Path $src $_)" })
+    # Sources may use wildcards (e.g. 'lib/compress/*.c'), resolved per tag because files come and go between
+    # releases. Each pattern must match something.
+    $sources = @(foreach ($pattern in $recipe.Sources) {
+            $path = Join-Path $src $pattern
+            if ($pattern -match '[*?]') {
+                $found = @(Get-ChildItem $path -File | Sort-Object Name | ForEach-Object FullName)
+                if ($found.Count -eq 0) { throw "$($recipe.Name) ${tag}: '$pattern' matches no files" }
+                $found
+            } else { $path }
+        })
+    # /Fo names each object after its source file in one directory, so base names must be unique.
+    $dupes = @($sources | Group-Object { [IO.Path]::GetFileNameWithoutExtension($_) } | Where-Object Count -gt 1)
+    if ($dupes) { throw "$($recipe.Name) ${tag}: duplicate source base names: $($dupes.Name -join ', ')" }
     # Trailing backslash: /Fo names each object after its source file inside that directory.
-    Invoke-Native 'cl.exe' (@($MsvcCommon.cl) + @($recipe.Cl) + @($set.cl) + $defines + @("/I$src", '/c') +
+    Invoke-Native 'cl.exe' (@($MsvcCommon.cl) + @($recipe.Cl) + @($set.cl) + $defines + $includes + @('/c') +
         $sources + @("/Fo$out\"))
-    $objs = @($recipe.Sources | ForEach-Object { Join-Path $out ([IO.Path]::GetFileNameWithoutExtension($_) + '.obj') })
+    $objs = @($sources | ForEach-Object { Join-Path $out ([IO.Path]::GetFileNameWithoutExtension($_) + '.obj') })
     $exe = $recipe.Exe
     Invoke-Native 'link.exe' (@($MsvcCommon.link) + @($set.link) + $objs + @(
             "/OUT:$out\$exe.exe", "/PDB:$out\$exe.pdb", "/MAP:$out\$exe.map"))
@@ -86,8 +99,15 @@ foreach ($name in $projectNames) {
                 $from = Join-Path $outRoot "$name/builds/$flagName/$($pair[1])"
                 Copy-Item "$from\$exe.exe", "$from\$exe.map" $dest -Force
             }
-            Invoke-Native 'cargo' @('run', '-q', '-p', 'permanent-beta-corpus', '--', 'truth',
-                '--old', "$variant\v1\$exe.map", '--new', "$variant\v2\$exe.map", '--out', "$variant\truth.json")
+            # Renames declared for the newer tag (checked by hand against the sources).
+            $renames = @()
+            if ($recipe.Renames -and $recipe.Renames.ContainsKey($new)) {
+                $table = $recipe.Renames[$new]
+                $renames = @($table.Keys | Sort-Object | ForEach-Object { '--rename'; "$_=$($table[$_])" })
+            }
+            Invoke-Native 'cargo' (@('run', '-q', '-p', 'permanent-beta-corpus', '--', 'truth',
+                    '--old', "$variant\v1\$exe.map", '--new', "$variant\v2\$exe.map", '--out', "$variant\truth.json") +
+                $renames)
             Write-Host "wrote $variant\truth.json"
         }
     }

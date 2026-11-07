@@ -5,7 +5,7 @@
 //! for deleted functions and candidates that map an out-of-scope function onto a fixture function.
 
 use crate::truth::GroundTruth;
-use permanent_beta_model::{Ambiguity, Rva, Verdict, VerificationReport};
+use permanent_beta_model::{Ambiguity, CandidateSource, Rva, Verdict, VerificationReport};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,6 +34,9 @@ pub struct FunctionScore {
     pub outcome: Outcome,
     /// The candidate's new address, if any.
     pub got: Option<Rva>,
+    /// The pass that proposed the candidate, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +61,51 @@ pub struct Scorecard {
     pub totals: Totals,
 }
 
+/// What one pass contributed: its candidates, split by outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassTotals {
+    pub accepted: u32,
+    pub review: u32,
+    pub wrong: u32,
+}
+
+impl PassTotals {
+    pub fn correct(&self) -> u32 {
+        self.accepted + self.review
+    }
+
+    /// Correct share of this pass's candidates. `None` if it proposed nothing in scope.
+    pub fn precision(&self) -> Option<f64> {
+        let all = self.correct() + self.wrong;
+        (all > 0).then(|| f64::from(self.correct()) / f64::from(all))
+    }
+}
+
 impl Scorecard {
+    /// Functions present in both builds: the most a matcher could get right.
+    pub fn in_both(&self) -> u32 {
+        self.functions
+            .iter()
+            .filter(|f| f.old.is_some() && !f.truth.is_empty())
+            .count() as u32
+    }
+
+    /// Per proposing pass, in name order. Recall of a pass is its `correct()` over [`Self::in_both`].
+    pub fn by_pass(&self) -> BTreeMap<String, PassTotals> {
+        let mut out: BTreeMap<String, PassTotals> = BTreeMap::new();
+        for f in &self.functions {
+            let Some(m) = &f.matcher else { continue };
+            let t = out.entry(m.clone()).or_default();
+            match f.outcome {
+                Outcome::Accepted => t.accepted += 1,
+                Outcome::Review => t.review += 1,
+                Outcome::Wrong => t.wrong += 1,
+                Outcome::Ambiguous | Outcome::Unmatched => {}
+            }
+        }
+        out
+    }
+
     pub fn outcome_of(&self, name: &str) -> Option<&FunctionScore> {
         self.functions
             .iter()
@@ -109,6 +156,7 @@ pub fn score(
             truth: acceptable.iter().copied().collect(),
             outcome,
             got,
+            matcher: report.map(proposer),
         });
     }
 
@@ -122,6 +170,7 @@ pub fn score(
                     truth: vec![],
                     outcome: Outcome::Wrong,
                     got: Some(r.candidate.new),
+                    matcher: Some(proposer(r)),
                 });
             }
         }
@@ -140,11 +189,19 @@ pub fn score(
     Scorecard { functions, totals }
 }
 
+fn proposer(r: &VerificationReport) -> String {
+    match &r.candidate.source {
+        CandidateSource::Deterministic { matcher } => matcher.clone(),
+        CandidateSource::Ai { model } => format!("ai:{model}"),
+        CandidateSource::Human { .. } => "human".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::truth::{TRUTH_SCHEMA_VERSION, TruthEntry};
-    use permanent_beta_model::{Candidate, CandidateSource};
+    use permanent_beta_model::Candidate;
 
     fn entry(name: &str, old: Option<u64>, new: Option<u64>) -> TruthEntry {
         TruthEntry {
@@ -152,6 +209,7 @@ mod tests {
             old: old.map(Rva),
             new: new.map(Rva),
             is_static: false,
+            renamed_to: None,
         }
     }
 
@@ -169,12 +227,16 @@ mod tests {
     }
 
     fn report(old: u64, new: u64, verdict: Verdict) -> VerificationReport {
+        report_by("t", old, new, verdict)
+    }
+
+    fn report_by(matcher: &str, old: u64, new: u64, verdict: Verdict) -> VerificationReport {
         VerificationReport {
             candidate: Candidate {
                 old: Rva(old),
                 new: Rva(new),
                 source: CandidateSource::Deterministic {
-                    matcher: "t".into(),
+                    matcher: matcher.into(),
                 },
                 score: 1.0,
                 evidence: vec![],
@@ -231,5 +293,38 @@ mod tests {
     fn out_of_scope_matches_onto_out_of_scope_functions_are_ignored() {
         let card = score(&truth(), &[report(0x9999, 0x8888, Verdict::Accepted)], &[]);
         assert_eq!(card.totals.wrong, 0);
+    }
+
+    #[test]
+    fn per_pass_totals_attribute_each_outcome_to_its_pass() {
+        let card = score(
+            &truth(),
+            &[
+                report_by("hash", 0x10, 0x110, Verdict::Accepted),
+                report_by("hash", 0x40, 0x140, Verdict::NeedsReview),
+                // Wrong: a deleted function matched onto an added one.
+                report_by("strings", 0x20, 0x130, Verdict::Accepted),
+            ],
+            &[],
+        );
+        let p = card.by_pass();
+        assert_eq!(
+            p["hash"],
+            PassTotals {
+                accepted: 1,
+                review: 1,
+                wrong: 0
+            }
+        );
+        assert_eq!(p["hash"].precision(), Some(1.0));
+        assert_eq!(p["strings"].wrong, 1);
+        assert_eq!(p["strings"].precision(), Some(0.0));
+        assert_eq!(card.in_both(), 2);
+    }
+
+    #[test]
+    fn unmatched_functions_belong_to_no_pass() {
+        let card = score(&truth(), &[], &[]);
+        assert!(card.by_pass().is_empty());
     }
 }

@@ -3,9 +3,9 @@
 //! Reads only what's in the binary: no PDB or map file. (The PDB GUID from the debug directory is recorded so
 //! the matching PDB can be found later, but no symbols are read.) Names come from exports only.
 //!
-//! Known gaps, all deliberate for M1: no PDB names or signatures, no version resource, chained `.pdata`
-//! fragments (split cold code) aren't merged into their parent, functions reached only indirectly (vtables,
-//! callbacks) and without `.pdata` aren't found, and `edges` isn't computed.
+//! Known gaps: no PDB names or signatures, no version resource, functions without `.pdata` reached only
+//! through data (vtables, function-pointer tables) aren't found, and `edges` isn't computed. Address-taken
+//! functions (`lea` of code) and chained `.pdata` fragments are handled (see `function`).
 
 mod function;
 mod image;
@@ -59,7 +59,7 @@ pub fn analyze_bytes(bytes: &[u8], file_name: &str) -> Result<AnalysisExport, By
     let functions = function::discover(&image)
         .into_iter()
         .map(|range| {
-            let mut f = function::features(&image, range);
+            let mut f = function::features(&image, &range);
             if let Some((_, name)) = image.exports.iter().find(|e| e.0 == range.start) {
                 f.name = Some(name.clone());
                 f.name_source = Some(NameSource::Export);

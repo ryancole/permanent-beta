@@ -10,13 +10,15 @@
 # Baseline 2026-11-05 (first run): /O2 61 of 69 functions present in both builds, /Od 150 and 152 of 163.
 # 2026-11-06, matched-callees pass: /O2 63 of 69, /Od 154 and 156 of 163 (adler32/crc32 at /O2;
 # adler32_combine, crc32_combine, gztell, gzoffset at /Od: identical code told apart by matched callees).
-# The remaining /O2 misses (zcalloc, zcfree, _tr_init, _tr_align, inflateReset, gzopen) have no function at
-# their RVA in the analysis export, so no matcher can see them: an analyzer gap, not a matching one.
+# 2026-11-06, analyzer reads chained .pdata fragments and address-taken code: /O2 69 of 69. The six /O2
+# misses were called (or had their address taken) only from chained fragments, which weren't decoded.
+# The remaining /Od misses include four functions nothing references (compressBound, get_crc_table,
+# zlibVersion, zError): dead code without .pdata, invisible to discovery.
 
 [gate.min_correct]
-"o2__v1.2.13__v1.3" = 63
-"o2__v1.3__v1.3.1" = 63
-"o2-icf__v1.2.13__v1.3" = 63
-"o2-icf__v1.3__v1.3.1" = 63
+"o2__v1.2.13__v1.3" = 69
+"o2__v1.3__v1.3.1" = 69
+"o2-icf__v1.2.13__v1.3" = 69
+"o2-icf__v1.3__v1.3.1" = 69
 "od__v1.2.13__v1.3" = 154
 "od__v1.3__v1.3.1" = 156

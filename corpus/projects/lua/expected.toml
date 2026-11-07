@@ -1,0 +1,20 @@
+# Gate for the Lua corpus. Scored by `pwsh corpus/build-projects.ps1 -Project lua -Score`
+# (add `--misses` to `pbeta-corpus score` to list what wasn't matched).
+#
+#   - zero wrong matches, always (not configurable);
+#   - at least `min_correct` correct matches per variant (<flags>__<old>__<new>), counting every function from
+#     Lua's own object files. Raise these when matching improves.
+#
+# Baseline 2026-11-06 (first run): /O2 642 of 733 and 667 of 736, /Od 1016 of 1094 and 1045 of 1096.
+# The first run found one real false positive: 5.4.8 moved the "error in error handling" literal from
+# luaD_seterrorobj into the new luaD_errerr, and the strings pass paired them. The strings pass now refuses a
+# pair whose inferred argument counts differ (3 vs 1 here). It also found six renames in 5.4.7, declared in
+# recipe.psd1 so the answer key doesn't score correct matches as wrong.
+
+[gate.min_correct]
+"o2__v5.4.6__v5.4.7" = 642
+"o2__v5.4.7__v5.4.8" = 667
+"o2-icf__v5.4.6__v5.4.7" = 642
+"o2-icf__v5.4.7__v5.4.8" = 667
+"od__v5.4.6__v5.4.7" = 1016
+"od__v5.4.7__v5.4.8" = 1045
