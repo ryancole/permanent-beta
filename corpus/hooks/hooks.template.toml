@@ -45,6 +45,8 @@ symbol = "apply_discount"
 [[hook]]
 name = "order_add"
 detour = "Hook_order_add"
+# High criticality: accepted only with a behavioral pass (design §6.3), which it can only get from a trial run.
+criticality = "high"
 prototype = "int order_add(Order* o, int sku, int qty)"
 
 [hook.target]

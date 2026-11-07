@@ -1165,6 +1165,7 @@ mod tests {
             normalized_hash: hash.map(str::to_owned),
             mnemonic_hash: None,
             inferred_args: None,
+            inferred_arg_classes: vec![],
             entry: None,
             basic_blocks: None,
             mnemonic_counts: Default::default(),

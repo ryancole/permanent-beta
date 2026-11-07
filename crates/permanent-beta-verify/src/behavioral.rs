@@ -11,7 +11,7 @@
 //! - [`TraceDiffRunner`] is a [`BehavioralRunner`]: it judges one candidate (old RVA → new RVA) from traces whose
 //!   hooks were placed at those addresses (`pbeta repair --old-trace --new-trace`).
 
-use crate::BehavioralRunner;
+use crate::{BehavioralRunner, VerifyContext};
 use permanent_beta_model::{
     BuildId, Candidate, CheckOutcome, CheckResult, FunctionFeatures, HookManifest, Rva, Trace,
     TraceEvent,
@@ -221,13 +221,17 @@ pub fn check_baseline(trace: &Trace, manifest: &HookManifest) -> TraceDiff {
     }
 }
 
-/// Compare the new run of a repaired manifest against the old run, hook by hook (matched by hook name).
+/// Compare the new run of a repaired manifest against earlier runs, hook by hook (matched by hook name).
+///
+/// `old` holds the earlier runs, most recent first: each hook is compared with the first run in which it was
+/// attached. A hook repaired from its own, older build (the previous build's run skipped it because that repair
+/// sent it to review) is thus compared with the run of the build it was written for.
 ///
 /// `held` lists the hooks repair sent to review, with the reason, when the repair report is known: those must
 /// not be attached, and every hook that wasn't attached must be among them. With `None`, unattached hooks are
 /// reported as not applied without that cross-check.
 pub fn diff_traces(
-    old: &Trace,
+    old: &[&Trace],
     new: &Trace,
     manifest: &HookManifest,
     held: Option<&BTreeMap<String, String>>,
@@ -273,12 +277,14 @@ pub fn diff_traces(
     }
 }
 
-fn compare_hook(old: &Trace, new: &Trace, hook: &str) -> HookOutcome {
+fn compare_hook(old: &[&Trace], new: &Trace, hook: &str) -> HookOutcome {
     let got = calls_of(new, hook);
-    if !matches!(placement(old, hook), Placement::Attached { status, .. } if status == ATTACHED_OK)
-    {
+    let baseline = old.iter().find(|t| {
+        matches!(placement(t, hook), Placement::Attached { status, .. } if status == ATTACHED_OK)
+    });
+    let Some(old) = baseline else {
         return HookOutcome::NoBaseline { calls: got.len() };
-    }
+    };
     let expected = calls_of(old, hook);
     if got.is_empty() && !expected.is_empty() {
         return HookOutcome::NotFired {
@@ -299,18 +305,26 @@ fn compare_hook(old: &Trace, new: &Trace, hook: &str) -> HookOutcome {
     }
 }
 
-/// Behavioral evidence for one candidate from two scenario traces: the calls a detour at `candidate.old` saw in
-/// the old run must equal what a detour at `candidate.new` saw in the new run.
+/// Behavioral evidence for one candidate from scenario traces: the calls a detour at `candidate.old` saw in the
+/// old build's run must equal what a detour at `candidate.new` saw in the new build's run.
 ///
-/// Inconclusive when the old run recorded nothing at the old address, or the new run had no working detour at
-/// the new address (the candidate wasn't tried). Fails on any difference, and when the new run crashed.
+/// Traces are matched to builds by their `start` event: the old trace must be a run of the candidate's old
+/// build and the new trace a run of its new build. A trace of any other build is no evidence (the same RVA is
+/// another function there), so the check is inconclusive. It's also inconclusive when the old run recorded
+/// nothing at the old address, or the new run had no working detour at the new address (the candidate wasn't
+/// tried). Fails on any difference, and when the new run crashed.
 pub struct TraceDiffRunner {
-    old: Trace,
+    old: Vec<Trace>,
     new: Trace,
 }
 
 impl TraceDiffRunner {
     pub fn new(old: Trace, new: Trace) -> Self {
+        Self::with_baselines(vec![old], new)
+    }
+
+    /// Several old runs, e.g. of the previous build and of older builds that hooks are repaired from.
+    pub fn with_baselines(old: Vec<Trace>, new: Trace) -> Self {
         Self { old, new }
     }
 
@@ -324,13 +338,33 @@ impl TraceDiffRunner {
 impl BehavioralRunner for TraceDiffRunner {
     fn run(
         &self,
+        ctx: &VerifyContext,
         candidate: &Candidate,
         _old: &FunctionFeatures,
         _new: &FunctionFeatures,
     ) -> CheckResult {
         let result = |outcome, detail: String| CheckResult::new("behavioral", outcome, detail);
-        let expected = calls_at(&self.old, candidate.old);
-        if !Self::attached_at(&self.old, candidate.old) || expected.is_empty() {
+        let Some(old) = self.old.iter().find(|t| t.build() == Some(&ctx.old_build)) else {
+            return result(
+                CheckOutcome::Inconclusive,
+                format!(
+                    "no scenario trace of the old build {}",
+                    short(&ctx.old_build)
+                ),
+            );
+        };
+        if self.new.build() != Some(&ctx.new_build) {
+            return result(
+                CheckOutcome::Inconclusive,
+                format!(
+                    "the new trace is a run of build {}, not of the new build {}",
+                    self.new.build().map_or("?", short),
+                    short(&ctx.new_build)
+                ),
+            );
+        }
+        let expected = calls_at(old, candidate.old);
+        if !Self::attached_at(old, candidate.old) || expected.is_empty() {
             return result(
                 CheckOutcome::Inconclusive,
                 format!("no recorded calls at {} in the old run", candidate.old),
@@ -369,6 +403,10 @@ impl BehavioralRunner for TraceDiffRunner {
     }
 }
 
+fn short(id: &BuildId) -> &str {
+    id.0.get(..12).unwrap_or(&id.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,8 +438,12 @@ mod tests {
     }
 
     fn trace(events: Vec<TraceEvent>) -> Trace {
+        trace_of("new", events)
+    }
+
+    fn trace_of(build: &str, events: Vec<TraceEvent>) -> Trace {
         let mut all = vec![TraceEvent::Start {
-            build: BuildId("b".into()),
+            build: BuildId(build.into()),
         }];
         all.extend(events);
         all.push(TraceEvent::End);
@@ -417,6 +459,7 @@ mod tests {
                     detour: None,
                     criticality: Criticality::Normal,
                     prototype: None,
+                    trial: false,
                     target: TargetLocator {
                         build: BuildId("b".into()),
                         rva: None,
@@ -430,13 +473,16 @@ mod tests {
 
     /// Old run: `price` at 0x100 sees sku 10 -> 470 and sku 11 -> 507; `stock` at 0x200 sees sku 10 -> 30.
     fn old_run() -> Trace {
-        trace(vec![
-            attach("price", 0x100),
-            attach("stock", 0x200),
-            call("stock", 0x200, "10", "30"),
-            call("price", 0x100, "10", "470"),
-            call("price", 0x100, "11", "507"),
-        ])
+        trace_of(
+            "old",
+            vec![
+                attach("price", 0x100),
+                attach("stock", 0x200),
+                call("stock", 0x200, "10", "30"),
+                call("price", 0x100, "10", "470"),
+                call("price", 0x100, "11", "507"),
+            ],
+        )
     }
 
     fn outcome(d: &TraceDiff, hook: &str) -> HookOutcome {
@@ -457,7 +503,7 @@ mod tests {
             call("price", 0x180, "10", "470"),
             call("price", 0x180, "11", "507"),
         ]);
-        let d = diff_traces(&old_run(), &new, &manifest(&["price", "stock"]), None);
+        let d = diff_traces(&[&old_run()], &new, &manifest(&["price", "stock"]), None);
         assert!(d.passed(), "{d:?}");
         assert_eq!(outcome(&d, "price"), HookOutcome::Same { calls: 2 });
     }
@@ -469,7 +515,7 @@ mod tests {
             attach("price", 0x280),
             call("price", 0x280, "10", "30"),
         ]);
-        let d = diff_traces(&old_run(), &new, &manifest(&["price"]), None);
+        let d = diff_traces(&[&old_run()], &new, &manifest(&["price"]), None);
         assert!(!d.passed());
         assert_eq!(
             outcome(&d, "price"),
@@ -484,7 +530,7 @@ mod tests {
     #[test]
     fn a_hook_that_no_longer_fires_fails() {
         let new = trace(vec![attach("price", 0x180), attach("stock", 0x280)]);
-        let d = diff_traces(&old_run(), &new, &manifest(&["price"]), None);
+        let d = diff_traces(&[&old_run()], &new, &manifest(&["price"]), None);
         assert_eq!(outcome(&d, "price"), HookOutcome::NotFired { expected: 2 });
         assert!(!d.passed());
     }
@@ -496,7 +542,7 @@ mod tests {
             call("stock", 0x280, "10", "30"),
         ]);
         new.events.pop(); // no End
-        let d = diff_traces(&old_run(), &new, &manifest(&["stock"]), None);
+        let d = diff_traces(&[&old_run()], &new, &manifest(&["stock"]), None);
         assert_eq!(outcome(&d, "stock"), HookOutcome::Same { calls: 1 });
         assert!(!d.passed());
     }
@@ -512,7 +558,7 @@ mod tests {
             attach("stock", 0x280),
             call("stock", 0x280, "10", "30"),
         ]);
-        let d = diff_traces(&old_run(), &new, &manifest, Some(&held));
+        let d = diff_traces(&[&old_run()], &new, &manifest, Some(&held));
         assert!(d.passed(), "{d:?}");
         assert_eq!(
             outcome(&d, "price"),
@@ -529,7 +575,7 @@ mod tests {
             attach("stock", 0x280),
             call("stock", 0x280, "10", "30"),
         ]);
-        let d = diff_traces(&old_run(), &new, &manifest, Some(&held));
+        let d = diff_traces(&[&old_run()], &new, &manifest, Some(&held));
         assert!(!d.passed());
         assert!(matches!(
             outcome(&d, "price"),
@@ -538,7 +584,7 @@ mod tests {
 
         // Skipped, but repair didn't report it: fails.
         let new = trace(vec![attach("price", 0x180), skip("stock")]);
-        let d = diff_traces(&old_run(), &new, &manifest, Some(&BTreeMap::new()));
+        let d = diff_traces(&[&old_run()], &new, &manifest, Some(&BTreeMap::new()));
         assert!(matches!(
             outcome(&d, "stock"),
             HookOutcome::SkippedUnreported { .. }
@@ -553,7 +599,7 @@ mod tests {
             rva: Rva(0x180),
             status: "error 13".into(),
         }]);
-        let d = diff_traces(&old_run(), &new, &manifest(&["price", "stock"]), None);
+        let d = diff_traces(&[&old_run()], &new, &manifest(&["price", "stock"]), None);
         assert!(matches!(
             outcome(&d, "price"),
             HookOutcome::AttachFailed { .. }
@@ -602,21 +648,97 @@ mod tests {
             call("price", 0x180, "10", "470"),
             call("price", 0x180, "11", "507"),
         ]);
-        let runner = TraceDiffRunner::new(old_run(), new);
+        let runner = TraceDiffRunner::new(old_run(), new.clone());
+        let cx = ctx("old", "new");
         let (o, n) = (features(0x100), features(0x180));
         assert_eq!(
-            runner.run(&candidate(0x100, 0x180), &o, &n).outcome,
+            runner.run(&cx, &candidate(0x100, 0x180), &o, &n).outcome,
             CheckOutcome::Pass
         );
         // Old price function paired with new stock function: the calls differ.
-        let r = runner.run(&candidate(0x100, 0x280), &o, &features(0x280));
+        let r = runner.run(&cx, &candidate(0x100, 0x280), &o, &features(0x280));
         assert_eq!(r.outcome, CheckOutcome::Fail, "{}", r.detail);
         // A candidate the new run never hooked is not evidence either way.
         assert_eq!(
             runner
-                .run(&candidate(0x100, 0x380), &o, &features(0x380))
+                .run(&cx, &candidate(0x100, 0x380), &o, &features(0x380))
                 .outcome,
             CheckOutcome::Inconclusive
         );
+    }
+
+    #[test]
+    fn runner_uses_only_traces_of_the_candidates_builds() {
+        let new = trace(vec![
+            attach("price", 0x180),
+            call("price", 0x180, "10", "470"),
+            call("price", 0x180, "11", "507"),
+        ]);
+        let runner = TraceDiffRunner::new(old_run(), new.clone());
+        let (o, n) = (features(0x100), features(0x180));
+        // Repairing from another old build: the run of "old" says nothing about what 0x100 is there, even
+        // though its calls would match.
+        let r = runner.run(&ctx("older", "new"), &candidate(0x100, 0x180), &o, &n);
+        assert_eq!(r.outcome, CheckOutcome::Inconclusive, "{}", r.detail);
+        // Nor does a new trace of a different build.
+        let r = runner.run(&ctx("old", "newer"), &candidate(0x100, 0x180), &o, &n);
+        assert_eq!(r.outcome, CheckOutcome::Inconclusive, "{}", r.detail);
+        // With the older build's run among the baselines, that run is the one compared.
+        let older = trace_of(
+            "older",
+            vec![attach("price", 0x100), call("price", 0x100, "10", "470")],
+        );
+        let runner = TraceDiffRunner::with_baselines(vec![old_run(), older], new);
+        let r = runner.run(&ctx("older", "new"), &candidate(0x100, 0x180), &o, &n);
+        assert_eq!(r.outcome, CheckOutcome::Fail, "1 call vs 2: {}", r.detail);
+        let r = runner.run(&ctx("old", "new"), &candidate(0x100, 0x180), &o, &n);
+        assert_eq!(r.outcome, CheckOutcome::Pass, "{}", r.detail);
+    }
+
+    fn ctx(old: &str, new: &str) -> VerifyContext {
+        VerifyContext {
+            old_build: BuildId(old.into()),
+            new_build: BuildId(new.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn each_hook_is_compared_with_the_latest_run_that_applied_it() {
+        // The previous run held "price" for review; the run before it (of its own build) applied it.
+        let previous = trace_of(
+            "v2",
+            vec![
+                skip("price"),
+                attach("stock", 0x200),
+                call("stock", 0x200, "10", "30"),
+            ],
+        );
+        let new = trace(vec![
+            attach("price", 0x180),
+            call("price", 0x180, "10", "470"),
+            call("price", 0x180, "11", "507"),
+            attach("stock", 0x280),
+            call("stock", 0x280, "10", "30"),
+        ]);
+        let m = manifest(&["price", "stock"]);
+        let d = diff_traces(&[&previous], &new, &m, None);
+        assert_eq!(outcome(&d, "price"), HookOutcome::NoBaseline { calls: 2 });
+        let d = diff_traces(&[&previous, &old_run()], &new, &m, None);
+        assert_eq!(outcome(&d, "price"), HookOutcome::Same { calls: 2 });
+        assert_eq!(outcome(&d, "stock"), HookOutcome::Same { calls: 1 });
+
+        // A wrong call still fails against the older baseline.
+        let wrong = trace(vec![
+            attach("price", 0x180),
+            call("price", 0x180, "10", "471"),
+        ]);
+        let d = diff_traces(
+            &[&previous, &old_run()],
+            &wrong,
+            &manifest(&["price"]),
+            None,
+        );
+        assert!(matches!(outcome(&d, "price"), HookOutcome::Differs { .. }));
     }
 }

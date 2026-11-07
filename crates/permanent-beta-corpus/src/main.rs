@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use permanent_beta_analysis::native::pattern::{Pattern, PatternIndex};
 use permanent_beta_corpus::{
     expected::Expected,
     fixture, hooks, map,
@@ -23,6 +24,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once per run; boxing variants would only complicate the clap derive.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Build the ground-truth function mapping from two linker map files.
     Truth {
@@ -84,6 +87,15 @@ enum Command {
         old_analysis: PathBuf,
         #[arg(long)]
         new_analysis: PathBuf,
+        /// An older build that hooks may be repaired from directly: its map. Pairs with --earlier-analysis, in
+        /// the same order. Repeatable.
+        #[arg(long)]
+        earlier_map: Vec<PathBuf>,
+        #[arg(long)]
+        earlier_analysis: Vec<PathBuf>,
+        /// The new binary: every re-bound hook's AOB pattern must match exactly once, at its RVA.
+        #[arg(long)]
+        new_binary: Option<PathBuf>,
         /// corpus/hooks/expected.toml; with --flags and --step, also enforce that step's baseline.
         #[arg(long, requires_all = ["flags", "step"])]
         expected: Option<PathBuf>,
@@ -168,17 +180,42 @@ fn main() -> Result<ExitCode> {
             new_hooks,
             old_analysis,
             new_analysis,
+            earlier_map,
+            earlier_analysis,
+            new_binary,
             expected,
             flags,
             step,
         } => {
+            anyhow::ensure!(
+                earlier_map.len() == earlier_analysis.len(),
+                "give one --earlier-analysis per --earlier-map"
+            );
+            let mut builds = vec![load_analysis(&old_analysis)?.build.id];
+            let mut maps = vec![load(&old_map)?];
+            for (m, a) in earlier_map.iter().zip(&earlier_analysis) {
+                builds.push(load_analysis(a)?.build.id);
+                maps.push(load(m)?);
+            }
+            let sources: Vec<_> = builds.iter().zip(&maps).collect();
+            let index = new_binary
+                .map(|p| -> Result<_> {
+                    let bytes =
+                        std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+                    PatternIndex::new(&bytes).map_err(anyhow::Error::msg)
+                })
+                .transpose()?;
+            let finder = |text: &str| -> Result<Vec<u64>, String> {
+                let p: Pattern = text.parse()?;
+                Ok(index.as_ref().map(|ix| ix.find(&p)).unwrap_or_default())
+            };
             let checks = hooks::check_hooks(
                 &load_hooks(&old_hooks)?,
                 &load_hooks(&new_hooks)?,
-                &load(&old_map)?,
+                &sources,
                 &load(&new_map)?,
-                &load_analysis(&old_analysis)?.build.id,
                 &load_analysis(&new_analysis)?.build.id,
+                index.as_ref().map(|_| &finder as hooks::PatternFinder),
             );
             let expected = expected
                 .map(|p| -> Result<hooks::HookExpected> {
@@ -198,7 +235,21 @@ fn main() -> Result<ExitCode> {
             for c in &checks {
                 let what = match &c.truth {
                     hooks::HookTruth::Correct { symbol, old, new } => {
-                        format!("correct  {old} -> {new} ({symbol})")
+                        let pattern = if index.is_some() {
+                            let h = load_hooks(&new_hooks)?;
+                            match h
+                                .hooks
+                                .iter()
+                                .find(|x| x.name == c.hook)
+                                .and_then(|x| x.target.pattern.clone())
+                            {
+                                Some(_) => ", pattern unique",
+                                None => ", no pattern",
+                            }
+                        } else {
+                            ""
+                        };
+                        format!("correct  {old} -> {new} ({symbol}{pattern})")
                     }
                     hooks::HookTruth::Wrong { detail, .. } => format!("WRONG    {detail}"),
                     hooks::HookTruth::Held => "held     (not re-bound: review)".to_owned(),

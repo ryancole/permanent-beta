@@ -14,11 +14,19 @@
     3. `pbeta analyze` each version. Writes the v1 manifest from corpus/hooks/hooks.template.toml (symbols
        resolved through v1's map, bound to v1's build id).
     4. Runs v1 under the hooks and records its trace (the baseline). Every hook must attach and fire.
-    5. For v1 -> v2 and v2 -> v3: `pbeta repair` the previous manifest, check each relocation against the answer
-       key (linker maps: a wrong relocation fails), run the new version with the repaired manifest, and
-       `pbeta trace-diff` its trace against the previous one: a hook that doesn't fire, fires differently,
-       crashes the app, or is applied although repair sent it to review fails.
-    6. Negative control: swaps two relocated hooks' RVAs in the v2 manifest and checks that both the answer key
+    5. For v1 -> v2 and v2 -> v3, from the previous manifest (hooks still bound to an older build are repaired
+       from that build: --earlier):
+       a. `pbeta repair --trial-out`: a trial manifest binds hooks whose only missing evidence is behavioral to
+          their candidates. The new version runs under it (the trial run).
+       b. `pbeta repair --old-trace ... --new-trace <trial run>` decides with that behavioral evidence and writes
+          the repaired manifest, with AOB patterns regenerated from the new binary (--new-binary).
+       c. Answer key (linker maps): a wrong relocation, or a pattern that doesn't find exactly its hook, fails.
+       d. The new version runs under the repaired manifest; `pbeta trace-diff` compares each hook with the last
+          run that applied it: a hook that doesn't fire, fires differently, crashes the app, or is applied
+          although repair sent it to review fails.
+       e. Every resolved hook must have a passing behavioral check; every prototype proposal must compile.
+    6. `pbeta header` builds hooks.gen.h from the three manifests; it must compile as C and C++.
+    7. Negative control: swaps two relocated hooks' RVAs in the v2 manifest and checks that both the answer key
        and the trace diff catch it.
   Fails on any wrong relocation, behavioral mismatch, or a missed negative control.
 
@@ -100,12 +108,27 @@ function Invoke-Allowing([string] $exe, [string[]] $arguments, [int[]] $ok) {
     $code
 }
 
+# Declarations a proposed shim needs to compile on its own: the existing detour (Hook_<name>) and the pointer
+# it calls the original through (Real_<name>), both from the hook's prototype in the manifest.
+function Get-ShimStub([string] $hook, [string] $dir, [string] $version) {
+    $manifest = Get-Content "$dir\$version\hooks.toml" -Raw
+    $m = [regex]::Match($manifest, "(?s)name = `"$hook`".*?prototype = `"([^`"]+)`"")
+    if (-not $m.Success) { throw "no prototype for $hook in $dir\$version\hooks.toml" }
+    $proto = $m.Groups[1].Value
+    $p = [regex]::Match($proto, '^(.*?)\b(\w+)\((.*)\)$')
+    $ret, $name, $params = $p.Groups[1].Value.Trim(), $p.Groups[2].Value, $p.Groups[3].Value
+    "$ret Hook_$name($params);`n$ret (*Real_$name)($params) = nullptr;"
+}
+
 function Invoke-Loop([string] $flagName) {
     $dir = Join-Path $outRoot $flagName
     $bin = Join-Path $outRoot 'bin'
     $pbeta = Join-Path $repo 'target/debug/pbeta.exe'
     $corpus = Join-Path $repo 'target/debug/pbeta-corpus.exe'
     $expected = Join-Path $hooksDir 'expected.toml'
+    # Hooks whose signature changes (log_event gains a parameter in v2): in review, they must come with a
+    # prototype proposal.
+    $proposalExpected = @('log_event')
 
     foreach ($version in $versions) {
         Invoke-Native $pbeta @('analyze', "$dir\$version\app.exe", '--out', "$dir\$version\analysis.json")
@@ -128,48 +151,91 @@ function Invoke-Loop([string] $flagName) {
     for ($i = 1; $i -lt $versions.Count; $i++) {
         $old, $new = $versions[$i - 1], $versions[$i]
         $step = "$old-$new"
-        $pair = @('--old', "$dir\$old\analysis.json", '--new', "$dir\$new\analysis.json", '--hooks', "$dir\$old\hooks.toml")
+        # Older builds, most recent first: hooks an earlier step sent to review are still bound to one of them.
+        $older = @($versions[0..($i - 1)])
+        [array]::Reverse($older)
+        $earlier = @($older | Select-Object -Skip 1)
+        $pair = @('--old', "$dir\$old\analysis.json", '--new', "$dir\$new\analysis.json", '--hooks', "$dir\$old\hooks.toml",
+            '--new-binary', "$dir\$new\app.exe")
+        foreach ($e in $earlier) { $pair += @('--earlier', "$dir\$e\analysis.json") }
+        $oldTraces = @()
+        foreach ($o in $older) { $oldTraces += @('--old-trace', "$dir\$o\trace.jsonl") }
         Write-Host "`n== [$flagName] $step"
-        & $pbeta repair @pair --out "$dir\$new\hooks.toml" --json | Set-Content "$dir\$new\repair.json"
-        if ($LASTEXITCODE -notin 0, 1) { throw "pbeta repair failed with exit code $LASTEXITCODE" }
-        $null = Invoke-Allowing $pbeta (@('repair') + $pair) @(0, 1)
 
-        $truth = Invoke-Allowing $corpus @('hook-check', '--old-map', "$dir\$old\app.map", '--new-map', "$dir\$new\app.map",
+        # a. Trial run: review candidates that only lack behavioral evidence run in place, in a test run.
+        $null = Invoke-Allowing $pbeta (@('repair') + $pair + @('--trial-out', "$dir\$new\trial.toml")) @(0, 1)
+        $code = & $runApp $new "$dir\$new\trial.toml" "$dir\$new\trial.jsonl"
+        if ($code -ne 0) { Write-Host "$new exited with $code in the trial run" }
+
+        # b. Decide with the behavioral evidence of the trial run.
+        $decide = @('repair') + $pair + $oldTraces + @('--new-trace', "$dir\$new\trial.jsonl", '--out', "$dir\$new\hooks.toml")
+        & $pbeta @decide --json | Set-Content "$dir\$new\repair.json"
+        if ($LASTEXITCODE -notin 0, 1) { throw "pbeta repair failed with exit code $LASTEXITCODE" }
+        $null = Invoke-Allowing $pbeta $decide @(0, 1)
+
+        # c. Answer key.
+        $keyArgs = @('hook-check', '--old-map', "$dir\$old\app.map", '--new-map', "$dir\$new\app.map",
             '--old-hooks', "$dir\$old\hooks.toml", '--new-hooks', "$dir\$new\hooks.toml",
             '--old-analysis', "$dir\$old\analysis.json", '--new-analysis', "$dir\$new\analysis.json",
-            '--expected', $expected, '--flags', $flagName, '--step', $step) @(0, 1)
+            '--new-binary', "$dir\$new\app.exe", '--expected', $expected, '--flags', $flagName, '--step', $step)
+        foreach ($e in $earlier) { $keyArgs += @('--earlier-map', "$dir\$e\app.map", '--earlier-analysis', "$dir\$e\analysis.json") }
+        $truth = Invoke-Allowing $corpus $keyArgs @(0, 1)
         if ($truth -ne 0) { $script:failures += "$step answer-key check" }
 
+        # d. Run under the repaired manifest and diff against the runs that applied each hook.
         $code = & $runApp $new "$dir\$new\hooks.toml" "$dir\$new\trace.jsonl"
         if ($code -ne 0) { Write-Host "$new exited with $code under the repaired hooks" }
-        $diffArgs = @('trace-diff', '--old', "$dir\$old\trace.jsonl", '--new', "$dir\$new\trace.jsonl",
-            '--hooks', "$dir\$new\hooks.toml", '--repair', "$dir\$new\repair.json")
+        $diffArgs = @('trace-diff', '--new', "$dir\$new\trace.jsonl", '--hooks', "$dir\$new\hooks.toml",
+            '--repair', "$dir\$new\repair.json")
+        foreach ($o in $older) { $diffArgs += @('--old', "$dir\$o\trace.jsonl") }
         $diff = Invoke-Allowing $pbeta $diffArgs @(0, 1)
         if ($diff -ne 0 -or $code -ne 0) { $script:failures += "$step trace diff" }
 
-        # The traces are also behavioral evidence for verification (design §6.2): re-run repair with them. Every
-        # hook it resolves must now carry a passing behavioral check, and none may fail.
-        $withTraces = & $pbeta repair @pair --old-trace "$dir\$old\trace.jsonl" --new-trace "$dir\$new\trace.jsonl" --json |
-            ConvertFrom-Json
-        if ($LASTEXITCODE -notin 0, 1) { throw "pbeta repair --old-trace failed with exit code $LASTEXITCODE" }
-        foreach ($r in $withTraces.repairs) {
+        # e. Behavioral evidence and proposals.
+        $repairJson = Get-Content "$dir\$new\repair.json" -Raw | ConvertFrom-Json
+        foreach ($r in $repairJson.repairs) {
             $b = @($r.verification.checks | Where-Object check -eq 'behavioral')
-            if ($r.action.action -ne 'needs_review' -and $b.outcome -ne 'pass') {
+            if ($r.action.action -ne 'needs_review' -and -not $r.reviewed_by -and $b.outcome -ne 'pass') {
                 $script:failures += "$step $($r.hook): resolved without a passing behavioral check ($($b.detail))"
             }
             if ($b.outcome -eq 'fail') { $script:failures += "$step $($r.hook): behavioral check failed ($($b.detail))" }
+            foreach ($p in @($r.proposals)) {
+                if (-not $p) { continue }
+                $shimCpp = "$dir\$new\shim-$($r.hook)-$($p.candidate).cpp"
+                Set-Content $shimCpp ("#include <cstdint>`n" + (Get-ShimStub $r.hook $dir $old) + "`n" + $p.shim)
+                & cl.exe /nologo /Zs /std:c++17 /W4 /WX /wd4505 $shimCpp | Out-Host
+                if ($LASTEXITCODE -ne 0) { $script:failures += "$step $($r.hook): proposed shim doesn't compile ($shimCpp)" }
+            }
+        }
+        foreach ($h in $proposalExpected) {
+            $r = $repairJson.repairs | Where-Object hook -eq $h
+            if ($r -and $r.action.action -eq 'needs_review' -and -not @($r.proposals | Where-Object { $_ }).Count) {
+                $script:failures += "$step ${h}: in review without a prototype proposal"
+            }
         }
 
         $diffJson = & $pbeta @diffArgs --json | ConvertFrom-Json
-        $repairJson = Get-Content "$dir\$new\repair.json" -Raw | ConvertFrom-Json
+        $trialed = @((Get-Content "$dir\$new\trial.toml" -Raw | Select-String -Pattern '(?m)^trial = true' -AllMatches).Matches).Count
         foreach ($r in $repairJson.repairs) {
             $action = $r.action.action
             if ($action -eq 'needs_review') { $action = "review: $($r.action.reason)" }
+            if ($r.from_build) { $action += ' (from v1)' }
             $h = $diffJson.hooks | Where-Object hook -eq $r.hook
             $script:summary += [pscustomobject]@{
                 Flags = $flagName; Step = $step; Hook = $r.hook; Repair = $action; Behavior = $h.outcome
             }
         }
+        Write-Host "[$flagName] $step trial bindings: $trialed"
+    }
+
+    # Offsets header from every manifest of the line; it must compile as C and as C++.
+    $header = "$dir\hooks.gen.h"
+    Invoke-Native $pbeta (@('header', '--out', $header) + @($versions | ForEach-Object { @('--hooks', "$dir\$_\hooks.toml") }))
+    foreach ($lang in 'c', 'cpp') {
+        $src = "$dir\header-check.$lang"
+        Set-Content $src "#include `"hooks.gen.h`"`nint main(void) { return pbeta_find_build(`"`") == NULL ? 0 : 1; }"
+        & cl.exe /nologo /Zs /W4 /WX /wd4505 "/I$dir" $src | Out-Host
+        if ($LASTEXITCODE -ne 0) { $script:failures += "hooks.gen.h doesn't compile as $lang" }
     }
 
     # Negative control: a wrong relocation must be caught by the answer key and by the trace diff.
@@ -212,3 +278,6 @@ if ($Run) {
     }
     Write-Host "`nhook-repair loop passed for $($flagNames -join ', ')"
 }
+# Explicitly: the negative control's last native command exits 1 by design, and CI's pwsh wrapper would
+# otherwise pass that $LASTEXITCODE on as the script's result.
+exit 0

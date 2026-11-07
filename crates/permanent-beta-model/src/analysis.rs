@@ -84,6 +84,10 @@ pub struct FunctionFeatures {
     /// parameters and stack arguments are invisible. Capped at 4. Inferred from code; no symbols needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inferred_args: Option<u8>,
+    /// Register class of each inferred argument slot, `inferred_args` long: which of the slot's two registers
+    /// (integer or vector) the code read. Empty if the analyzer didn't compute it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inferred_arg_classes: Vec<ArgClass>,
     /// How often each instruction mnemonic occurs (e.g. `"Mov" → 12`). Order-free, so it survives small
     /// edits and reordering; used by similarity matching. Empty if the analyzer didn't compute it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -91,6 +95,18 @@ pub struct FunctionFeatures {
     /// What a Detours-style entry patch would overwrite. `None` if the analyzer didn't compute it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<EntryInfo>,
+}
+
+/// Which register of a Win64 argument slot carries a value: rcx/rdx/r8/r9 or xmm0–3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgClass {
+    /// Integer or pointer (rcx, rdx, r8, r9).
+    Integer,
+    /// Floating point or vector (xmm0–3).
+    Vector,
+    /// The code didn't read this slot (a lower slot is unused while a higher one is read).
+    Unused,
 }
 
 /// Facts about a function's entry that decide whether a 5-byte `jmp` patch (Detours) can be applied safely.

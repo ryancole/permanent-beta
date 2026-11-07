@@ -2,7 +2,10 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use permanent_beta_analysis::{Analyzer, export, native::NativePeAnalyzer};
+use permanent_beta_analysis::{
+    Analyzer, export,
+    native::{NativePeAnalyzer, pattern::PatternIndex},
+};
 use permanent_beta_engine::Engine;
 use permanent_beta_engine::permanent_beta_repair::{HookRepair, RepairAction};
 use permanent_beta_engine::permanent_beta_verify::{
@@ -10,8 +13,8 @@ use permanent_beta_engine::permanent_beta_verify::{
     behavioral::{self, HookOutcome, TraceDiff},
 };
 use permanent_beta_model::{
-    CandidateSource, DecisionAction, HookManifest, PriorDecisions, ReviewStatus, Rva, Trace,
-    TraceEvent, Verdict,
+    BuildId, CandidateSource, DecisionAction, HookManifest, PriorDecisions, ReviewStatus, Rva,
+    Trace, TraceEvent, Verdict,
 };
 use permanent_beta_store::{Choice, JsonFileStore, MappingStore};
 use std::collections::BTreeMap;
@@ -60,17 +63,30 @@ enum Command {
         /// Hook manifest (TOML).
         #[arg(long)]
         hooks: PathBuf,
+        /// Analysis of an older build that some hooks are still bound to (an earlier repair sent them to
+        /// review). Those hooks are repaired from that build directly. Repeatable.
+        #[arg(long)]
+        earlier: Vec<PathBuf>,
         /// Write the repaired manifest here.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// The new binary: regenerate a unique AOB pattern for every re-bound hook. Without it, re-bound hooks
+        /// carry no pattern (the old one was only checked against the old build).
+        #[arg(long)]
+        new_binary: Option<PathBuf>,
+        /// Write a trial manifest here: the repaired manifest plus trial bindings for hooks in review whose only
+        /// missing evidence is behavioral. Run the new build under it and pass that trace as --new-trace.
+        #[arg(long)]
+        trial_out: Option<PathBuf>,
         /// Record accepted mappings and review items in this store, and honor its review decisions.
         #[arg(long)]
         store: Option<PathBuf>,
-        /// Behavioral evidence (design §7.3): a scenario trace of the old build with hooks at the old RVAs.
-        /// Needs --new-trace.
+        /// Behavioral evidence (design §7.3): a scenario trace of an old build with hooks at the old RVAs (the
+        /// previous build's, and any --earlier build's). Each candidate is judged against its own build's run.
+        /// Repeatable; needs --new-trace.
         #[arg(long, requires = "new_trace")]
-        old_trace: Option<PathBuf>,
-        /// The same scenario on the new build with hooks at the candidates' RVAs. Needs --old-trace.
+        old_trace: Vec<PathBuf>,
+        /// The same scenario on the new build with hooks at the candidates' RVAs (e.g. the --trial-out run).
         #[arg(long, requires = "old_trace")]
         new_trace: Option<PathBuf>,
         #[arg(long)]
@@ -79,13 +95,14 @@ enum Command {
     /// Compare scenario call traces hook by hook (design §7.3). Exit code 1 if any hook's behavior differs, a
     /// hook didn't fire or wasn't attached, the run crashed, or a hook sent to review was applied anyway.
     TraceDiff {
-        /// Trace of the old build with the original hooks.
+        /// Trace of the old build with the original hooks. Repeatable, most recent first: each hook is compared
+        /// with the first run that applied it (a hook repaired from an older build, with that build's run).
         #[arg(
             long,
             conflicts_with = "baseline",
             required_unless_present = "baseline"
         )]
-        old: Option<PathBuf>,
+        old: Vec<PathBuf>,
         /// Trace of the new build with the repaired hooks.
         #[arg(long, requires = "old")]
         new: Option<PathBuf>,
@@ -101,6 +118,20 @@ enum Command {
         repair: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+    },
+    /// Print the shortest unique AOB pattern for the function at an RVA (design §7.2).
+    Pattern {
+        binary: PathBuf,
+        #[arg(long)]
+        rva: Rva,
+    },
+    /// Generate the offsets header (`hooks.gen.h`): each build's hook RVAs and patterns, from hook manifests.
+    Header {
+        /// Hook manifests, e.g. every repaired manifest of a release line. Repeatable.
+        #[arg(long, required = true)]
+        hooks: Vec<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Inspect and decide the review queue.
     Review {
@@ -171,26 +202,40 @@ fn run(cli: Cli) -> Result<u8> {
             old,
             new,
             hooks,
+            earlier,
             out,
+            new_binary,
+            trial_out,
             store,
             old_trace,
             new_trace,
             json,
         } => {
-            let traces = match (old_trace, new_trace) {
-                (Some(o), Some(n)) => Some((load_trace(&o)?, load_trace(&n)?)),
-                _ => None,
+            let traces = match new_trace {
+                Some(n) => Some((
+                    old_trace
+                        .iter()
+                        .map(|p| load_trace(p))
+                        .collect::<Result<Vec<_>>>()?,
+                    load_trace(&n)?,
+                )),
+                None => None,
             };
-            cmd_repair(
-                &old,
-                &new,
-                &hooks,
-                out.as_deref(),
-                store.as_deref(),
+            cmd_repair(RepairArgs {
+                old: &old,
+                new: &new,
+                hooks: &hooks,
+                earlier: &earlier,
+                out: out.as_deref(),
+                new_binary: new_binary.as_deref(),
+                trial_out: trial_out.as_deref(),
+                store: store.as_deref(),
                 traces,
                 json,
-            )
+            })
         }
+        Command::Pattern { binary, rva } => cmd_pattern(&binary, rva),
+        Command::Header { hooks, out } => cmd_header(&hooks, &out),
         Command::TraceDiff {
             old,
             new,
@@ -199,7 +244,7 @@ fn run(cli: Cli) -> Result<u8> {
             repair,
             json,
         } => cmd_trace_diff(
-            old.as_deref(),
+            &old,
             new.as_deref(),
             baseline.as_deref(),
             &hooks,
@@ -276,39 +321,106 @@ fn cmd_match(old: &Path, new: &Path, json: bool) -> Result<u8> {
     Ok(EXIT_OK)
 }
 
-fn cmd_repair(
-    old: &Path,
-    new: &Path,
-    hooks: &Path,
-    out: Option<&Path>,
-    store: Option<&Path>,
-    traces: Option<(Trace, Trace)>,
+struct RepairArgs<'a> {
+    old: &'a Path,
+    new: &'a Path,
+    hooks: &'a Path,
+    earlier: &'a [PathBuf],
+    out: Option<&'a Path>,
+    new_binary: Option<&'a Path>,
+    trial_out: Option<&'a Path>,
+    store: Option<&'a Path>,
+    traces: Option<(Vec<Trace>, Trace)>,
     json: bool,
-) -> Result<u8> {
-    let (old, new) = (export::load(old)?, export::load(new)?);
-    let manifest = load_manifest(hooks)?;
+}
 
-    let mut opened = store.map(JsonFileStore::open).transpose()?;
-    let prior = opened
+fn cmd_repair(a: RepairArgs) -> Result<u8> {
+    let (old, new) = (export::load(a.old)?, export::load(a.new)?);
+    let earlier = a
+        .earlier
+        .iter()
+        .map(|p| export::load(p).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    let manifest = load_manifest(a.hooks)?;
+    permanent_beta_engine::permanent_beta_repair::check_input(&manifest)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", a.hooks.display()))?;
+
+    let mut opened = a.store.map(JsonFileStore::open).transpose()?;
+    let priors: BTreeMap<BuildId, PriorDecisions> = opened
         .as_ref()
-        .map(|s| s.prior_decisions(&old.build.id, &new.build.id))
-        .unwrap_or_else(PriorDecisions::default);
-    let engine = match traces {
-        Some((o, n)) => Engine::with_behavioral(Box::new(TraceDiffRunner::new(o, n))),
+        .map(|s| {
+            std::iter::once(&old)
+                .chain(&earlier)
+                .map(|e| {
+                    (
+                        e.build.id.clone(),
+                        s.prior_decisions(&e.build.id, &new.build.id),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let engine = match a.traces {
+        Some((o, n)) => Engine::with_behavioral(Box::new(TraceDiffRunner::with_baselines(o, n))),
         None => Engine::with_defaults(),
     };
-    let report = engine.repair_with(&manifest, &old, &new, &prior);
+    let mut report = engine.repair_across(&manifest, &old, &earlier, &new, &priors);
 
-    if let Some(out) = out {
+    // AOB patterns for re-bound hooks, from the new binary (rewrite_manifest dropped the old ones).
+    let mut pattern_notes: Vec<String> = Vec::new();
+    if let Some(bin) = a.new_binary {
+        let bytes = std::fs::read(bin).with_context(|| format!("reading {}", bin.display()))?;
+        let index = PatternIndex::new(&bytes)
+            .map_err(|e| anyhow::anyhow!("{}: not a PE x64 image: {e}", bin.display()))?;
+        let binary_build = permanent_beta_analysis::native::build_id(&bytes);
+        anyhow::ensure!(
+            binary_build == new.build.id,
+            "{} is build {}, but --new is an analysis of {}",
+            bin.display(),
+            binary_build.0,
+            new.build.id.0
+        );
+        for hook in &mut report.updated_manifest.hooks {
+            let rebound = report
+                .repairs
+                .iter()
+                .any(|r| r.hook == hook.name && r.is_resolved());
+            let Some(rva) = hook.target.rva.filter(|_| rebound) else {
+                continue;
+            };
+            match index.generate(rva.0) {
+                Ok(p) => hook.target.pattern = Some(p.to_string()),
+                Err(e) => pattern_notes.push(format!("{}: no pattern at {rva} ({e})", hook.name)),
+            }
+        }
+    }
+
+    if let Some(out) = a.out {
         std::fs::write(out, toml::to_string_pretty(&report.updated_manifest)?)
             .with_context(|| format!("writing {}", out.display()))?;
+    }
+    let mut trialed = Vec::new();
+    if let Some(path) = a.trial_out {
+        let (trial, names) = permanent_beta_engine::permanent_beta_repair::trial_manifest(
+            &report.updated_manifest,
+            &report.repairs,
+            &new,
+        );
+        let text = format!(
+            "# TRIAL MANIFEST: hooks marked `trial = true` are bound to unverified review candidates, for a test \
+             run that\n# collects behavioral evidence (pbeta repair --new-trace). Never ship it; pbeta repair \
+             refuses it as input.\n{}",
+            toml::to_string_pretty(&trial)?
+        );
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        trialed = names;
     }
     if let Some(store) = opened.as_mut() {
         store.put_mappings(&report.mappings)?;
         store.enqueue_review(&report.review_items)?;
     }
 
-    if json {
+    if a.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for r in &report.repairs {
@@ -317,22 +429,49 @@ fn cmd_repair(
                 .as_ref()
                 .map(|who| format!(" (decided by {who})"))
                 .unwrap_or_default();
+            let from = r
+                .from_build
+                .as_ref()
+                .map(|b| format!(" [from build {}]", b.0.get(..12).unwrap_or(&b.0)))
+                .unwrap_or_default();
             let outcome = match &r.action {
-                RepairAction::Unchanged { rva } => format!("unchanged at {rva}{by}"),
-                RepairAction::Relocated { old, new } => format!("relocated {old} -> {new}{by}"),
+                RepairAction::Unchanged { rva } => format!("unchanged at {rva}{by}{from}"),
+                RepairAction::Relocated { old, new } => {
+                    format!("relocated {old} -> {new}{by}{from}")
+                }
                 RepairAction::NeedsReview { reason, detail } => {
                     format!(
-                        "NEEDS REVIEW ({}): {detail}",
+                        "NEEDS REVIEW ({}){from}: {detail}",
                         serde_json::to_value(reason)?.as_str().unwrap_or("?")
                     )
                 }
             };
             println!("{:<18} {outcome}", r.hook);
+            for p in &r.proposals {
+                println!(
+                    "{:<18}   proposed prototype for {}: {}",
+                    "", p.candidate, p.prototype
+                );
+            }
         }
         let resolved = report.repairs.iter().filter(|r| r.is_resolved()).count();
         println!("\n{resolved}/{} hooks resolved", report.repairs.len());
-        if let Some(out) = out {
+        for n in &pattern_notes {
+            println!("pattern: {n}");
+        }
+        if let Some(out) = a.out {
             println!("repaired manifest written to {}", out.display());
+        }
+        if let Some(path) = a.trial_out {
+            println!(
+                "trial manifest written to {} (trial bindings: {})",
+                path.display(),
+                if trialed.is_empty() {
+                    "none".to_owned()
+                } else {
+                    trialed.join(", ")
+                }
+            );
         }
     }
     Ok(if report.needs_review() {
@@ -340,6 +479,34 @@ fn cmd_repair(
     } else {
         EXIT_OK
     })
+}
+
+fn cmd_pattern(binary: &Path, rva: Rva) -> Result<u8> {
+    let bytes = std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
+    let index = PatternIndex::new(&bytes)
+        .map_err(|e| anyhow::anyhow!("{}: not a PE x64 image: {e}", binary.display()))?;
+    match index.generate(rva.0) {
+        Ok(p) => {
+            println!("{p}");
+            Ok(EXIT_OK)
+        }
+        Err(e) => {
+            eprintln!("{rva}: {e}");
+            Ok(EXIT_NEEDS_REVIEW)
+        }
+    }
+}
+
+fn cmd_header(hooks: &[PathBuf], out: &Path) -> Result<u8> {
+    let manifests = hooks
+        .iter()
+        .map(|p| load_manifest(p))
+        .collect::<Result<Vec<_>>>()?;
+    let text = permanent_beta_engine::permanent_beta_repair::header::offsets_header(&manifests)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    std::fs::write(out, text).with_context(|| format!("writing {}", out.display()))?;
+    println!("offsets header written to {}", out.display());
+    Ok(EXIT_OK)
 }
 
 fn load_manifest(path: &Path) -> Result<HookManifest> {
@@ -390,7 +557,7 @@ fn held_for_review(path: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 fn cmd_trace_diff(
-    old: Option<&Path>,
+    old: &[PathBuf],
     new: Option<&Path>,
     baseline: Option<&Path>,
     hooks: &Path,
@@ -400,9 +567,14 @@ fn cmd_trace_diff(
     let manifest = load_manifest(hooks)?;
     let diff = match (old, new, baseline) {
         (_, _, Some(b)) => behavioral::check_baseline(&load_trace(b)?, &manifest),
-        (Some(o), Some(n), None) => {
+        ([_, ..], Some(n), None) => {
             let held = repair.map(held_for_review).transpose()?;
-            behavioral::diff_traces(&load_trace(o)?, &load_trace(n)?, &manifest, held.as_ref())
+            let old = old
+                .iter()
+                .map(|p| load_trace(p))
+                .collect::<Result<Vec<_>>>()?;
+            let old: Vec<&Trace> = old.iter().collect();
+            behavioral::diff_traces(&old, &load_trace(n)?, &manifest, held.as_ref())
         }
         _ => anyhow::bail!("give --old and --new, or --baseline"),
     };

@@ -451,6 +451,7 @@ mod tests {
             reason: ReviewReason::Ambiguous,
             detail: String::new(),
             candidates,
+            proposals: vec![],
             status: ReviewStatus::Open,
         }
     }

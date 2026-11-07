@@ -3,7 +3,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Identifies a build: the SHA-256 (hex) of the binary file.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BuildId(pub String);
 

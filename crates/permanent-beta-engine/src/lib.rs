@@ -9,10 +9,12 @@ use permanent_beta_model::{
     Rva, VerificationReport,
 };
 use permanent_beta_repair::{
-    HookRepair, RepairAction, decide, from_review, review_items, rewrite_manifest, stale_locator,
+    HookRepair, RepairAction, decide, from_review, prototype, review_items, rewrite_manifest,
+    stale_locator,
 };
 use permanent_beta_verify::{BehavioralRunner, Policy, Verifier, VerifyContext};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 pub use permanent_beta_repair;
 pub use permanent_beta_verify;
@@ -119,61 +121,49 @@ impl Engine {
         new: &AnalysisExport,
         prior: &PriorDecisions,
     ) -> RepairReport {
-        let outcome = run_passes(old, new, &self.matchers);
-        let candidates = &outcome.candidates;
-        let ctx = VerifyContext::new(old, new, candidates);
+        let priors = BTreeMap::from([(old.build.id.clone(), prior.clone())]);
+        self.repair_across(manifest, old, &[], new, &priors)
+    }
+
+    /// Repair every hook to `new`, each from the build its locator is bound to: `old` (the previous build), or
+    /// one of `earlier`, older builds that hooks an earlier repair sent to review are still bound to. Such a hook
+    /// is matched from its own build straight to `new` (e.g. v1 → v3), never through `old`, where its RVA means
+    /// nothing. A hook bound to a build that isn't given is a stale locator.
+    ///
+    /// `priors` holds review decisions per source build (for the pair source → `new`).
+    pub fn repair_across(
+        &self,
+        manifest: &HookManifest,
+        old: &AnalysisExport,
+        earlier: &[AnalysisExport],
+        new: &AnalysisExport,
+        priors: &BTreeMap<BuildId, PriorDecisions>,
+    ) -> RepairReport {
         let (from, to) = (&old.build.id, &new.build.id);
+        // One match run per source build that some hook needs (always the old build: its mappings are recorded).
+        let mut pairs: Vec<Pair> = vec![Pair::new(old, new, &self.matchers)];
+        for hook in &manifest.hooks {
+            let b = &hook.target.build;
+            if pairs.iter().any(|p| &p.old.build.id == b) {
+                continue;
+            }
+            if let Some(e) = earlier.iter().find(|e| &e.build.id == b) {
+                pairs.push(Pair::new(e, new, &self.matchers));
+            }
+        }
+        let none = PriorDecisions::default();
 
         let repairs: Vec<HookRepair> = manifest
             .hooks
             .iter()
             .map(|hook| {
-                if hook.target.build != old.build.id {
+                let Some(pair) = pairs.iter().find(|p| p.old.build.id == hook.target.build) else {
                     return stale_locator(hook, from);
-                }
-                let old_fn = resolve_old(hook, old);
-                let reviewed = old_fn.and_then(|o| {
-                    let m = prior.accepted.iter().find(|m| m.old == o.rva)?;
-                    let Decider::Human { reviewer } = &m.decided_by else {
-                        return None;
-                    };
-                    Some((o, new.function(m.new)?, reviewer))
-                });
-                if let Some((o, n, reviewer)) = reviewed {
-                    return from_review(hook, o, n, reviewer);
-                }
-                let rejected = |c_old: Rva, c_new: Rva| prior.rejected.contains(&(c_old, c_new));
-                let cand = old_fn
-                    .and_then(|f| candidates.iter().find(|c| c.old == f.rva))
-                    .filter(|c| !rejected(c.old, c.new));
-                let new_fn = cand.and_then(|c| new.function(c.new));
-                let policy = Policy::for_criticality(hook.criticality);
-                let report = match (cand, old_fn, new_fn) {
-                    (Some(c), Some(o), Some(n)) => {
-                        Some(self.verifier.verify(&ctx, c, o, n, policy))
-                    }
-                    _ => None,
                 };
-                let mut alternatives = match (cand, old_fn) {
-                    (None, Some(o)) => self.alternatives(&ctx, &outcome, o, new, policy),
-                    _ => Vec::new(),
-                };
-                alternatives.retain(|a| !rejected(a.candidate.old, a.candidate.new));
-                let mut repair = decide(hook, old_fn, report, new_fn, alternatives);
-                let refused: Vec<String> = old_fn
-                    .map(|o| {
-                        prior
-                            .rejected
-                            .iter()
-                            .filter(|(r_old, _)| *r_old == o.rva)
-                            .map(|(_, r_new)| r_new.to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if let RepairAction::NeedsReview { detail, .. } = &mut repair.action {
-                    if !refused.is_empty() {
-                        detail.push_str(&format!(" (a reviewer rejected {})", refused.join(", ")));
-                    }
+                let prior = priors.get(&pair.old.build.id).unwrap_or(&none);
+                let mut repair = self.repair_hook(hook, pair, new, prior);
+                if &pair.old.build.id != from {
+                    repair.from_build = Some(pair.old.build.id.clone());
                 }
                 repair
             })
@@ -182,19 +172,13 @@ impl Engine {
         // Engine decisions only: a reviewer's mapping is already in the store (its `verification` is None).
         let mappings = repairs
             .iter()
-            .filter(|r| r.is_resolved())
             .filter_map(|r| {
                 let v = r.verification.as_ref()?;
-                let new = match r.action {
-                    RepairAction::Unchanged { rva } => rva,
-                    RepairAction::Relocated { new, .. } => new,
-                    RepairAction::NeedsReview { .. } => return None,
-                };
                 Some(Mapping {
-                    from_build: from.clone(),
+                    from_build: r.from_build.clone().unwrap_or_else(|| from.clone()),
                     to_build: to.clone(),
                     old: v.candidate.old,
-                    new,
+                    new: r.new_rva()?,
                     decided_by: Decider::Engine,
                     source: v.candidate.source.clone(),
                     score: v.candidate.score,
@@ -213,6 +197,73 @@ impl Engine {
             mappings,
             repairs,
         }
+    }
+
+    /// Repair one hook within one build pair.
+    fn repair_hook(
+        &self,
+        hook: &HookSpec,
+        pair: &Pair,
+        new: &AnalysisExport,
+        prior: &PriorDecisions,
+    ) -> HookRepair {
+        let old = pair.old;
+        let candidates = &pair.outcome.candidates;
+        let old_fn = resolve_old(hook, old);
+        let reviewed = old_fn.and_then(|o| {
+            let m = prior.accepted.iter().find(|m| m.old == o.rva)?;
+            let Decider::Human { reviewer } = &m.decided_by else {
+                return None;
+            };
+            Some((o, new.function(m.new)?, reviewer))
+        });
+        if let Some((o, n, reviewer)) = reviewed {
+            return from_review(hook, o, n, reviewer);
+        }
+        let rejected = |c_old: Rva, c_new: Rva| prior.rejected.contains(&(c_old, c_new));
+        let cand = old_fn
+            .and_then(|f| candidates.iter().find(|c| c.old == f.rva))
+            .filter(|c| !rejected(c.old, c.new));
+        let new_fn = cand.and_then(|c| new.function(c.new));
+        let policy = Policy::for_criticality(hook.criticality);
+        let report = match (cand, old_fn, new_fn) {
+            (Some(c), Some(o), Some(n)) => Some(self.verifier.verify(&pair.ctx, c, o, n, policy)),
+            _ => None,
+        };
+        let mut alternatives = match (cand, old_fn) {
+            (None, Some(o)) => self.alternatives(&pair.ctx, &pair.outcome, o, new, policy),
+            _ => Vec::new(),
+        };
+        alternatives.retain(|a| !rejected(a.candidate.old, a.candidate.new));
+        let mut repair = decide(hook, old_fn, report, new_fn, alternatives);
+        let refused: Vec<String> = old_fn
+            .map(|o| {
+                prior
+                    .rejected
+                    .iter()
+                    .filter(|(r_old, _)| *r_old == o.rva)
+                    .map(|(_, r_new)| r_new.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let RepairAction::NeedsReview { detail, .. } = &mut repair.action {
+            if !refused.is_empty() {
+                detail.push_str(&format!(" (a reviewer rejected {})", refused.join(", ")));
+            }
+        }
+        // A hook in review whose candidates read more register arguments than its prototype declares gets a
+        // proposed prototype and shim for each such candidate (design §7.2; suggestions only).
+        if let (false, Some(o)) = (repair.is_resolved(), old_fn) {
+            repair.proposals = repair
+                .verification
+                .iter()
+                .chain(&repair.alternatives)
+                .filter_map(|v| {
+                    prototype::propose(hook, o, new.function(v.candidate.new)?, &new.build.id)
+                })
+                .collect();
+        }
+        repair
     }
 
     /// Verify each competitor of an ambiguous old function, purely as evidence for the reviewer.
@@ -261,6 +312,21 @@ impl Engine {
     }
 }
 
+/// One source build matched against the new build.
+struct Pair<'a> {
+    old: &'a AnalysisExport,
+    outcome: MatchOutcome,
+    ctx: VerifyContext,
+}
+
+impl<'a> Pair<'a> {
+    fn new(old: &'a AnalysisExport, new: &AnalysisExport, matchers: &[Box<dyn Matcher>]) -> Self {
+        let outcome = run_passes(old, new, matchers);
+        let ctx = VerifyContext::new(old, new, &outcome.candidates);
+        Self { old, outcome, ctx }
+    }
+}
+
 fn resolve_old<'a>(hook: &HookSpec, old: &'a AnalysisExport) -> Option<&'a FunctionFeatures> {
     hook.target
         .rva
@@ -289,6 +355,7 @@ mod tests {
             normalized_hash: Some(hash.to_owned()),
             mnemonic_hash: None,
             inferred_args: None,
+            inferred_arg_classes: vec![],
             entry: None,
             basic_blocks: None,
             edges: None,
@@ -326,6 +393,7 @@ mod tests {
                 detour: None,
                 criticality: Criticality::Normal,
                 prototype: None,
+                trial: false,
                 target: TargetLocator {
                     build: BuildId("a".into()),
                     rva: Some(Rva(0x10)),
@@ -454,6 +522,77 @@ mod tests {
             r.repairs[0].verification.as_ref().map(|v| v.candidate.new),
             Some(Rva(0x110))
         );
+    }
+
+    #[test]
+    fn a_stale_hook_is_repaired_from_its_own_build() {
+        // The hook was written for "z" at 0x10. In "a" (the previous build) 0x10 is an unrelated function; given
+        // z's analysis, the hook is matched z -> b directly.
+        let z = export("z", vec![func(0x10, "hooked"), func(0x40, "other")]);
+        let old = export("a", vec![func(0x10, "other"), func(0x30, "hooked")]);
+        let new = export("b", vec![func(0x110, "other"), func(0x130, "hooked")]);
+        let mut stale = manifest();
+        stale.hooks[0].target.build = BuildId("z".into());
+
+        let r = Engine::with_defaults().repair_across(
+            &stale,
+            &old,
+            std::slice::from_ref(&z),
+            &new,
+            &BTreeMap::new(),
+        );
+        let repair = &r.repairs[0];
+        assert_eq!(repair.from_build, Some(BuildId("z".into())));
+        assert_eq!(repair.old, Some(Rva(0x10)));
+        assert_eq!(
+            repair.verification.as_ref().map(|v| v.candidate.new),
+            Some(Rva(0x130)),
+            "matched through z, not through a's 0x10"
+        );
+        // Its review item (bare test functions lack independent evidence) is for the pair z -> b.
+        assert_eq!(r.review_items[0].from_build, BuildId("z".into()));
+        assert!(
+            r.review_items[0].id.starts_with("H:z:b"),
+            "{}",
+            r.review_items[0].id
+        );
+
+        // Without z's analysis it stays a stale locator.
+        let r = Engine::with_defaults().repair_across(&stale, &old, &[], &new, &BTreeMap::new());
+        assert_eq!(r.review_items[0].reason, ReviewReason::StaleLocator);
+    }
+
+    #[test]
+    fn a_changed_register_signature_gets_a_prototype_proposal() {
+        // Two identical candidates (ambiguous), each reading a third register argument.
+        let mut old_fn = func(0x10, "k");
+        old_fn.inferred_args = Some(2);
+        let mut copies = vec![func(0x110, "k"), func(0x120, "k")];
+        for c in &mut copies {
+            c.inferred_args = Some(3);
+        }
+        let (old, new) = (export("a", vec![old_fn]), export("b", copies));
+        let mut m = manifest();
+        m.hooks[0].prototype = Some("void H(const char* msg, int code)".into());
+        let r = Engine::with_defaults().repair(&m, &old, &new);
+        assert!(!r.repairs[0].is_resolved());
+        let proposed: Vec<Rva> = r.repairs[0].proposals.iter().map(|p| p.candidate).collect();
+        assert_eq!(proposed, vec![Rva(0x110), Rva(0x120)]);
+        for p in &r.repairs[0].proposals {
+            assert_eq!(
+                p.prototype,
+                "void H(const char* msg, int code, intptr_t arg2)"
+            );
+        }
+
+        // Negative: the same register use proposes nothing.
+        let mut same = new.clone();
+        for f in &mut same.functions {
+            f.inferred_args = Some(2);
+        }
+        let r2 = Engine::with_defaults().repair(&m, &old, &same);
+        assert!(r2.repairs[0].proposals.is_empty());
+        assert_eq!(r.review_items[0].proposals, r.repairs[0].proposals);
     }
 
     #[test]

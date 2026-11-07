@@ -1,25 +1,37 @@
-# Status — where we left off (2026-11-06)
+# Status — where we left off (2026-11-07)
 
-M2 (corpus) is done, and M3's matching depth is done apart from the mnemonic-hash pass and the SQLite store, with 0
-wrong matches on every corpus variant. Review-queue decisions (`pbeta review accept` / `reject`) are honored by
-`repair --store`.
+M2 (corpus) is done, M3's matching depth is done apart from the mnemonic-hash pass and the SQLite store, and **M4
+(repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
+corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **M4's end-to-end loop** (not yet through CI). Real Detours hooks written against a sample app's v1
-are repaired v1 → v2 → v3, checked against the answer key, run, and their call traces diffed
-(`corpus/build-hooks.ps1 -Run`, `corpus/hooks/README.md`). Results, the same at /O2 and /Od:
+Latest work: finishing M4 (`corpus/build-hooks.ps1 -Run`, `corpus/hooks/README.md`). Results, the same shape at
+/O2 and /Od:
 
 | Hook | v1 → v2 | v2 → v3 |
 |---|---|---|
-| `price_lookup`, `stock_level`, `order_add`, `format_receipt` | relocated, same trace | relocated (/Od: unchanged), same trace |
+| `price_lookup`, `stock_level`, `format_receipt` | relocated, same trace | relocated (/Od: some unchanged), same trace |
+| `order_add` (high criticality) | relocated after its trial run, same trace | same |
 | `checksum` | relocated, same trace | review: ambiguous (identical `checksum_backup` added) |
-| `ship_order` | relocated, same trace | review: insufficient evidence (body edited) |
-| `log_event` | review (parameter added): ambiguous at /O2, verification failed at /Od | review: stale locator |
-| `apply_discount` | review (body rewritten): insufficient evidence at /O2, unmatched at /Od | review: stale locator |
+| `ship_order` | relocated, same trace | review: insufficient evidence; its trial passed |
+| `log_event` | review (parameter added), with a prototype proposal and a shim that compiles | repaired from v1: same review, same proposal |
+| `apply_discount` | review (body rewritten): insufficient evidence at /O2 (trial passed), unmatched at /Od | repaired from v1: same |
 
-0 wrong relocations. Every applied hook sees identical calls, review hooks are held and reported, and a
-deliberately swapped pair is caught by both the answer key and the trace diff. The loop found a real bug: repair
-trusted a locator bound to another build (v2 → v3 "relocated" `apply_discount` from its v1 RVA, correct only by
-luck). Such hooks now go to review as `stale_locator`.
+What's new:
+
+- **Trial runs** (`pbeta repair --trial-out`): review candidates whose only missing evidence is behavioral are
+  bound in a trial manifest, run, and judged from that run. This is how a high-criticality hook earns its
+  behavioral pass.
+- **Repair from the hook's own build** (`--earlier`): hooks still bound to v1 are matched v1 → v3, not reported
+  as stale. Behavioral evidence is always taken from the trace of the candidate's own build.
+- **AOB patterns** (`--new-binary`, `pbeta pattern`): regenerated for every re-bound hook, unique in the code,
+  and checked against the new binary by the answer key. A re-bound hook no longer carries its old, unchecked
+  pattern.
+- **Offsets header** (`pbeta header`): `hooks.gen.h` from the manifests; compiles as C and C++.
+- **Prototype proposals**: added register parameters (typed from the register class the analyzer now records,
+  `inferred_arg_classes`) with a shim that keeps the existing detour unchanged.
+- The ambiguity message no longer calls a single, unconfirmed candidate "equally plausible".
+- CI's hook-loop step failed on the previous commit although the loop passed: the negative control's last exit
+  code (1, by design) leaked out of the script. It now exits 0 explicitly.
 
 ## What works
 
@@ -29,6 +41,9 @@ luck). Such hooks now go to review as `stale_locator`.
 - **`pbeta trace-diff`** (design §7.3, scenario trace diff): compares two runs' traces hook by hook (missed,
   different or failed calls, crashes, review hooks applied or silently skipped). `pbeta repair --old-trace
   --new-trace` adds the same evidence to verification (`TraceDiffRunner`).
+- **`pbeta repair --trial-out / --earlier / --new-binary`, `pbeta pattern`, `pbeta header`** (M4): trial
+  manifests, repair from a hook's own build, AOB patterns, the offsets header, and prototype proposals in review
+  items (see above, and design §7.2).
 - **`pbeta match` / `repair` / `review list|accept|reject`**: six matching passes (name, normalized hash, strings, matched
   callees, call graph, and a weak similarity pass for edited functions); string matches are vetoed when argument counts or matched callers contradict them,
   rechecked against the final matches. Verification on parameters, strings, size, callers, callees, constants,
@@ -42,7 +57,8 @@ luck). Such hooks now go to review as `stale_locator`.
   - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 159 of 163.
   - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 706–714 of ~735, /Od 1077–1085 of ~1095.
   - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 623–669 of ~729, /Od 1674–1731 of ~1879.
-  - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations.
+  - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations,
+    with trial runs, patterns, the header and proposed shims checked.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score`, `pwsh corpus/build-projects.ps1 -Score` and
     `pwsh corpus/build-hooks.ps1 -Run`. Add
     `--misses` to `pbeta-corpus score` to list misses.
@@ -53,8 +69,8 @@ luck). Such hooks now go to review as `stale_locator`.
 |---|---|
 | 1. Find the new location | Done; measured on zlib, Lua and zstd |
 | 2. Verify it's the same function | Done for symbol-less binaries; PDB signatures not read |
-| 3. Adapt hooks (signature/struct changes) | Detection only (inferred args, signatures if known); no adaptation |
-| 4. Behavioral tests from the old version | Scenario trace diff done (M4); recorded per-call test cases and replay not started |
+| 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim); struct layouts not started |
+| 4. Behavioral tests from the old version | Scenario trace diff and trial runs done (M4); recorded per-call test cases and replay not started |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server, Ghidra extension, hosted service, IDA plugin | Not started (designed) |
 | AI fallback | Not started (designed, design §8) |
@@ -62,16 +78,17 @@ luck). Such hooks now go to review as `stale_locator`.
 
 ## Suggested next steps
 
-1. **Finish M4:** trial runs of review candidates (so high-criticality hooks can earn their behavioral pass),
-   repairing a stale hook from its own build (v1 → v3), AOB regeneration, offsets header, and prototype proposals
-   for `log_event`'s added parameter. The `log_event` review reads "1 functions ... equally plausible" at /O2: the
-   ambiguity message should handle a single competitor.
-2. **MCP server** (design §11.2): list and explain review items, propose mappings into verification. Agents
-   can't accept; decisions stay with `pbeta review` (or the UI later).
+1. **Decide whether a behavioral pass should count as independent evidence** (design §6.3, [Guess]). Today it's
+   required for high criticality but never counts toward the structural passes, so `apply_discount` and
+   `ship_order` pass their trials, are correct per the answer key, and still wait in review.
+2. **MCP server** (design §11.2): list and explain review items (now with proposals), propose mappings into
+   verification. Agents can't accept; decisions stay with `pbeta review` (or the UI later).
 3. **Calibrate the similarity thresholds** (score 0.75, margin 0.1, size 16, weights; all [Guess]) from the
    corpus: score distributions of correct vs ambiguous pairs. Fixture S3–S5 at /O2 are still unmatched.
 4. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.
-5. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
+5. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
+   proposals; both lean on PDB or Ghidra types.
+6. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 
 ## Known rough edges
 
@@ -79,7 +96,12 @@ luck). Such hooks now go to review as `stale_locator`.
   `pbeta-corpus hook-manifest` does it for the corpus only.
 - The trace diff checks one scripted scenario: a wrong target that happens to see the same arguments and results
   for those calls would pass it. The detours log by-value arguments written per prototype by hand.
-- AOB patterns are kept as they are, not regenerated or re-validated.
+- AOB patterns are only regenerated with `--new-binary`; without it a re-bound hook has no pattern. The minimum
+  length (8 bytes) is a guess, and patterns are only checked for uniqueness in the build they're made from.
+- A trial run that crashes fails every candidate's behavioral check in that run, holding the whole step for
+  review. One run per trialed hook would isolate it, at the cost of more runs.
+- Prototype proposals only cover added register parameters (slots 1–4), with types guessed from the register
+  class; stack parameters, removed or reordered ones aren't proposed.
 - Call-sequence pairing by position is a review suggestion only. In the ICF build it suggests `pb_deleted` →
   `pb_body_edited`, which is misleading but not a wrong match.
 - `.exe` hashes change on every rebuild even with `/Brepro` (PE timestamp, PDB signature), so a build ID is

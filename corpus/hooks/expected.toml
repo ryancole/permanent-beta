@@ -4,14 +4,20 @@
 # applied hook (pbeta trace-diff). Per step and flag set:
 #   min_resolved  hooks re-bound to the new build, all correctly. Raise it when the engine resolves more.
 #   held          hooks that must stay in review, never applied: a changed signature (log_event gains a
-#                 parameter in v2), identical code (checksum and checksum_backup in v3), and locators still bound
-#                 to v1 after the first step sent them to review (stale_locator).
+#                 parameter in v2), identical code (checksum and checksum_backup in v3), and a rewritten body
+#                 (apply_discount; v2-v3 repairs it from v1, its own build).
 #
-# Hooks resolved today (2026-11-06):
-#   v1-v2: price_lookup, stock_level, order_add, format_receipt, checksum, ship_order. Review: log_event
-#          (signature changed), apply_discount (rewritten body: insufficient evidence at /O2, unmatched at /Od).
-#   v2-v3: price_lookup, stock_level, order_add, format_receipt. Review: checksum (ambiguous), ship_order (body
-#          edited: insufficient evidence), log_event and apply_discount (stale locators).
+# order_add is high criticality: it's only resolved when its trial run gives it a behavioral pass, so
+# min_resolved also gates the trial runs.
+#
+# Hooks resolved today (2026-11-07):
+#   v1-v2: price_lookup, stock_level, order_add (after its trial), format_receipt, checksum, ship_order. Review:
+#          log_event (an unconfirmed candidate at /O2, verification failed at /Od; both with a prototype
+#          proposal), apply_discount (rewritten body: insufficient evidence after a passing trial at /O2,
+#          unmatched at /Od).
+#   v2-v3: price_lookup, stock_level, order_add (after its trial), format_receipt. Review: checksum (ambiguous),
+#          ship_order (body edited: insufficient evidence after a passing trial), and, repaired v1 -> v3 from
+#          their own build, log_event and apply_discount with the same reasons as in v1-v2.
 
 [[step]]
 name = "v1-v2"

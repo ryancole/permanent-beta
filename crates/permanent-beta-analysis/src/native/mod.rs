@@ -9,6 +9,7 @@
 
 mod function;
 mod image;
+pub mod pattern;
 
 use crate::{AnalysisError, Analyzer};
 use permanent_beta_model::{
@@ -48,13 +49,20 @@ pub enum BytesError {
     Invalid(String),
 }
 
+/// A build's id: the SHA-256 of the file, lowercase hex.
+pub fn build_id(bytes: &[u8]) -> BuildId {
+    BuildId(
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
 /// Analyze an in-memory PE x64 image.
 pub fn analyze_bytes(bytes: &[u8], file_name: &str) -> Result<AnalysisExport, BytesError> {
     let image = image::Image::parse(bytes).map_err(BytesError::Invalid)?;
-    let build_id: String = Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let build_id = build_id(bytes).0;
 
     let functions = function::discover(&image)
         .into_iter()

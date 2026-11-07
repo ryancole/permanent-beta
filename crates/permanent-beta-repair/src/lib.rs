@@ -1,11 +1,16 @@
 //! Repair (design §7): decide what happens to each hook, rewrite the manifest, and emit review items.
 //!
-//! Planned generators: AOB pattern regeneration, offsets header (`hooks.gen.h`), struct-layout and prototype
-//! adaptation proposals. The detour body is never rewritten automatically.
+//! Generators: trial manifests for collecting behavioral evidence on review candidates ([`trial_manifest`]),
+//! the offsets header ([`header`]) and prototype proposals ([`prototype`]). AOB patterns need the binary, so the
+//! analyzer generates them (`permanent_beta_analysis::native::pattern`). Struct-layout proposals are not built.
+//! The detour body is never rewritten automatically.
+
+pub mod header;
+pub mod prototype;
 
 use permanent_beta_model::{
-    BuildId, CheckOutcome, FunctionFeatures, HookManifest, HookSpec, ReviewItem, ReviewReason, Rva,
-    Verdict, VerificationReport,
+    AnalysisExport, BuildId, CheckOutcome, FunctionFeatures, HookManifest, HookSpec,
+    PrototypeProposal, ReviewItem, ReviewReason, Rva, Verdict, VerificationReport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,11 +43,40 @@ pub struct HookRepair {
     /// Set when a reviewer decided this hook's target (an accepted human mapping) instead of the engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_by: Option<String>,
+    /// The build this hook was repaired from, when it isn't the report's old build: a hook whose locator is
+    /// bound to an older build is repaired from that build directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_build: Option<BuildId>,
+    /// Prototype proposals for candidates whose parameters seem to have changed (review only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposals: Vec<PrototypeProposal>,
 }
 
 impl HookRepair {
+    fn new(hook: &HookSpec, old: Option<Rva>, action: RepairAction) -> Self {
+        Self {
+            hook: hook.name.clone(),
+            old,
+            action,
+            verification: None,
+            alternatives: Vec::new(),
+            reviewed_by: None,
+            from_build: None,
+            proposals: Vec::new(),
+        }
+    }
+
     pub fn is_resolved(&self) -> bool {
         !matches!(self.action, RepairAction::NeedsReview { .. })
+    }
+
+    /// The new-build RVA of a resolved hook.
+    pub fn new_rva(&self) -> Option<Rva> {
+        match self.action {
+            RepairAction::Unchanged { rva } => Some(rva),
+            RepairAction::Relocated { new, .. } => Some(new),
+            RepairAction::NeedsReview { .. } => None,
+        }
     }
 }
 
@@ -60,12 +94,12 @@ pub fn decide(
     alternatives: Vec<VerificationReport>,
 ) -> HookRepair {
     let review = |reason, detail: String, report| HookRepair {
-        hook: hook.name.clone(),
-        old: old_fn.map(|f| f.rva),
-        action: RepairAction::NeedsReview { reason, detail },
         verification: report,
-        alternatives: Vec::new(),
-        reviewed_by: None,
+        ..HookRepair::new(
+            hook,
+            old_fn.map(|f| f.rva),
+            RepairAction::NeedsReview { reason, detail },
+        )
     };
 
     let Some(old_fn) = old_fn else {
@@ -83,19 +117,36 @@ pub fn decide(
                 None,
             );
         }
-        let rvas: Vec<String> = alternatives
-            .iter()
-            .map(|a| a.candidate.new.to_string())
-            .collect();
-        let mut repair = review(
-            ReviewReason::Ambiguous,
-            format!(
+        let detail = match &alternatives[..] {
+            // One competitor: a pass only suggested it (e.g. a call position under a matched caller) or another
+            // old function claims it too. Not "equally plausible": there's nothing to be equal to.
+            [only] => {
+                let why: Vec<&str> = only
+                    .candidate
+                    .evidence
+                    .iter()
+                    .map(|e| e.detail.as_str())
+                    .collect();
+                format!(
+                    "the only candidate, {}, is unconfirmed ({}); the engine will not pick it",
+                    only.candidate.new,
+                    if why.is_empty() {
+                        "no unique evidence".to_owned()
+                    } else {
+                        why.join("; ")
+                    }
+                )
+            }
+            many => format!(
                 "{} functions in the new build are equally plausible ({}); the engine will not pick one",
-                rvas.len(),
-                rvas.join(", ")
+                many.len(),
+                many.iter()
+                    .map(|a| a.candidate.new.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
-            None,
-        );
+        };
+        let mut repair = review(ReviewReason::Ambiguous, detail, None);
         repair.alternatives = alternatives;
         return repair;
     };
@@ -165,12 +216,8 @@ pub fn decide(
                 }
             };
             HookRepair {
-                hook: hook.name.clone(),
-                old: Some(old_fn.rva),
-                action,
                 verification: Some(report),
-                alternatives: Vec::new(),
-                reviewed_by: None,
+                ..HookRepair::new(hook, Some(old_fn.rva), action)
             }
         }
     }
@@ -180,22 +227,19 @@ pub fn decide(
 /// so looking it up in the old analysis could land on an unrelated function. Typically a hook an earlier repair
 /// sent to review: it keeps its old binding until a reviewer decides it, or until it's repaired from its own build.
 pub fn stale_locator(hook: &HookSpec, old_build: &BuildId) -> HookRepair {
-    HookRepair {
-        hook: hook.name.clone(),
-        old: None,
-        action: RepairAction::NeedsReview {
+    HookRepair::new(
+        hook,
+        None,
+        RepairAction::NeedsReview {
             reason: ReviewReason::StaleLocator,
             detail: format!(
-                "locator is bound to build {}, not the old build {}; repair it from its own build, or decide its \
-                 earlier review item",
+                "locator is bound to build {}, not the old build {}; repair it from its own build (give that \
+                 build's analysis too), or decide its earlier review item",
                 short(&hook.target.build),
                 short(old_build)
             ),
         },
-        verification: None,
-        alternatives: Vec::new(),
-        reviewed_by: None,
-    }
+    )
 }
 
 /// A hook whose target a reviewer already decided (an accepted human mapping for this build pair). Not
@@ -206,20 +250,17 @@ pub fn from_review(
     new_fn: &FunctionFeatures,
     reviewer: &str,
 ) -> HookRepair {
+    let action = if old_fn.rva == new_fn.rva {
+        RepairAction::Unchanged { rva: new_fn.rva }
+    } else {
+        RepairAction::Relocated {
+            old: old_fn.rva,
+            new: new_fn.rva,
+        }
+    };
     HookRepair {
-        hook: hook.name.clone(),
-        old: Some(old_fn.rva),
-        action: if old_fn.rva == new_fn.rva {
-            RepairAction::Unchanged { rva: new_fn.rva }
-        } else {
-            RepairAction::Relocated {
-                old: old_fn.rva,
-                new: new_fn.rva,
-            }
-        },
-        verification: None,
-        alternatives: Vec::new(),
         reviewed_by: Some(reviewer.to_owned()),
+        ..HookRepair::new(hook, Some(old_fn.rva), action)
     }
 }
 
@@ -235,8 +276,8 @@ fn failing_checks(report: &VerificationReport) -> String {
 
 /// Re-bind resolved hooks to the new build. Unresolved hooks keep their old locator.
 ///
-/// TODO(design §7.2): regenerate and uniqueness-check AOB patterns for relocated hooks. Until then an existing
-/// pattern is kept as-is and must be re-validated.
+/// A re-bound locator drops its AOB pattern: the pattern was checked against the old build only, and a locator
+/// claims validity for its build. Regenerate patterns from the new binary (`pbeta repair --new-binary`).
 pub fn rewrite_manifest(
     manifest: &HookManifest,
     repairs: &[HookRepair],
@@ -244,18 +285,87 @@ pub fn rewrite_manifest(
 ) -> HookManifest {
     let mut out = manifest.clone();
     for hook in &mut out.hooks {
-        let Some(repair) = repairs.iter().find(|r| r.hook == hook.name) else {
+        let Some(new_rva) = repairs
+            .iter()
+            .find(|r| r.hook == hook.name)
+            .and_then(HookRepair::new_rva)
+        else {
             continue;
-        };
-        let new_rva = match repair.action {
-            RepairAction::Unchanged { rva } => rva,
-            RepairAction::Relocated { new, .. } => new,
-            RepairAction::NeedsReview { .. } => continue,
         };
         hook.target.build = new_build.clone();
         hook.target.rva = Some(new_rva);
+        hook.target.pattern = None;
     }
     out
+}
+
+/// A manifest a repair may start from. Trial manifests are refused: their trial bindings point at unverified
+/// candidates, and repairing from one would treat a guess as the old build's truth.
+pub fn check_input(manifest: &HookManifest) -> Result<(), String> {
+    let trial: Vec<&str> = manifest
+        .hooks
+        .iter()
+        .filter(|h| h.trial)
+        .map(|h| h.name.as_str())
+        .collect();
+    if trial.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "this is a trial manifest (trial bindings: {}); repair from the repaired manifest instead",
+            trial.join(", ")
+        ))
+    }
+}
+
+/// The candidate a trial run can test for this hook: it went to review for insufficient evidence only (no
+/// check failed, so behavioral evidence could settle it), its single candidate wasn't rejected, and the new
+/// function's entry can be patched. Ambiguous hooks aren't trialed: one detour can only sit at one address.
+pub fn trial_candidate(repair: &HookRepair, new: &AnalysisExport) -> Option<Rva> {
+    let RepairAction::NeedsReview {
+        reason: ReviewReason::InsufficientEvidence,
+        ..
+    } = repair.action
+    else {
+        return None;
+    };
+    let v = repair.verification.as_ref()?;
+    if v.verdict != Verdict::NeedsReview || v.checks.iter().any(|c| c.outcome == CheckOutcome::Fail)
+    {
+        return None;
+    }
+    let f = new.function(v.candidate.new)?;
+    if f.entry.is_some_and(|e| !e.hazards().is_empty()) {
+        return None;
+    }
+    Some(v.candidate.new)
+}
+
+/// The repaired manifest plus trial bindings: every [`trial_candidate`] is bound to the new build at its
+/// candidate and marked `trial`. Running the new build under it records what each candidate does, for
+/// `pbeta repair --old-trace --new-trace` to judge. Returns the manifest and the hooks it trials.
+pub fn trial_manifest(
+    updated: &HookManifest,
+    repairs: &[HookRepair],
+    new: &AnalysisExport,
+) -> (HookManifest, Vec<String>) {
+    let mut out = updated.clone();
+    let mut trialed = Vec::new();
+    for hook in &mut out.hooks {
+        let Some(rva) = repairs
+            .iter()
+            .find(|r| r.hook == hook.name)
+            .and_then(|r| trial_candidate(r, new))
+        else {
+            continue;
+        };
+        hook.target.build = new.build.id.clone();
+        hook.target.rva = Some(rva);
+        hook.target.pattern = None;
+        hook.trial = true;
+        trialed.push(hook.name.clone());
+    }
+    (out, trialed)
 }
 
 /// Review items for every unresolved hook. Ids are stable per (hook, build pair).
@@ -264,9 +374,14 @@ pub fn review_items(repairs: &[HookRepair], from: &BuildId, to: &BuildId) -> Vec
         .iter()
         .filter_map(|r| match &r.action {
             RepairAction::NeedsReview { reason, detail } => Some(ReviewItem {
-                id: format!("{}:{}:{}", r.hook, short(from), short(to)),
+                id: format!(
+                    "{}:{}:{}",
+                    r.hook,
+                    short(r.from_build.as_ref().unwrap_or(from)),
+                    short(to)
+                ),
                 hook: Some(r.hook.clone()),
-                from_build: from.clone(),
+                from_build: r.from_build.clone().unwrap_or_else(|| from.clone()),
                 to_build: to.clone(),
                 old: r.old,
                 reason: *reason,
@@ -277,6 +392,7 @@ pub fn review_items(repairs: &[HookRepair], from: &BuildId, to: &BuildId) -> Vec
                     .chain(&r.alternatives)
                     .cloned()
                     .collect(),
+                proposals: r.proposals.clone(),
                 status: Default::default(),
             }),
             _ => None,
@@ -301,6 +417,7 @@ mod tests {
             detour: None,
             criticality: Criticality::Normal,
             prototype: None,
+            trial: false,
             target: TargetLocator {
                 build: BuildId("old".into()),
                 rva: Some(Rva(0x10)),
@@ -319,6 +436,7 @@ mod tests {
             normalized_hash: None,
             mnemonic_hash: None,
             inferred_args: None,
+            inferred_arg_classes: vec![],
             entry: None,
             basic_blocks: None,
             mnemonic_counts: Default::default(),
@@ -415,6 +533,25 @@ mod tests {
     }
 
     #[test]
+    fn a_single_unconfirmed_competitor_is_not_called_equally_plausible() {
+        let mut a = report(Verdict::Rejected);
+        a.candidate.evidence = vec![permanent_beta_model::Evidence {
+            kind: "ambiguous".into(),
+            detail: "suggestion from caller 0x11d0".into(),
+        }];
+        let r = decide(&hook(), Some(&func(0x10, 1)), None, None, vec![a]);
+        let RepairAction::NeedsReview { reason, detail } = &r.action else {
+            panic!("{:?}", r.action);
+        };
+        assert_eq!(*reason, ReviewReason::Ambiguous);
+        assert!(!detail.contains("equally plausible"), "{detail}");
+        assert!(
+            detail.contains("only candidate, 0x20, is unconfirmed (suggestion from caller 0x11d0)"),
+            "{detail}"
+        );
+    }
+
+    #[test]
     fn ambiguity_goes_to_review_even_if_alternatives_verify() {
         // Both competitors would pass verification on their own; the hook must still not resolve.
         let mut a = report(Verdict::Accepted);
@@ -431,9 +568,117 @@ mod tests {
                 ..
             }
         ));
+        let RepairAction::NeedsReview { detail, .. } = &r.action else {
+            unreachable!()
+        };
+        assert!(
+            detail.starts_with("2 functions in the new build are equally plausible (0x20, 0x30)"),
+            "{detail}"
+        );
         let items = review_items(&[r], &BuildId("old".into()), &BuildId("new".into()));
         assert_eq!(items[0].reason, ReviewReason::Ambiguous);
         assert_eq!(items[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn a_rebound_locator_drops_its_unchecked_pattern() {
+        let mut manifest = HookManifest {
+            hooks: vec![hook()],
+        };
+        manifest.hooks[0].target.pattern = Some("48 89 5C 24 ??".into());
+        let moved = decide(
+            &hook(),
+            Some(&func(0x10, 1)),
+            Some(report(Verdict::Accepted)),
+            Some(&func(0x20, 1)),
+            vec![],
+        );
+        let out = rewrite_manifest(&manifest, &[moved], &BuildId("new".into()));
+        assert_eq!(out.hooks[0].target.rva, Some(Rva(0x20)));
+        assert_eq!(out.hooks[0].target.pattern, None);
+
+        // A hook left in review keeps its old binding, pattern included: it's still valid for the old build.
+        let held = decide(&hook(), Some(&func(0x10, 1)), None, None, vec![]);
+        let out = rewrite_manifest(&manifest, &[held], &BuildId("new".into()));
+        assert_eq!(
+            out.hooks[0].target.pattern.as_deref(),
+            Some("48 89 5C 24 ??")
+        );
+    }
+
+    fn export(functions: Vec<FunctionFeatures>) -> AnalysisExport {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": permanent_beta_model::ANALYSIS_SCHEMA_VERSION,
+            "build": { "id": "new", "file_name": "t.exe", "version": null, "machine": "x64", "pdb": null },
+            "producer": { "tool": "test", "version": "0" },
+            "functions": functions,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_insufficient_evidence_candidates_are_trialed() {
+        use permanent_beta_model::{CheckResult, EntryInfo};
+        let new = export(vec![func(0x20, 1)]);
+        let manifest = HookManifest {
+            hooks: vec![hook()],
+        };
+        let waiting = decide(
+            &hook(),
+            Some(&func(0x10, 1)),
+            Some(report(Verdict::NeedsReview)),
+            Some(&func(0x20, 1)),
+            vec![],
+        );
+        let (trial, names) = trial_manifest(&manifest, std::slice::from_ref(&waiting), &new);
+        assert_eq!(names, vec!["H".to_owned()]);
+        assert!(trial.hooks[0].trial);
+        assert_eq!(trial.hooks[0].target.rva, Some(Rva(0x20)));
+        assert_eq!(trial.hooks[0].target.build, BuildId("new".into()));
+        assert!(
+            check_input(&trial).is_err(),
+            "a trial manifest can't be repaired from"
+        );
+        assert!(check_input(&manifest).is_ok());
+
+        // A failing check: behavioral evidence can't settle it, so no trial.
+        let mut failing = report(Verdict::NeedsReview);
+        failing.checks = vec![CheckResult::new("callers", CheckOutcome::Fail, "0/2")];
+        let failed = decide(
+            &hook(),
+            Some(&func(0x10, 1)),
+            Some(failing),
+            Some(&func(0x20, 1)),
+            vec![],
+        );
+        assert_eq!(trial_candidate(&failed, &new), None);
+        // Ambiguous, unmatched or already resolved: nothing to trial.
+        let mut a = report(Verdict::Accepted);
+        a.candidate.new = Rva(0x30);
+        let ambiguous = decide(
+            &hook(),
+            Some(&func(0x10, 1)),
+            None,
+            None,
+            vec![a.clone(), a],
+        );
+        assert_eq!(trial_candidate(&ambiguous, &new), None);
+        let resolved = decide(
+            &hook(),
+            Some(&func(0x10, 1)),
+            Some(report(Verdict::Accepted)),
+            Some(&func(0x20, 1)),
+            vec![],
+        );
+        assert_eq!(trial_candidate(&resolved, &new), None);
+        // An entry Detours can't patch.
+        let mut short_fn = func(0x20, 1);
+        short_fn.entry = Some(EntryInfo {
+            patch_len: 3,
+            branch_into_patch: false,
+            jump_thunk: false,
+        });
+        assert_eq!(trial_candidate(&waiting, &export(vec![short_fn])), None);
     }
 
     #[test]

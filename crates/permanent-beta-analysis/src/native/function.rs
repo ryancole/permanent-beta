@@ -20,7 +20,7 @@ use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
     OpKind, Register,
 };
-use permanent_beta_model::{EntryInfo, FunctionFeatures, Rva};
+use permanent_beta_model::{ArgClass, EntryInfo, FunctionFeatures, Rva};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -348,6 +348,11 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         }
     }
 
+    let args = if insns.is_empty() {
+        (0, Vec::new())
+    } else {
+        inferred_args(&insns)
+    };
     FunctionFeatures {
         rva: Rva(range.start as u64),
         size: range.segments().map(|(s, e)| e - s).sum(),
@@ -362,7 +367,8 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         constants: constants.into_iter().collect(),
         imports: imports.into_iter().collect(),
         signature: None,
-        inferred_args: (!insns.is_empty()).then(|| inferred_args(&insns)),
+        inferred_args: (!insns.is_empty()).then_some(args.0),
+        inferred_arg_classes: args.1,
         entry: (!insns.is_empty()).then(|| entry_info(&insns, start_va, &internal_targets)),
         mnemonic_counts,
     }
@@ -396,14 +402,14 @@ const ARG_SLOTS: [(Register, Register); 4] = [
     (Register::R9, Register::ZMM3),
 ];
 
-/// 1 + the highest argument slot whose register is read before it's written, scanning in address order up to
-/// the first call or return. A heuristic lower bound: it ignores control flow, unused trailing parameters and
-/// stack arguments.
-fn inferred_args(insns: &[Instruction]) -> u8 {
+/// Register-argument use: 1 + the highest argument slot whose register is read before it's written, scanning in
+/// address order up to the first call or return, and each slot's register class up to that one. A heuristic
+/// lower bound: it ignores control flow, unused trailing parameters and stack arguments.
+fn inferred_args(insns: &[Instruction]) -> (u8, Vec<ArgClass>) {
     #[derive(Clone, Copy, PartialEq)]
     enum Slot {
         Unknown,
-        Arg,
+        Arg(ArgClass),
         Clobbered,
     }
     let mut slots = [Slot::Unknown; 4];
@@ -417,7 +423,15 @@ fn inferred_args(insns: &[Instruction]) -> u8 {
         for pass_reads in [true, false] {
             for used in info.used_registers() {
                 let full = used.register().full_register();
-                let Some(slot) = ARG_SLOTS.iter().position(|&(g, v)| g == full || v == full) else {
+                let Some((slot, class)) = ARG_SLOTS.iter().enumerate().find_map(|(i, &(g, v))| {
+                    if g == full {
+                        Some((i, ArgClass::Integer))
+                    } else if v == full {
+                        Some((i, ArgClass::Vector))
+                    } else {
+                        None
+                    }
+                }) else {
                     continue;
                 };
                 if slots[slot] != Slot::Unknown {
@@ -432,17 +446,25 @@ fn inferred_args(insns: &[Instruction]) -> u8 {
                 );
                 let writes = used.access() == OpAccess::Write;
                 if pass_reads && reads {
-                    slots[slot] = Slot::Arg;
+                    slots[slot] = Slot::Arg(class);
                 } else if !pass_reads && writes {
                     slots[slot] = Slot::Clobbered;
                 }
             }
         }
     }
-    slots
+    let count = slots
         .iter()
-        .rposition(|&s| s == Slot::Arg)
-        .map_or(0, |i| i as u8 + 1)
+        .rposition(|s| matches!(s, Slot::Arg(_)))
+        .map_or(0, |i| i + 1);
+    let classes = slots[..count]
+        .iter()
+        .map(|s| match s {
+            Slot::Arg(c) => *c,
+            _ => ArgClass::Unused,
+        })
+        .collect();
+    (count as u8, classes)
 }
 
 #[cfg(test)]
@@ -639,17 +661,21 @@ mod tests {
             analyze(&[0x8b, 0xc1, 0x03, 0xc2, 0xc3]).inferred_args,
             Some(2)
         );
-        // mov eax, r8d; ret  → third slot used, so at least 3 parameters
-        assert_eq!(analyze(&[0x44, 0x89, 0xc0, 0xc3]).inferred_args, Some(3));
+        // mov eax, r8d; ret  → third slot used, so at least 3 parameters; the first two aren't read
+        let f = analyze(&[0x44, 0x89, 0xc0, 0xc3]);
+        assert_eq!(f.inferred_args, Some(3));
+        assert_eq!(
+            f.inferred_arg_classes,
+            vec![ArgClass::Unused, ArgClass::Unused, ArgClass::Integer]
+        );
     }
 
     #[test]
     fn infers_vector_register_arguments() {
         // addss xmm0, xmm1; ret  → float parameters in slots 1 and 2
-        assert_eq!(
-            analyze(&[0xf3, 0x0f, 0x58, 0xc1, 0xc3]).inferred_args,
-            Some(2)
-        );
+        let f = analyze(&[0xf3, 0x0f, 0x58, 0xc1, 0xc3]);
+        assert_eq!(f.inferred_args, Some(2));
+        assert_eq!(f.inferred_arg_classes, vec![ArgClass::Vector; 2]);
     }
 
     #[test]

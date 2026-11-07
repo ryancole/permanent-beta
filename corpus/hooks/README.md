@@ -18,7 +18,7 @@ the first time, and cargo. Output goes to `target/hooks/<flags>/v{1,2,3}/` and `
 | `app/v{1,2,3}/app.cpp` | Sample app: a fixed order-processing script, so every run makes the same calls. Hook targets are `extern "C"` and `noinline`. |
 | `hookdll/hookdll.cpp` | Hook DLL. Reads the manifest (`pbeta`'s TOML), attaches a logging Detours detour to every hook whose locator is bound to the running build, and writes a JSON Lines trace (`attach`, `skip`, `call` with arguments and result by value, `end`). |
 | `launcher/launcher.cpp` | Starts the app with the DLL injected (`DetourCreateProcessWithDllExW`), passing the manifest, trace path and the .exe's SHA-256 (its build id) through the environment. |
-| `hooks.template.toml` | The hooks, written against v1 by symbol. `pbeta-corpus hook-manifest` resolves the symbols through v1's linker map and drops them, so repair sees RVAs only. |
+| `hooks.template.toml` | The hooks, written against v1 by symbol. `pbeta-corpus hook-manifest` resolves the symbols through v1's linker map and drops them, so repair sees RVAs only. `order_add` is high criticality: it needs a behavioral pass, which only a trial run can give it. |
 | `expected.toml` | Per step and flag set: hooks that must be resolved (at least), and hooks that must stay in review. |
 
 Detours (MIT) is cloned at a pinned commit and built with its own makefile; it's never committed.
@@ -43,19 +43,29 @@ at that address now.
 ## What `-Run` checks
 
 1. **Baseline:** v1 runs under the v1 manifest; every hook must attach and fire, and the run must exit normally.
-2. **Each step** (v1 → v2, v2 → v3), from the previous step's manifest:
-   - `pbeta repair` writes the repaired manifest (`repair.json` keeps its report).
+2. **Each step** (v1 → v2, v2 → v3), from the previous step's manifest. A hook still bound to an older build
+   (an earlier step sent it to review) is repaired from that build directly (`--earlier`, e.g. v1 → v3):
+   - **Trial run:** `pbeta repair --trial-out` writes the repaired manifest plus trial bindings: hooks in review
+     whose only missing evidence is behavioral (`insufficient_evidence`, no failing check, one patchable
+     candidate) are bound to their candidates and marked `trial = true`. The new version runs under it.
+   - **Decision:** `pbeta repair --old-trace <each older run> --new-trace <trial run> --new-binary` decides with
+     that behavioral evidence (`TraceDiffRunner`, design §6.2; each candidate is judged against its own old
+     build's run), writes the repaired manifest with AOB patterns regenerated from the new binary, and
+     `repair.json` keeps its report.
    - **Answer key** (`pbeta-corpus hook-check`): every re-bound hook must land on the function with the same symbol
-     in the new map. A wrong relocation fails. So does resolving a hook whose locator wasn't valid for the old build.
-     The step must also meet `expected.toml`.
+     in the new map, judged from the build its locator was bound to. A wrong relocation fails, and so does a
+     pattern that doesn't match exactly once, at the hook's RVA. So does resolving a hook whose locator wasn't
+     bound to a build repair was given. The step must also meet `expected.toml`.
    - **Run:** the new version runs under the repaired manifest.
    - **Trace diff** (`pbeta trace-diff --repair repair.json`): every applied hook must see the same calls, arguments
-     and results as in the previous version's run. A hook that doesn't fire, fires differently, fails to attach,
-     or crashes the app fails. So does a hook repair sent to review that was applied anyway, or one that was skipped
-     without being reported.
-   - **Behavioral evidence:** `pbeta repair --old-trace --new-trace` re-runs verification with the traces
-     (`TraceDiffRunner`, design §6.2). Every hook it resolves must have a passing behavioral check, and none may fail.
-3. **Negative control:** `price_lookup` and `stock_level` (both `int f(int)`) swap RVAs in the v2 manifest. Both
+     and results as in the last run that applied it (for a hook repaired from v1, v1's run). A hook that doesn't
+     fire, fires differently, fails to attach, or crashes the app fails. So does a hook repair sent to review
+     that was applied anyway, or one that was skipped without being reported.
+   - **Evidence:** every hook repair resolved must have a passing behavioral check, and none may fail.
+   - **Proposals:** `log_event` (a parameter added in v2) must come with a prototype proposal, and every proposed
+     shim must compile (`cl /Zs`) against the hook's existing detour.
+3. **Offsets header:** `pbeta header` builds `hooks.gen.h` from the three manifests; it must compile as C and C++.
+4. **Negative control:** `price_lookup` and `stock_level` (both `int f(int)`) swap RVAs in the v2 manifest. Both
    the answer key and the trace diff must catch it.
 
 The script prints a per-hook table (repair outcome and trace-diff outcome for each step) and exits 1 on any
@@ -67,7 +77,11 @@ failure.
   arguments and results for those calls would pass the trace diff (the answer key would still catch it here).
 - Detours are written against v1's prototypes and struct layout. A changed signature goes to review instead of
   being adapted (design §7.2).
-- A hook sent to review stays bound to its old build, so later steps report it as `stale_locator` until a reviewer
-  decides it, or it's repaired from its own build.
-- High-criticality hooks need a behavioral pass before they're accepted, but the harness only runs accepted hooks.
-  Trial runs of review candidates are not built yet, so every hook here is `normal`.
+- A hook sent to review stays bound to its old build. Later steps repair it from that build when its analysis is
+  given (`--earlier`), and report it as `stale_locator` otherwise.
+- A behavioral pass is required for high criticality but doesn't count toward the independent structural passes
+  (design §6.3). So trials resolve `order_add` (high, with 3 independent passes), while `apply_discount` and
+  `ship_order` pass their trials and stay in review: correctly matched, but with no independent structural
+  evidence.
+- A trial run binds unverified candidates. One that crashes the app fails the behavioral check of every
+  candidate in that run (the run didn't complete), which holds the step's hooks for review: safe, but noisy.

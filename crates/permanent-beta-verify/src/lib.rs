@@ -6,8 +6,8 @@
 //! is wide enough that a pass says little, but a wildly different size is still a strong reason to fail.
 
 use permanent_beta_model::{
-    AnalysisExport, Candidate, CheckOutcome, CheckResult, Criticality, FunctionFeatures, Rva,
-    Verdict, VerificationReport, evidence_kind,
+    AnalysisExport, BuildId, Candidate, CheckOutcome, CheckResult, Criticality, FunctionFeatures,
+    Rva, Verdict, VerificationReport, evidence_kind,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -20,6 +20,9 @@ pub use behavioral::TraceDiffRunner;
 /// of the match, not ground truth.
 #[derive(Debug, Default)]
 pub struct VerifyContext {
+    /// The two builds being compared, so evidence recorded per build (e.g. traces) is only used for its own build.
+    pub old_build: BuildId,
+    pub new_build: BuildId,
     mapping: HashMap<Rva, Rva>,
     old_callers: HashMap<Rva, Vec<Rva>>,
     new_callers: HashMap<Rva, Vec<Rva>>,
@@ -28,6 +31,8 @@ pub struct VerifyContext {
 impl VerifyContext {
     pub fn new(old: &AnalysisExport, new: &AnalysisExport, candidates: &[Candidate]) -> Self {
         Self {
+            old_build: old.build.id.clone(),
+            new_build: new.build.id.clone(),
             mapping: candidates.iter().map(|c| (c.old, c.new)).collect(),
             old_callers: callers_index(old),
             new_callers: callers_index(new),
@@ -63,6 +68,7 @@ pub trait StructuralCheck {
 pub trait BehavioralRunner {
     fn run(
         &self,
+        ctx: &VerifyContext,
         candidate: &Candidate,
         old: &FunctionFeatures,
         new: &FunctionFeatures,
@@ -73,7 +79,13 @@ pub trait BehavioralRunner {
 pub struct NoBehavioralCorpus;
 
 impl BehavioralRunner for NoBehavioralCorpus {
-    fn run(&self, _: &Candidate, _: &FunctionFeatures, _: &FunctionFeatures) -> CheckResult {
+    fn run(
+        &self,
+        _: &VerifyContext,
+        _: &Candidate,
+        _: &FunctionFeatures,
+        _: &FunctionFeatures,
+    ) -> CheckResult {
         CheckResult::new(
             "behavioral",
             CheckOutcome::Inconclusive,
@@ -201,7 +213,7 @@ impl Verifier {
             .filter(|c| c.outcome == CheckOutcome::Pass && c.counted)
             .count();
 
-        let behavioral = self.behavioral.run(candidate, old, new);
+        let behavioral = self.behavioral.run(ctx, candidate, old, new);
         let behavioral_outcome = behavioral.outcome;
         checks.push(behavioral);
 
@@ -522,6 +534,7 @@ mod tests {
             normalized_hash: None,
             mnemonic_hash: None,
             inferred_args: None,
+            inferred_arg_classes: vec![],
             entry: None,
             basic_blocks: None,
             mnemonic_counts: Default::default(),

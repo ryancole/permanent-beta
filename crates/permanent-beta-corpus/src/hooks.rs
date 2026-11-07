@@ -69,20 +69,51 @@ fn symbols_at(map: &MapFile, rva: Rva) -> Vec<&str> {
         .collect()
 }
 
-/// Judge every hook of `new_manifest` (repaired from `old_manifest`) against the two builds' maps.
+/// Where a pattern matches in the new binary's code (RVAs), for checking regenerated AOB patterns.
+pub type PatternFinder<'a> = &'a dyn Fn(&str) -> Result<Vec<u64>, String>;
+
+/// Judge every hook of `new_manifest` (repaired from `old_manifest`) against the builds' maps.
+///
+/// `sources` are the builds repair may start from, each with its map: the old build first, then older builds
+/// that hooks still bound to them are repaired from. A hook resolved from a locator bound to any other build is
+/// wrong, even at the right address. With `patterns`, a re-bound hook's AOB pattern must match exactly once in
+/// the new binary, at its RVA.
 pub fn check_hooks(
     old_manifest: &HookManifest,
     new_manifest: &HookManifest,
-    old_map: &MapFile,
+    sources: &[(&BuildId, &MapFile)],
     new_map: &MapFile,
-    old_build: &BuildId,
     new_build: &BuildId,
+    patterns: Option<PatternFinder>,
 ) -> Vec<HookCheck> {
     new_manifest
         .hooks
         .iter()
         .map(|h| {
-            let truth = judge(old_manifest, h, old_map, new_map, old_build, new_build);
+            let mut truth = judge(old_manifest, h, sources, new_map, new_build);
+            if let (HookTruth::Correct { old, new, .. }, Some(find), Some(p)) =
+                (&truth, patterns, h.target.pattern.as_deref())
+            {
+                let at = find(p);
+                if at.as_deref() != Ok(&[new.0][..]) {
+                    truth = HookTruth::Wrong {
+                        detail: format!(
+                            "pattern {p:?} matches {} in the new binary, not exactly {new}",
+                            match at {
+                                Ok(v) if v.is_empty() => "nowhere".to_owned(),
+                                Ok(v) => v
+                                    .iter()
+                                    .map(|r| format!("{r:#x}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                Err(e) => format!("nothing ({e})"),
+                            }
+                        ),
+                        old: Some(*old),
+                        new: *new,
+                    };
+                }
+            }
             HookCheck {
                 hook: h.name.clone(),
                 truth,
@@ -94,9 +125,8 @@ pub fn check_hooks(
 fn judge(
     old_manifest: &HookManifest,
     h: &permanent_beta_model::HookSpec,
-    old_map: &MapFile,
+    sources: &[(&BuildId, &MapFile)],
     new_map: &MapFile,
-    old_build: &BuildId,
     new_build: &BuildId,
 ) -> HookTruth {
     if h.target.build != *new_build {
@@ -114,12 +144,12 @@ fn judge(
         return wrong("not in the old manifest".into(), None);
     };
     let old = before.target.rva;
-    if before.target.build != *old_build {
+    let Some((_, old_map)) = sources.iter().find(|(b, _)| **b == before.target.build) else {
         return wrong(
             "resolved from a locator that was bound to another build".into(),
             old,
         );
-    }
+    };
     let Some(old_rva) = old else {
         return wrong("the old locator has no RVA".into(), None);
     };
@@ -264,6 +294,7 @@ mod tests {
                     detour: None,
                     criticality: Criticality::Normal,
                     prototype: None,
+                    trial: false,
                     target: TargetLocator {
                         build: BuildId(build.into()),
                         rva: Some(Rva(*r)),
@@ -307,7 +338,7 @@ mod tests {
         let mut new = manifest("v2", &[("price", 0x180), ("stock", 0x180), ("log", 0x300)]);
         new.hooks[2].target.build = v1.clone(); // held
 
-        let checks = check_hooks(&old, &new, &old_map, &new_map, &v1, &v2);
+        let checks = check_hooks(&old, &new, &[(&v1, &old_map)], &new_map, &v2, None);
         assert!(matches!(checks[0].truth, HookTruth::Correct { .. }));
         assert!(
             matches!(checks[1].truth, HookTruth::Wrong { .. }),
@@ -330,7 +361,7 @@ mod tests {
             "stock",
         )
         .unwrap();
-        let checks = check_hooks(&old, &new, &old_map, &new_map, &v1, &v2);
+        let checks = check_hooks(&old, &new, &[(&v1, &old_map)], &new_map, &v2, None);
         assert_eq!(gate(&checks, None).len(), 2, "{checks:?}");
     }
 
@@ -342,8 +373,72 @@ mod tests {
         let new_map = map(&[("price", 0x180)]);
         let old = manifest("v0", &[("price", 0x100)]);
         let new = manifest("v2", &[("price", 0x180)]);
-        let checks = check_hooks(&old, &new, &old_map, &new_map, &v1, &v2);
+        let checks = check_hooks(&old, &new, &[(&v1, &old_map)], &new_map, &v2, None);
         assert!(matches!(checks[0].truth, HookTruth::Wrong { .. }));
+    }
+
+    #[test]
+    fn a_hook_repaired_from_its_own_older_build_is_judged_by_that_build() {
+        // The old manifest (v2's) still binds "log" to v1, where 0x300 is log. Repair moved it v1 -> v3.
+        let (v1, v2, v3) = (
+            BuildId("v1".into()),
+            BuildId("v2".into()),
+            BuildId("v3".into()),
+        );
+        let v1_map = map(&[("log", 0x300), ("price", 0x100)]);
+        let v2_map = map(&[("price", 0x300), ("log", 0x400)]); // 0x300 is another function in v2
+        let v3_map = map(&[("log", 0x380), ("price", 0x180)]);
+        let mut old = manifest("v2", &[("log", 0x300)]);
+        old.hooks[0].target.build = v1.clone();
+        let new = manifest("v3", &[("log", 0x380)]);
+
+        let checks = check_hooks(
+            &old,
+            &new,
+            &[(&v2, &v2_map), (&v1, &v1_map)],
+            &v3_map,
+            &v3,
+            None,
+        );
+        assert!(
+            matches!(checks[0].truth, HookTruth::Correct { .. }),
+            "{checks:?}"
+        );
+        // Without v1's map it's a locator from an unknown build: wrong.
+        let checks = check_hooks(&old, &new, &[(&v2, &v2_map)], &v3_map, &v3, None);
+        assert!(matches!(checks[0].truth, HookTruth::Wrong { .. }));
+        // Judged by v2's map instead it would be wrong too (0x300 is price there): the build decides.
+        let mut as_v2 = old.clone();
+        as_v2.hooks[0].target.build = v2.clone();
+        let checks = check_hooks(&as_v2, &new, &[(&v2, &v2_map)], &v3_map, &v3, None);
+        assert!(matches!(checks[0].truth, HookTruth::Wrong { .. }));
+    }
+
+    #[test]
+    fn a_pattern_must_find_exactly_its_hook() {
+        let (v1, v2) = ids();
+        let old_map = map(&[("price", 0x100)]);
+        let new_map = map(&[("price", 0x180)]);
+        let old = manifest("v1", &[("price", 0x100)]);
+        let mut new = manifest("v2", &[("price", 0x180)]);
+        new.hooks[0].target.pattern = Some("48 8B".into());
+        let check = |found: Vec<u64>| {
+            let finder = move |_: &str| Ok(found.clone());
+            check_hooks(&old, &new, &[(&v1, &old_map)], &new_map, &v2, Some(&finder))
+        };
+        assert!(matches!(
+            check(vec![0x180])[0].truth,
+            HookTruth::Correct { .. }
+        ));
+        assert!(matches!(
+            check(vec![0x180, 0x400])[0].truth,
+            HookTruth::Wrong { .. }
+        ));
+        assert!(matches!(
+            check(vec![0x400])[0].truth,
+            HookTruth::Wrong { .. }
+        ));
+        assert!(matches!(check(vec![])[0].truth, HookTruth::Wrong { .. }));
     }
 
     #[test]
@@ -353,7 +448,7 @@ mod tests {
         let new_map = map(&[("price", 0x180), ("log", 0x380)]);
         let old = manifest("v1", &[("price", 0x100), ("log", 0x300)]);
         let new = manifest("v2", &[("price", 0x180), ("log", 0x380)]);
-        let checks = check_hooks(&old, &new, &old_map, &new_map, &v1, &v2);
+        let checks = check_hooks(&old, &new, &[(&v1, &old_map)], &new_map, &v2, None);
         let step = StepExpected {
             name: "v1-v2".into(),
             flags: "o2".into(),

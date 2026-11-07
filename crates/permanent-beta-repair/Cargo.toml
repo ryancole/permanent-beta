@@ -9,3 +9,6 @@ publish.workspace = true
 [dependencies]
 permanent-beta-model.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

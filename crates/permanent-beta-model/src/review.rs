@@ -1,5 +1,6 @@
 //! Review queue items and the decisions reviewers make on them (design §9.1: ReviewItem, ReviewDecision).
 
+use crate::hook::PrototypeProposal;
 use crate::ids::{BuildId, Rva};
 use crate::mapping::{Mapping, VerificationReport};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,9 @@ pub struct ReviewItem {
     pub reason: ReviewReason,
     pub detail: String,
     pub candidates: Vec<VerificationReport>,
+    /// Prototype proposals for candidates whose parameters seem to have changed. Suggestions only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposals: Vec<PrototypeProposal>,
     #[serde(default)]
     pub status: ReviewStatus,
 }

@@ -278,8 +278,12 @@ callers, callees, constants and imports. Failures always count, so evidence can'
 A `BehavioralRunner` replays recorded tests (§7.3) against the new build and returns pass, fail or inconclusive.
 The default is `NoBehavioralCorpus`, which always returns inconclusive. `TraceDiffRunner` (implemented, M4) judges a
 candidate from two scenario traces: the calls a detour at the old RVA saw in the old run must equal the calls a
-detour at the candidate's RVA saw in the new run. It's inconclusive when either side has no hook there, and fails
-on any difference or a crashed run. `pbeta repair --old-trace --new-trace` uses it.
+detour at the candidate's RVA saw in the new run. Traces are matched to builds by their `start` event, so the old
+trace is always a run of the candidate's own old build (an RVA means nothing in another build). It's inconclusive
+when there's no trace of either build or either side has no hook there, and fails on any difference or a crashed
+run. `pbeta repair --old-trace ... --new-trace` uses it; the new trace is usually a trial run (§7.2), so review
+candidates can be judged too. A behavioral pass is required for high criticality but does not count toward the
+independent structural passes **[Guess]**: a scenario only exercises some inputs.
 
 ### 6.3 Acceptance policy
 
@@ -335,17 +339,37 @@ Each locator is bound to a specific `build`. A repaired manifest re-binds it to 
 | Outcome | Meaning | Output |
 |---|---|---|
 | `unchanged` | Verified, same RVA | Locator re-bound to the new build. |
-| `relocated` | Verified, new RVA | New RVA; planned: a regenerated, minimal-wildcard, uniqueness-checked AOB pattern. |
+| `relocated` | Verified, new RVA | New RVA, and with `--new-binary` a regenerated AOB pattern (below). |
 | `needs_review` | Unmatched, ambiguous, verification failed, insufficient evidence, signature changed, not hookable (the new function is under 5 bytes, a branch targets the patched bytes, or it is only a jump thunk), or stale locator (bound to another build than the one repaired from, e.g. a hook an earlier repair sent to review: its RVA says nothing about the old build) | Review item; the locator stays bound to the old build. |
 
-Planned generators (all output goes to review unless purely mechanical):
+A hook whose locator is still bound to an older build (an earlier repair sent it to review) is repaired from that
+build directly when its analysis is given (`pbeta repair --earlier`), e.g. v1 → v3. Without it, it's a stale
+locator.
 
-- **Offsets header** (`hooks.gen.h`): RVAs and patterns per build, for hook DLLs that use hardcoded tables.
-- **Struct layout adaptation**: when a struct used in the prototype changed, emit updated definitions or field
-  offset constants derived from PDB or Ghidra types. Field correspondence (old field → new field) is itself a
-  mapping with evidence. **[Validate]** feasibility without PDBs.
-- **Prototype adaptation**: added, removed or reordered parameters produce a proposed new typedef and a shim. The
+Generators (all output goes to review unless purely mechanical):
+
+- **AOB patterns** (implemented): a re-bound locator drops its old pattern (it was checked against the old build
+  only). `pbeta repair --new-binary` regenerates one per re-bound hook: the shortest run of whole instructions
+  from the entry, at least 8 bytes **[Guess]**, never past the function, that matches exactly once in the image's
+  executable code. RIP-relative displacements, branches leaving the function and in-image addresses are `??`;
+  everything else stays concrete. Identical code elsewhere means no pattern, never a shorter one that could
+  resolve to the copy. `pbeta pattern <binary> --rva` prints one.
+- **Trial manifests** (implemented): `pbeta repair --trial-out` adds trial bindings (`trial = true`) for hooks in
+  review whose only missing evidence is behavioral (insufficient evidence, no failing check, one patchable
+  candidate) to the repaired manifest. A test run under it gives those candidates their behavioral evidence
+  (§6.2). `repair` refuses a trial manifest as input, and `header` refuses to emit one.
+- **Offsets header** (implemented): `pbeta header --hooks <manifest>... --out hooks.gen.h`: RVAs and patterns per
+  build, for hook DLLs that use hardcoded tables, with a lookup by the executable's SHA-256. A hook without a
+  verified locator for a build has RVA 0 there.
+- **Prototype adaptation** (implemented for added register parameters): when a candidate reads more Win64
+  argument registers than the hook's prototype declares (and the old function didn't), the review item gets a
+  proposed prototype, with each added parameter typed from its register class (`intptr_t` or `double`), and a C++
+  shim: a new detour that stashes the added arguments and calls the existing detour, whose call to the original
+  forwards them. Removed or reordered parameters aren't proposed (inferred arguments are a lower bound). The
   detour body is never rewritten automatically.
+- **Struct layout adaptation** (planned): when a struct used in the prototype changed, emit updated definitions or
+  field offset constants derived from PDB or Ghidra types. Field correspondence (old field → new field) is itself
+  a mapping with evidence. **[Validate]** feasibility without PDBs.
 
 ### 7.3 Behavioral test corpus **[Provisional]**
 
@@ -400,9 +424,10 @@ locator is bound to the running build (by the .exe's SHA-256), so hooks sent to 
 writes a JSON Lines trace (`TraceEvent` in the model): attach and skip records, then one `call` per call with
 arguments and result by value (no pointers, which differ between runs), and `end` on a normal exit.
 `pbeta trace-diff` compares two runs hook by hook. Given the repair report, it also checks that every hook repair
-sent to review was held and every hook not applied was reported. Not yet recorded: memory behind pointers, writes
-and callee sequences (the JSON test cases above), and comparison rules (`compare.ignore`). Each detour logs what
-its prototype makes meaningful, written by hand.
+sent to review was held and every hook not applied was reported. Each hook is compared with the most recent run
+that applied it (`--old` repeatable), so a hook repaired from an older build is checked against that build's run.
+Not yet recorded: memory behind pointers, writes and callee sequences (the JSON test cases above), and comparison
+rules (`compare.ignore`). Each detour logs what its prototype makes meaningful, written by hand.
 
 **Privacy:** recorded memory can contain customer data. Recordings stay local by default, with redaction rules in
 the harness config. **[Validate]** with target customers.
@@ -572,10 +597,14 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
 ```
 pbeta analyze <binary> --out a.json                       # native PE x64 analyzer
 pbeta match   --old a.json --new b.json [--json]
-pbeta repair  --old a.json --new b.json --hooks hooks.toml [--out hooks.new.toml] [--store path]
-              [--old-trace a.jsonl --new-trace b.jsonl] [--json]
-pbeta trace-diff --old a.jsonl --new b.jsonl --hooks hooks.new.toml [--repair report.json] [--json]
+pbeta repair  --old a.json --new b.json --hooks hooks.toml [--earlier older.json]... [--out hooks.new.toml]
+              [--new-binary b.exe] [--trial-out trial.toml] [--store path]
+              [--old-trace a.jsonl... --new-trace b.jsonl] [--json]
+pbeta trace-diff --old a.jsonl [--old older.jsonl]... --new b.jsonl --hooks hooks.new.toml [--repair report.json]
+              [--json]
 pbeta trace-diff --baseline a.jsonl --hooks hooks.toml   # every hook attached and fired
+pbeta pattern <binary> --rva <rva>                        # shortest unique AOB pattern
+pbeta header  --hooks a.toml [--hooks b.toml]... --out hooks.gen.h
 pbeta review  list [--store path] [--all]
 pbeta review  accept <id> --reviewer <name> [--candidate <rva>] [--force] [--note text] [--store path]
 pbeta review  reject <id> --reviewer <name> [--note text] [--store path]
@@ -700,7 +729,7 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | **M1 Spikes** | Native PE x64 analyzer on one real binary; Ghidra headless exporter; `pdb` crate on MSVC PDBs | Both analyzers export the same functions for a sample binary (diff report) |
 | **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression |
-| **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Harness, trace diff and loop done 2026-11-06 (6 of 8 hooks resolved v1 → v2, 4 of 8 v2 → v3, 0 wrong, all applied hooks behave the same); AOB, offsets header and adaptation proposals not started |
+| **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (6 of 8 hooks resolved v1 → v2 and 4 of 8 v2 → v3, including a high-criticality hook through its trial run; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Not built: the recording harness (per-call test cases) and struct-layout proposals |
 | **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus |
 | **M6 Ghidra extension** | Exporter + review UI | Usable by an external tester |
 | Later | Hosted / on-prem history service, IDA plugin, ELF | Driven by §14 validation |
