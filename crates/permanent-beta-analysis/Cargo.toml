@@ -8,8 +8,10 @@ publish.workspace = true
 
 [dependencies]
 permanent-beta-model.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+pdb = "0.8"
 object = { version = "0.36", default-features = false, features = ["std", "read_core", "pe"] }
 sha2 = "0.10"

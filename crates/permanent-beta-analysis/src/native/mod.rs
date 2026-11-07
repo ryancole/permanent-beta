@@ -3,9 +3,9 @@
 //! Reads only what's in the binary: no PDB or map file. (The PDB GUID from the debug directory is recorded so
 //! the matching PDB can be found later, but no symbols are read.) Names come from exports only.
 //!
-//! Known gaps: no PDB names or signatures, no version resource, functions without `.pdata` reached only
-//! through data (vtables, function-pointer tables) aren't found, and `edges` isn't computed. Address-taken
-//! functions (`lea` of code) and chained `.pdata` fragments are handled (see `function`).
+//! Known gaps: no PDB names or signatures (see `crate::symbols`), no version resource, dead code without
+//! `.pdata` isn't found, and `edges` isn't computed. Address-taken functions (`lea` of code), code pointers in
+//! data (base relocations) and chained `.pdata` fragments are handled (see `function`).
 
 mod function;
 mod image;

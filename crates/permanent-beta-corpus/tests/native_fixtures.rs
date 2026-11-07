@@ -172,3 +172,40 @@ fn main_calls_the_fixture_functions() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs corpus/build-fixtures.ps1"]
+fn pdb_names_agree_with_the_answer_key() {
+    use permanent_beta_analysis::symbols;
+    for flags in FLAG_SETS {
+        let b = load(flags);
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/fixtures/basic")
+            .join(flags);
+        let mut old = b.old.clone();
+        let pdb = symbols::read(&dir.join("v1/fixture.pdb")).unwrap();
+        let report = symbols::apply(&mut old, &pdb).unwrap();
+        assert!(report.named > 0, "[{flags}] the PDB named nothing");
+        let mut checked = 0;
+        for e in &b.truth.functions {
+            let (Some(rva), [name]) = (e.old, e.names.as_slice()) else {
+                continue;
+            };
+            let f = old.function(rva).unwrap();
+            assert_eq!(f.name.as_deref(), Some(name.as_str()), "[{flags}] at {rva}");
+            checked += 1;
+        }
+        assert!(checked > 0, "[{flags}] no answer-key function checked");
+
+        // Negative case: v2's PDB is another build's and must be refused for v1.
+        let other = symbols::read(&dir.join("v2/fixture.pdb")).unwrap();
+        let mut fresh = b.old.clone();
+        assert!(symbols::apply(&mut fresh, &other).is_err(), "[{flags}]");
+        assert!(
+            fresh
+                .functions
+                .iter()
+                .all(|f| f.name_source != Some(permanent_beta_model::NameSource::Pdb))
+        );
+    }
+}

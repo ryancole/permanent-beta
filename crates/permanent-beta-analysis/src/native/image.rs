@@ -1,14 +1,16 @@
-//! A loaded PE x64 image: sections by RVA, exception table (`.pdata`), import address table, exports.
+//! A loaded PE x64 image: sections by RVA, exception table (`.pdata`), import address table, exports, and the
+//! code addresses stored in data (from base relocations).
 //!
-//! `object` parses the headers and sections. The exception and import directories are parsed by hand from
-//! section bytes: both are simple fixed-size tables, and this keeps the parsing visible and testable.
+//! `object` parses the headers and sections. The exception, import and base relocation directories are parsed
+//! by hand from section bytes: all are simple tables, and this keeps the parsing visible and testable.
 
 use object::pe::{
-    IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_SCN_MEM_EXECUTE,
+    IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_DIRECTORY_ENTRY_IMPORT,
+    IMAGE_REL_BASED_DIR64, IMAGE_SCN_MEM_EXECUTE,
 };
 use object::read::pe::PeFile64;
 use object::{Architecture, LittleEndian as LE, Object, ObjectSection, SectionFlags};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// `UNW_FLAG_CHAININFO`: this RUNTIME_FUNCTION is a fragment (e.g. split cold code) of another function.
 const UNW_FLAG_CHAININFO: u8 = 0x4;
@@ -44,6 +46,10 @@ pub(crate) struct Image {
     pub exports: Vec<(u32, String)>,
     /// CodeView GUID and age from the debug directory (identifies the matching PDB; no symbols are read).
     pub pdb: Option<(String, u32)>,
+    /// Code addresses (RVAs, sorted, deduplicated) stored as 64-bit pointers in non-executable sections: every
+    /// `DIR64` base relocation whose slot is in data and whose value points into executable code. Function
+    /// tables, vtables, callbacks in initialized structs. Pointers stored in code are left out.
+    pub code_pointers: Vec<u32>,
 }
 
 impl Image {
@@ -99,9 +105,10 @@ impl Image {
                 .map(|d| (d.virtual_address.get(LE), d.size.get(LE)))
                 .filter(|&(rva, size)| rva != 0 && size != 0)
         };
-        let (exception_dir, import_dir) = (
+        let (exception_dir, import_dir, reloc_dir) = (
             dir(IMAGE_DIRECTORY_ENTRY_EXCEPTION),
             dir(IMAGE_DIRECTORY_ENTRY_IMPORT),
+            dir(IMAGE_DIRECTORY_ENTRY_BASERELOC),
         );
 
         let mut image = Image {
@@ -118,6 +125,9 @@ impl Image {
         }
         if let Some((rva, _)) = import_dir {
             image.iat = image.parse_imports(rva);
+        }
+        if let Some((rva, size)) = reloc_dir {
+            image.code_pointers = image.parse_code_pointers(rva, size);
         }
         Ok(image)
     }
@@ -267,6 +277,42 @@ impl Image {
         None
     }
 
+    /// Walk the base relocation table (blocks of: page RVA, block size, then 16-bit entries of type << 12 |
+    /// page offset) and keep the targets of `DIR64` slots in data that point into executable code.
+    fn parse_code_pointers(&self, rva: u32, size: u32) -> Vec<u32> {
+        let mut out = BTreeSet::new();
+        let mut at = rva;
+        let end = rva.saturating_add(size);
+        while at + 8 <= end {
+            let (Some(page), Some(block)) = (self.u32_at(at), self.u32_at(at + 4)) else {
+                break;
+            };
+            if block < 8 {
+                break;
+            }
+            for i in 0..(block - 8) / 2 {
+                let Some(e) = self.bytes(at + 8 + i * 2, 2) else {
+                    break;
+                };
+                let e = u16::from_le_bytes([e[0], e[1]]);
+                if e >> 12 != IMAGE_REL_BASED_DIR64 {
+                    continue;
+                }
+                let slot = page + u32::from(e & 0xfff);
+                if self.is_executable(slot) {
+                    continue;
+                }
+                if let Some(target) = self.u64_at(slot).and_then(|v| self.va_to_rva(v))
+                    && self.is_executable(target)
+                {
+                    out.insert(target);
+                }
+            }
+            at += block;
+        }
+        out.into_iter().collect()
+    }
+
     fn parse_imports(&self, rva: u32) -> HashMap<u32, String> {
         let mut iat = HashMap::new();
         for d in 0.. {
@@ -397,6 +443,67 @@ pub(crate) mod tests {
         // Both entries use plain unwind info: two separate functions.
         let p = chained_image(0x2100).parse_pdata(0x2000, 24);
         assert!(p.iter().all(|r| !r.chained && r.parent.is_none()));
+    }
+
+    /// One relocation block for page 0x2000 holding `entries`, written at 0x2800 of the data section; the
+    /// pointer slots it names are filled from `slots`.
+    fn reloc_image(slots: &[(u32, u64)], entries: &[u16], code_slot: Option<(u32, u64)>) -> Image {
+        let mut data = vec![0u8; 0x900];
+        for &(slot, value) in slots {
+            let at = (slot - 0x2000) as usize;
+            data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let block = 8 + 2 * entries.len() as u32;
+        data[0x800..0x804].copy_from_slice(&0x2000u32.to_le_bytes());
+        data[0x804..0x808].copy_from_slice(&block.to_le_bytes());
+        for (i, e) in entries.iter().enumerate() {
+            data[0x808 + i * 2..0x80a + i * 2].copy_from_slice(&e.to_le_bytes());
+        }
+        let mut code = vec![0xc3u8; 0x100];
+        if let Some((slot, value)) = code_slot {
+            let at = (slot - 0x1000) as usize;
+            code[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        image(&code, &data)
+    }
+
+    const BASE: u64 = 0x1_4000_0000;
+
+    #[test]
+    fn pointers_to_code_in_data_are_found() {
+        let dir64 = |off: u16| (IMAGE_REL_BASED_DIR64 << 12) | off;
+        let img = reloc_image(
+            &[
+                (0x2010, BASE + 0x1040),
+                (0x2018, BASE + 0x1020),
+                (0x2020, BASE + 0x1040),
+            ],
+            &[dir64(0x10), dir64(0x18), dir64(0x20), 0],
+            None,
+        );
+        let block = 8 + 2 * 4;
+        assert_eq!(img.parse_code_pointers(0x2800, block), vec![0x1020, 0x1040]);
+    }
+
+    #[test]
+    fn pointers_to_data_or_stored_in_code_are_not_code_pointers() {
+        // Negative case: a data pointer to data, a non-DIR64 entry, and a code pointer stored in code (an
+        // immediate operand) must not become function starts.
+        let dir64 = |off: u16| (IMAGE_REL_BASED_DIR64 << 12) | off;
+        let highlow = (3u16 << 12) | 0x18;
+        let img = reloc_image(
+            &[(0x2010, BASE + 0x2400), (0x2018, BASE + 0x1040)],
+            &[dir64(0x10), highlow],
+            Some((0x1080, BASE + 0x1040)),
+        );
+        assert!(img.parse_code_pointers(0x2800, 12).is_empty());
+        // The slot in code, named by a block for page 0x1000, is skipped too.
+        let mut img = img;
+        let d = &mut img.sections[1].data;
+        d[0x800..0x804].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[0x804..0x808].copy_from_slice(&10u32.to_le_bytes());
+        d[0x808..0x80a].copy_from_slice(&dir64(0x80).to_le_bytes());
+        assert!(img.parse_code_pointers(0x2800, 10).is_empty());
     }
 
     #[test]

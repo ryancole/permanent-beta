@@ -24,10 +24,12 @@
 
 # 2026-11-07, similarity margin calibrated 0.1 -> 0.05 (pbeta-corpus sweep): /O2 667 and 676, /O2+ICF 653 and 662,
 # /Od 1700 and 1738, 0 wrong.
+# 2026-11-07, function starts from code pointers in data (base relocations; design §4.4): the block-compressor
+# table's functions are found instead of absorbed: /O2 671 and 679, /O2+ICF 657 and 665, /Od unchanged, 0 wrong.
 [gate.min_correct]
-"o2__v1.5.5__v1.5.6" = 667
-"o2__v1.5.6__v1.5.7" = 676
-"o2-icf__v1.5.5__v1.5.6" = 653
-"o2-icf__v1.5.6__v1.5.7" = 662
+"o2__v1.5.5__v1.5.6" = 671
+"o2__v1.5.6__v1.5.7" = 679
+"o2-icf__v1.5.5__v1.5.6" = 657
+"o2-icf__v1.5.6__v1.5.7" = 665
 "od__v1.5.5__v1.5.6" = 1700
 "od__v1.5.6__v1.5.7" = 1738

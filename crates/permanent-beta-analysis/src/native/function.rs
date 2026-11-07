@@ -1,10 +1,12 @@
 //! Function discovery and per-function features.
 //!
 //! Discovery: x64 `.pdata` lists every function that needs unwind info, but MSVC emits none for leaf functions
-//! that don't touch the stack, which is common at /O2. So starts are seeded from `.pdata`, the entry point and
-//! exports, then extended to a fixpoint with direct call/jump targets and RIP-relative `lea` operands (an
+//! that don't touch the stack, which is common at /O2. So starts are seeded from `.pdata`, the entry point,
+//! exports and code pointers stored in data (base relocations: function tables, callbacks in initialized
+//! structs), then extended to a fixpoint with direct call/jump targets and RIP-relative `lea` operands (an
 //! address taken, e.g. a callback) that land in executable code outside any known function. A function without
-//! `.pdata` ends at the next known start (trailing `int3` padding trimmed).
+//! `.pdata` ends at the next known start (trailing `int3` padding trimmed), so a function that no start reaches
+//! is taken into the one before it.
 //!
 //! Chained `.pdata` entries are fragments of another function: at /O2 MSVC splits bodies into chained
 //! fragments (shrink-wrapping), and these hold much of the code. Each fragment belongs to the function its chain
@@ -89,6 +91,15 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
             .iter()
             .map(|e| e.0)
             .filter(|&e| image.is_executable(e)),
+    );
+    // A pointer in data into code outside any .pdata range: a function reached only through a table. Inside a
+    // .pdata range it's a pointer into a known function (or a fragment), not a start.
+    starts.extend(
+        image
+            .code_pointers
+            .iter()
+            .copied()
+            .filter(|&t| !inside_pdata(t)),
     );
 
     loop {
@@ -700,6 +711,45 @@ mod tests {
         // lea into the middle of a .pdata function, or into the lea's own function: not new functions.
         assert_eq!(takes_address(0x1012, true), vec![0x1000, 0x1010]);
         assert_eq!(takes_address(0x1003, false), vec![0x1000]);
+    }
+
+    /// 0x1000 (.pdata 0x1000..0x1010): `xor eax, eax; ret`. 0x1010 and 0x1020: leaves without .pdata, each
+    /// `mov eax, 1; ret`, never called; 0x1020 is in a function table in data (`table_has_0x1020`).
+    fn table_image(code_pointers: Vec<u32>) -> Vec<(u32, u32)> {
+        let mut code = vec![0x33, 0xc0, 0xc3];
+        code.resize(0x10, 0xcc);
+        code.extend([0xb8, 1, 0, 0, 0, 0xc3]);
+        code.resize(0x20, 0xcc);
+        code.extend([0xb8, 1, 0, 0, 0, 0xc3]);
+        code.resize(0x30, 0xcc);
+        let mut img = image(&code, &[]);
+        img.pdata = vec![pdata(0x1000, 0x1010, None)];
+        img.exports = vec![(0x1010, "f".into())];
+        img.code_pointers = code_pointers;
+        discover(&img).iter().map(|r| (r.start, r.end)).collect()
+    }
+
+    #[test]
+    fn a_function_only_in_a_data_table_is_found_not_absorbed() {
+        // Without the table entry, 0x1020 is absorbed: 0x1010 runs to the section's end (zstd's block
+        // compressor table, design §4.4).
+        assert_eq!(
+            table_image(vec![]),
+            vec![(0x1000, 0x1010), (0x1010, 0x1026)]
+        );
+        assert_eq!(
+            table_image(vec![0x1020]),
+            vec![(0x1000, 0x1010), (0x1010, 0x1016), (0x1020, 0x1026)]
+        );
+    }
+
+    #[test]
+    fn a_data_pointer_into_a_pdata_function_is_not_a_start() {
+        // Negative case: a pointer into the middle of a function with exact .pdata bounds must not split it.
+        assert_eq!(
+            table_image(vec![0x1002]),
+            vec![(0x1000, 0x1010), (0x1010, 0x1026)]
+        );
     }
 
     fn analyze(code: &[u8]) -> FunctionFeatures {

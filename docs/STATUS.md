@@ -4,7 +4,17 @@ M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (de
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **widening the AI measurement** (design §8). /Od and deleted functions measured: 54 of 56 proposals
+Latest work: **M1 spikes, PDB and diff** (design §4.4). `pbeta analyze --pdb` adds PDB names and signatures
+(refused for another build's PDB; folded entries stay unnamed), and `pbeta analysis-diff` compares two analyses of
+one build. The first diff report, native vs PDB on every corpus variant: no hash or name disagreement; native
+finds the import thunks the PDB has no symbol for; it misses functions reached only through data (function
+tables, dead code), and where such a function has no `.pdata` the previous function **absorbs** it (zstd /O2's
+`ZSTD_writeLastEmptyBlock`: 147 bytes natively, 29 in the PDB). **Fixed:** function starts now also come from
+code pointers in data (base relocations). Every /O2 build finds every PDB function; only unreferenced dead code
+at /Od is left. Lua /O2 +10 correct per variant, zstd /O2 +3 to +4, 0 wrong; baselines raised. The Ghidra
+exporter is still to do; Java and Ghidra aren't installed here.
+
+Before that: **widening the AI measurement** (design §8). /Od and deleted functions measured: 54 of 56 proposals
 correct across Lua and zstd, /O2 and /Od; on deleted functions Claude answered `none` except for two near misses;
 no wrong proposal passes verification. The analyzer now hashes import names (analysis schema 2): Lua's `math_*`
 wrappers, which Claude couldn't tell apart, are now matched by the engine itself (+6 to +7 correct per Lua
@@ -51,8 +61,9 @@ What's new:
 
 ## What works
 
-- **`pbeta analyze`** reads PE x64 executables with no symbols: functions from `.pdata`, call targets and
-  address-taken code, with chained `.pdata` fragments merged into their parent; normalized and mnemonic hashes,
+- **`pbeta analyze`** reads PE x64 executables with no symbols: functions from `.pdata`, code pointers in data
+  (base relocations), call targets and address-taken code, with chained `.pdata` fragments merged into their
+  parent; with `--pdb`, names and signatures from the build's PDB; normalized and mnemonic hashes,
   callees in call order, strings, constants, imports, inferred register arguments, and entry hookability.
 - **`pbeta trace-diff`** (design §7.3, scenario trace diff): compares two runs' traces hook by hook (missed,
   different or failed calls, crashes, review hooks applied or silently skipped). `pbeta repair --old-trace
@@ -81,8 +92,8 @@ What's new:
   pass's precision and recall.
   - Purpose-built fixture `basic` (`corpus/fixtures`): 3 flag sets.
   - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 159 of 163.
-  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 716–722 of ~735, /Od 1086–1092 of ~1095.
-  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 667–676 of ~729 (/O2+ICF 653–662), /Od 1700–1738 of ~1879.
+  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 726–732 of ~735, /Od 1086–1092 of ~1095.
+  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 671–679 of ~729 (/O2+ICF 657–665), /Od 1700–1738 of ~1879.
   - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations,
     with trial runs, patterns, the header and proposed shims checked.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score`, `pwsh corpus/build-projects.ps1 -Score` and
@@ -94,7 +105,7 @@ What's new:
 | Goal | State |
 |---|---|
 | 1. Find the new location | Done; measured on zlib, Lua and zstd |
-| 2. Verify it's the same function | Done for symbol-less binaries; PDB signatures not read |
+| 2. Verify it's the same function | Done for symbol-less binaries; with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
 | 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim); struct layouts not started |
 | 4. Behavioral tests from the old version | Scenario trace diff and trial runs done (M4); recorded per-call test cases and replay not started |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
@@ -105,6 +116,8 @@ What's new:
 
 ## Suggested next steps
 
+0. **Ghidra headless exporter** (needs a JDK 21 and Ghidra 11.x), diffed against the native analysis with
+   `pbeta analysis-diff`, to close M1.
 1. **Decide whether `pbeta propose` runs as part of `repair`** for unmatched hook targets (proposals into the
    hook's review item, never applied). Optionally describe unmatched callees in the prompt, the lever for zstd's
    `*_noDict_*` family; instruction text wouldn't separate it (design §8).
@@ -131,6 +144,8 @@ What's new:
   per build.
 - Renames in the answer key are declared by hand. zstd lists only the renames the engine matched; an
   undeclared rename shows up as a "wrong" match and must be checked against the sources before declaring it.
+- Dead code without `.pdata` is absorbed into the function before it when nothing marks its start (design §4.4):
+  its code is hashed as part of that function. Seen only at /Od on the corpus.
 - Dead code without `.pdata` (nothing references it) is never discovered: zlib /Od's `compressBound`,
   `get_crc_table`, `zlibVersion`, `zError`.
 - Once one copy in a group of identical code is resolved, the hash pass can pair the remaining copies by

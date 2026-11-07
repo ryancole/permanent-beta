@@ -3,8 +3,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use permanent_beta_analysis::{
-    Analyzer, export,
+    Analyzer, diff, export,
     native::{NativePeAnalyzer, pattern::PatternIndex},
+    symbols,
 };
 use permanent_beta_engine::Engine;
 use permanent_beta_engine::permanent_beta_repair::{HookRepair, RepairAction};
@@ -38,11 +39,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Analyze a binary into the normalized AnalysisExport JSON (native analyzer: not implemented yet).
+    /// Analyze a PE x64 binary into the normalized AnalysisExport JSON (native analyzer).
     Analyze {
         binary: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// The build's PDB: add its function names and signatures. Refused unless its GUID and age match the
+        /// binary's debug directory. Boundaries and hashes stay the native analyzer's.
+        #[arg(long)]
+        pdb: Option<PathBuf>,
+        /// With --pdb, also write the PDB's procedures (entry, length, name, signature) as an analysis, for
+        /// comparing function boundaries with `pbeta analysis-diff`.
+        #[arg(long, requires = "pdb")]
+        pdb_functions: Option<PathBuf>,
+    },
+    /// Compare two analyses of the same build: functions only one found, different sizes, hashes or names.
+    /// Exit code 1 if they disagree at all.
+    AnalysisDiff {
+        a: PathBuf,
+        b: PathBuf,
+        /// Print the full report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// List at most this many functions per kind of disagreement (text output).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Match functions between two analysis exports and verify each candidate.
     Match {
@@ -233,11 +254,13 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<u8> {
     match cli.command {
-        Command::Analyze { binary, out } => {
-            let analysis = NativePeAnalyzer.analyze(&binary)?;
-            export::save(&analysis, &out)?;
-            Ok(EXIT_OK)
-        }
+        Command::Analyze {
+            binary,
+            out,
+            pdb,
+            pdb_functions,
+        } => cmd_analyze(&binary, &out, pdb.as_deref(), pdb_functions.as_deref()),
+        Command::AnalysisDiff { a, b, json, limit } => cmd_analysis_diff(&a, &b, json, limit),
         Command::Match { old, new, json } => cmd_match(&old, &new, json),
         Command::Repair {
             old,
@@ -667,6 +690,120 @@ fn cmd_propose(a: ProposeArgs) -> Result<u8> {
     } else {
         EXIT_NEEDS_REVIEW
     })
+}
+
+fn cmd_analyze(
+    binary: &Path,
+    out: &Path,
+    pdb: Option<&Path>,
+    pdb_functions: Option<&Path>,
+) -> Result<u8> {
+    let mut analysis = NativePeAnalyzer.analyze(binary)?;
+    if let Some(pdb) = pdb {
+        let symbols = symbols::read(pdb)?;
+        let report = symbols::apply(&mut analysis, &symbols)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", pdb.display()))?;
+        eprintln!(
+            "PDB: {} entries; named {}, signed {}, {} folded (left unnamed), {} not found by the native analyzer",
+            report.pdb_entries,
+            report.named,
+            report.signed,
+            report.ambiguous,
+            report.not_in_analysis
+        );
+        if let Some(path) = pdb_functions {
+            export::save(&symbols::procedures_export(&analysis.build, &symbols), path)?;
+        }
+    }
+    export::save(&analysis, out)?;
+    Ok(EXIT_OK)
+}
+
+fn cmd_analysis_diff(a: &Path, b: &Path, json: bool, limit: usize) -> Result<u8> {
+    let d = diff::diff(&export::load(a)?, &export::load(b)?);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&d)?);
+    } else {
+        print_analysis_diff(&d, limit);
+    }
+    Ok(if d.is_clean() {
+        EXIT_OK
+    } else {
+        EXIT_NEEDS_REVIEW
+    })
+}
+
+fn print_analysis_diff(d: &diff::AnalysisDiff, limit: usize) {
+    println!("a: {} ({} functions)", d.a_producer, d.a_functions);
+    println!("b: {} ({} functions)", d.b_producer, d.b_functions);
+    if d.different_builds {
+        println!(
+            "DIFFERENT BUILDS: RVAs aren't comparable; the rest of this report is meaningless"
+        );
+    }
+    println!(
+        "agree {} · only a {} · only b {} · size differs {} · hash differs {} · name differs {}",
+        d.agreeing,
+        d.only_a.len(),
+        d.only_b.len(),
+        d.size_differs.len(),
+        d.hash_differs.len(),
+        d.name_differs.len()
+    );
+    let name = |n: &Option<String>| n.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
+    let section = |title: &str, lines: Vec<String>| {
+        if lines.is_empty() {
+            return;
+        }
+        println!(
+            "
+{title}:"
+        );
+        for l in lines.iter().take(limit) {
+            println!("  {l}");
+        }
+        if lines.len() > limit {
+            println!("  ... {} more (--limit, --json)", lines.len() - limit);
+        }
+    };
+    let unpaired = |u: &diff::Unpaired| {
+        let inside = u
+            .inside
+            .map(|r| format!(", inside the other's {r}"))
+            .unwrap_or_default();
+        format!("{}{} ({} bytes{inside})", u.rva, name(&u.name), u.size)
+    };
+    section("only in a", d.only_a.iter().map(unpaired).collect());
+    section("only in b", d.only_b.iter().map(unpaired).collect());
+    section(
+        "size differs",
+        d.size_differs
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}{}: {} vs {} bytes",
+                    s.rva,
+                    name(&s.name),
+                    s.a_size,
+                    s.b_size
+                )
+            })
+            .collect(),
+    );
+    section(
+        "hash differs",
+        d.hash_differs
+            .iter()
+            .map(|h| format!("{}{}: {:?}", h.rva, name(&h.name), h.kind))
+            .collect(),
+    );
+    section(
+        "name differs",
+        d.name_differs
+            .iter()
+            .map(|n| format!("{}: {} vs {}", n.rva, n.a_name, n.b_name))
+            .collect(),
+    );
 }
 
 fn cmd_pattern(binary: &Path, rva: Rva) -> Result<u8> {
