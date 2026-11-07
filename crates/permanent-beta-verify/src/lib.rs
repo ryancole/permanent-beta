@@ -213,8 +213,14 @@ impl Verifier {
             .filter(|c| c.outcome == CheckOutcome::Pass && c.counted)
             .count();
 
-        let behavioral = self.behavioral.run(ctx, candidate, old, new);
+        // A behavioral pass is independent of every structural check and of the candidate's evidence, so it
+        // counts as one independent pass, except where policy requires it on top of the structural passes
+        // (high criticality): there it's a requirement, not a substitute for structural evidence.
+        let mut behavioral = self.behavioral.run(ctx, candidate, old, new);
+        behavioral.counted = !policy.require_behavioral_pass;
         let behavioral_outcome = behavioral.outcome;
+        let passes =
+            passes + usize::from(behavioral.counted && behavioral_outcome == CheckOutcome::Pass);
         checks.push(behavioral);
 
         let verdict = decide(fails, passes, behavioral_outcome, policy);
@@ -656,6 +662,99 @@ mod tests {
             Criticality::High,
         );
         assert_eq!(r.verdict, Verdict::NeedsReview);
+    }
+
+    /// A behavioral runner that always reports `outcome`.
+    struct Fixed(CheckOutcome);
+
+    impl BehavioralRunner for Fixed {
+        fn run(
+            &self,
+            _: &VerifyContext,
+            _: &Candidate,
+            _: &FunctionFeatures,
+            _: &FunctionFeatures,
+        ) -> CheckResult {
+            CheckResult::new("behavioral", self.0, "fixed")
+        }
+    }
+
+    fn verify_with(
+        behavioral: CheckOutcome,
+        c: &Candidate,
+        o: &FunctionFeatures,
+        n: &FunctionFeatures,
+        crit: Criticality,
+    ) -> VerificationReport {
+        Verifier::with_behavioral(Box::new(Fixed(behavioral))).verify(
+            &VerifyContext::default(),
+            c,
+            o,
+            n,
+            Policy::for_criticality(crit),
+        )
+    }
+
+    #[test]
+    fn a_behavioral_pass_counts_as_one_independent_pass_below_high() {
+        // A hash match of a leaf with no strings: no independent structural pass at all.
+        let f = func(0x10, 100, &[], None);
+        let c = cand(0x10, 0x10, evidence_kind::NORMALIZED_HASH);
+        assert_eq!(
+            verify(&c, &f, &f, Criticality::Normal).verdict,
+            Verdict::NeedsReview
+        );
+
+        let r = verify_with(CheckOutcome::Pass, &c, &f, &f, Criticality::Normal);
+        assert_eq!(r.verdict, Verdict::Accepted);
+        let b = r.checks.iter().find(|c| c.check == "behavioral").unwrap();
+        assert!(b.counted);
+        assert_eq!(
+            verify_with(CheckOutcome::Pass, &c, &f, &f, Criticality::Low).verdict,
+            Verdict::Accepted
+        );
+
+        // Negative: inconclusive or failing behavior gives nothing (a failure still sends to review).
+        assert_eq!(
+            verify_with(CheckOutcome::Inconclusive, &c, &f, &f, Criticality::Normal).verdict,
+            Verdict::NeedsReview
+        );
+        let mut strong = func(0x10, 100, &["a"], Some(2));
+        strong.constants = vec![0x1234_5678];
+        let named = cand(0x10, 0x10, evidence_kind::NAME);
+        assert_eq!(
+            verify(&named, &strong, &strong, Criticality::Normal).verdict,
+            Verdict::Accepted
+        );
+        assert_eq!(
+            verify_with(
+                CheckOutcome::Fail,
+                &named,
+                &strong,
+                &strong,
+                Criticality::Normal
+            )
+            .verdict,
+            Verdict::NeedsReview
+        );
+    }
+
+    #[test]
+    fn at_high_criticality_a_behavioral_pass_does_not_replace_structural_passes() {
+        // One structural pass (strings) plus a behavioral pass: high needs two structural passes.
+        let f = func(0x10, 100, &["a"], None);
+        let c = cand(0x10, 0x10, evidence_kind::NAME);
+        let r = verify_with(CheckOutcome::Pass, &c, &f, &f, Criticality::High);
+        assert_eq!(r.verdict, Verdict::NeedsReview);
+        let b = r.checks.iter().find(|c| c.check == "behavioral").unwrap();
+        assert!(!b.counted, "at high it's a requirement, not a counted pass");
+
+        // Two structural passes (strings, parameter count) plus the behavioral pass: accepted.
+        let f = func(0x10, 100, &["a"], Some(2));
+        assert_eq!(
+            verify_with(CheckOutcome::Pass, &c, &f, &f, Criticality::High).verdict,
+            Verdict::Accepted
+        );
     }
 
     #[test]

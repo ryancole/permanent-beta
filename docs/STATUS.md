@@ -12,9 +12,9 @@ Latest work: finishing M4 (`corpus/build-hooks.ps1 -Run`, `corpus/hooks/README.m
 | `price_lookup`, `stock_level`, `format_receipt` | relocated, same trace | relocated (/Od: some unchanged), same trace |
 | `order_add` (high criticality) | relocated after its trial run, same trace | same |
 | `checksum` | relocated, same trace | review: ambiguous (identical `checksum_backup` added) |
-| `ship_order` | relocated, same trace | review: insufficient evidence; its trial passed |
+| `ship_order` | relocated, same trace | relocated after its trial run (no independent structural evidence), same trace |
 | `log_event` | review (parameter added), with a prototype proposal and a shim that compiles | repaired from v1: same review, same proposal |
-| `apply_discount` | review (body rewritten): insufficient evidence at /O2 (trial passed), unmatched at /Od | repaired from v1: same |
+| `apply_discount` | /O2: unchanged after its trial run (body rewritten, same results); /Od: review (unmatched) | /O2: unchanged after its trial; /Od: repaired from v1, still unmatched |
 
 What's new:
 
@@ -29,6 +29,9 @@ What's new:
 - **Offsets header** (`pbeta header`): `hooks.gen.h` from the manifests; compiles as C and C++.
 - **Prototype proposals**: added register parameters (typed from the register class the analyzer now records,
   `inferred_arg_classes`) with a shim that keeps the existing detour unchanged.
+- **Policy:** a behavioral pass now counts as one independent pass for low and normal criticality (design §6.3);
+  high still needs 2 structural passes plus the behavioral pass. That resolves `apply_discount` (/O2) and
+  `ship_order` (v2 → v3) through their trial runs, both correct per the answer key; hook-loop baselines raised.
 - The ambiguity message no longer calls a single, unconfirmed candidate "equally plausible".
 - CI's hook-loop step failed on the previous commit although the loop passed: the negative control's last exit
   code (1, by design) leaked out of the script. It now exits 0 explicitly.
@@ -78,17 +81,14 @@ What's new:
 
 ## Suggested next steps
 
-1. **Decide whether a behavioral pass should count as independent evidence** (design §6.3, [Guess]). Today it's
-   required for high criticality but never counts toward the structural passes, so `apply_discount` and
-   `ship_order` pass their trials, are correct per the answer key, and still wait in review.
-2. **MCP server** (design §11.2): list and explain review items (now with proposals), propose mappings into
+1. **MCP server** (design §11.2): list and explain review items (now with proposals), propose mappings into
    verification. Agents can't accept; decisions stay with `pbeta review` (or the UI later).
-3. **Calibrate the similarity thresholds** (score 0.75, margin 0.1, size 16, weights; all [Guess]) from the
+2. **Calibrate the similarity thresholds** (score 0.75, margin 0.1, size 16, weights; all [Guess]) from the
    corpus: score distributions of correct vs ambiguous pairs. Fixture S3–S5 at /O2 are still unmatched.
-4. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.
-5. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
+3. **Corpus breadth:** a C++ project (vtables, which discovery can't see yet), `/LTCG` and PGO flag sets.
+4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
    proposals; both lean on PDB or Ghidra types.
-6. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
+5. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 
 ## Known rough edges
 

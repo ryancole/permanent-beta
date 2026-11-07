@@ -79,9 +79,10 @@ failure.
   being adapted (design §7.2).
 - A hook sent to review stays bound to its old build. Later steps repair it from that build when its analysis is
   given (`--earlier`), and report it as `stale_locator` otherwise.
-- A behavioral pass is required for high criticality but doesn't count toward the independent structural passes
-  (design §6.3). So trials resolve `order_add` (high, with 3 independent passes), while `apply_discount` and
-  `ship_order` pass their trials and stay in review: correctly matched, but with no independent structural
-  evidence.
+- A behavioral pass counts as one independent pass for normal hooks, but at high criticality it's required on
+  top of 2 structural passes (design §6.3). So trials resolve `apply_discount` (/O2) and `ship_order` (v2 → v3),
+  which have no independent structural evidence, and `order_add` (high, with 3 independent structural passes).
+  A wrong candidate that happens to behave the same in the one scenario would also pass a normal hook's trial;
+  the answer key would catch it here, but nothing does in production.
 - A trial run binds unverified candidates. One that crashes the app fails the behavioral check of every
   candidate in that run (the run didn't complete), which holds the step's hooks for review: safe, but noisy.

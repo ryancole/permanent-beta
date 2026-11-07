@@ -282,8 +282,7 @@ detour at the candidate's RVA saw in the new run. Traces are matched to builds b
 trace is always a run of the candidate's own old build (an RVA means nothing in another build). It's inconclusive
 when there's no trace of either build or either side has no hook there, and fails on any difference or a crashed
 run. `pbeta repair --old-trace ... --new-trace` uses it; the new trace is usually a trial run (§7.2), so review
-candidates can be judged too. A behavioral pass is required for high criticality but does not count toward the
-independent structural passes **[Guess]**: a scenario only exercises some inputs.
+candidates can be judged too. How a behavioral pass counts toward acceptance is part of the policy (§6.3).
 
 ### 6.3 Acceptance policy
 
@@ -299,6 +298,13 @@ All three numbers are **[Guess]**. Normal was 2 when every passing check counted
 size check stopped counting, 2 *independent* passes made a correctly matched leaf function with no strings
 impossible to accept. Now a unique match plus one independent check (typically callers) is enough, and the corpus
 gate guards it. Low may drop to 0 once calibrated.
+
+A behavioral pass (decided 2026-11-07) is independent of every structural check and of the candidate's evidence,
+so for low and normal it counts as one independent pass: a correctly matched function with no independent
+structural evidence (a rewritten leaf, or a hash match with no strings) is accepted once its scenario trace
+matches. For high it does not count: high still needs 2 independent *structural* passes, and the behavioral pass
+on top. A scenario only exercises some inputs, so for the hooks that matter most it confirms the structure rather
+than replacing it. **[Guess]**, like the numbers above. A behavioral failure always sends to review.
 
 Verdict rules (implemented):
 
@@ -729,7 +735,7 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | **M1 Spikes** | Native PE x64 analyzer on one real binary; Ghidra headless exporter; `pdb` crate on MSVC PDBs | Both analyzers export the same functions for a sample binary (diff report) |
 | **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression |
-| **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (6 of 8 hooks resolved v1 → v2 and 4 of 8 v2 → v3, including a high-criticality hook through its trial run; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Not built: the recording harness (per-call test cases) and struct-layout proposals |
+| **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (at /O2 7 of 8 hooks resolved v1 → v2 and 6 of 8 v2 → v3, at /Od 6 and 5, including a high-criticality hook and two hooks without structural evidence through their trial runs; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Not built: the recording harness (per-call test cases) and struct-layout proposals |
 | **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus |
 | **M6 Ghidra extension** | Exporter + review UI | Usable by an external tester |
 | Later | Hosted / on-prem history service, IDA plugin, ELF | Driven by §14 validation |

@@ -4,41 +4,40 @@
 # applied hook (pbeta trace-diff). Per step and flag set:
 #   min_resolved  hooks re-bound to the new build, all correctly. Raise it when the engine resolves more.
 #   held          hooks that must stay in review, never applied: a changed signature (log_event gains a
-#                 parameter in v2), identical code (checksum and checksum_backup in v3), and a rewritten body
-#                 (apply_discount; v2-v3 repairs it from v1, its own build).
+#                 parameter in v2), identical code (checksum and checksum_backup in v3), and at /Od a rewritten
+#                 body with no candidate (apply_discount; v2-v3 repairs it from v1, its own build).
 #
-# order_add is high criticality: it's only resolved when its trial run gives it a behavioral pass, so
+# A passing behavioral check counts as one independent pass below high criticality (design §6.3). order_add is
+# high: it's resolved only when its trial run passes and it has 2 independent structural passes. apply_discount
+# (/O2) and ship_order (v2-v3) have no independent structural pass and are resolved by their trial runs. So
 # min_resolved also gates the trial runs.
 #
 # Hooks resolved today (2026-11-07):
-#   v1-v2: price_lookup, stock_level, order_add (after its trial), format_receipt, checksum, ship_order. Review:
-#          log_event (an unconfirmed candidate at /O2, verification failed at /Od; both with a prototype
-#          proposal), apply_discount (rewritten body: insufficient evidence after a passing trial at /O2,
-#          unmatched at /Od).
-#   v2-v3: price_lookup, stock_level, order_add (after its trial), format_receipt. Review: checksum (ambiguous),
-#          ship_order (body edited: insufficient evidence after a passing trial), and, repaired v1 -> v3 from
-#          their own build, log_event and apply_discount with the same reasons as in v1-v2.
+#   v1-v2 /O2: all but log_event (an unconfirmed candidate, with a prototype proposal). /Od: all but log_event
+#              (verification failed, with a proposal) and apply_discount (rewritten body: unmatched).
+#   v2-v3 /O2: all but checksum (ambiguous) and log_event (repaired from v1: same review). /Od: also not
+#              apply_discount (repaired from v1: unmatched).
 
 [[step]]
 name = "v1-v2"
 flags = "o2"
-min_resolved = 6
+min_resolved = 7
 held = ["log_event"]
 
 [[step]]
 name = "v2-v3"
 flags = "o2"
-min_resolved = 4
-held = ["log_event", "apply_discount", "checksum"]
+min_resolved = 6
+held = ["log_event", "checksum"]
 
 [[step]]
 name = "v1-v2"
 flags = "od"
 min_resolved = 6
-held = ["log_event"]
+held = ["log_event", "apply_discount"]
 
 [[step]]
 name = "v2-v3"
 flags = "od"
-min_resolved = 4
+min_resolved = 5
 held = ["log_event", "apply_discount", "checksum"]
