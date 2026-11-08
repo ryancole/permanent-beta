@@ -4,7 +4,14 @@
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **struct layout proposals and the AI proposer in repair** (design §7.2, §8).
+Latest work: **unmatched callees in the AI prompt, measured and not adopted** (design §8). Sketching
+each function's unmatched callees (size, top mnemonics, strings, constants) gained 5 correct answers over 182
+questions but went from 2 wrong to 6 wrong, 2 of which would pass verification: Claude started picking inside
+zstd's near-identical `noDict_*` family, wrongly, where it used to say `none`. The prompt is unchanged. The
+current prompt was remeasured after tonight's matching changes and its answers recorded: /O2 37 of 38 correct,
+/Od 38 of 39, deleted functions 11 of 12 `none`, no wrong proposal passing the policy.
+
+Before that: **struct layout proposals and the AI proposer in repair** (design §7.2, §8).
 - `pbeta analyze --pdb` now records the layouts of the structs signatures use (`types`). When a struct a hook's
   prototype names changed layout, the hook goes to review (`struct_layout_changed`) with the field changes, the
   new definition and `offsetof` constants with `static_assert`s. Fields correspond by name. On the `basic`
@@ -209,8 +216,9 @@ What's new:
 
 ## Suggested next steps
 
-1. **AI prompt context:** describe unmatched callees in the prompt, the lever for zstd's `*_noDict_*` family
-   (design §8); measure with `pbeta-corpus score-ai`.
+1. **zstd's `noDict_*` family stays with review:** prompt context made the AI guess wrongly inside it (design
+   §8). If anything, matching could separate `_0`/`_1` by which unmatched new callee (`ZSTD_match4Found_cmov` /
+   `_branch`) gets matched first; the AI shouldn't.
 2. **Swapped inlining (zstd under /LTCG and PGO):** when the compiler keeps a different one of two related
    functions out of line in each build, decide what the right answer even is (the survivor does the old one's
    work) and how to detect it: e.g. the new function's callees include the old function's callees *and* its

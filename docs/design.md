@@ -651,8 +651,28 @@ wrappers differed only in which import thunk they call (`sin`, `cos`, ...), and 
 normalized hash, so none matched and the calls showed as `unmatched`. The normalized hash now covers the imported
 name (analysis schema 2), the thunks match, and matching resolves the wrappers itself (+6 to +7 correct per Lua
 variant, 0 wrong). zstd's `ZSTD_compressBlock_fast_noDict_*_0/_1` differ only in calling the new
-`ZSTD_match4Found_cmov` or `_branch`, inlined in the old build; describing unmatched callees would be the lever
-there, not instruction text.
+`ZSTD_match4Found_cmov` or `_branch`, inlined in the old build; describing unmatched callees looked like the
+lever there.
+
+**Unmatched callees in the prompt: measured, not adopted (2026-11-07).** Each function's unmatched callees (at
+most 4) were sketched in the prompt: size, top 8 mnemonics, a few strings, constants and imports, with a
+sentence in the system prompt about inlined code. Same questions both arms, after tonight's matching changes
+(Lua and zstd, /O2 and /Od, 40 per variant; deleted functions on the fixture and zstd):
+
+| Set | Prompt | Asked | Correct | Wrong | Wrong passing policy | Precision |
+|---|---|---|---|---|---|---|
+| /O2 | current | 91 | 37 | 1 | 0 | 97.4% |
+| /O2 | + unmatched callees | 91 | 38 | 4 | **2** | 90.5% |
+| /Od | current | 91 | 38 | 1 | 0 | 97.4% |
+| /Od | + unmatched callees | 91 | 42 | 2 | 0 | 95.5% |
+| Deleted | current | 12 | 0 | 1 | 0 | 11 right `none`s |
+| Deleted | + unmatched callees | 12 | 0 | 2 | 0 | 10 right `none`s |
+
+The sketches made Claude choose inside the very family they were for, and choose wrong: `noDict_5_1` and
+`noDict_7_1` got a sibling instantiation, and `ZSTD_cwksp_aligned_alloc_size` its neighbour. Two of the wrong
+answers would pass verification. Five more correct answers don't pay for that, so the prompt is unchanged. The
+current prompt's answers on these questions are recorded in `corpus/ai/claude-opus-5-5.jsonl` and replay offline
+(the table's first rows); the sketch arm's answers are kept in the log too, as the experiment's raw data.
 
 ---
 
