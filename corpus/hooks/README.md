@@ -71,6 +71,33 @@ at that address now.
 The script prints a per-hook table (repair outcome and trace-diff outcome for each step) and exits 1 on any
 failure.
 
+## Recorded test cases (`-Replay`)
+
+```bash
+pwsh corpus/build-hooks.ps1 -Run -Replay
+```
+
+Design §7.3, replay by emulation. Needs pbeta built with the `emulator` feature (Unicorn): CMake, Ninja and
+libclang, found by `corpus/lib/emulator.ps1` (see `third_party/README.md`). On top of the checks above:
+
+1. **Record:** v1 (after its baseline) and v2 (after its step) run once more under the hook DLL's record mode:
+   `PBETA_RECORD` (the recording directory, `target/hooks/<flags>/<version>/rec`) and `PBETA_SPEC` (from
+   `pbeta harness-spec` on the version's manifest and its `--pdb` analysis). `hookdll/record_thunk.asm` is the
+   generic thunk: it captures the argument registers and stack, the DLL the memory behind pointers before and
+   after the call, one JSON case per distinct call.
+2. **Decide with them:** the decision step also gets `--cases` for every older version's recording. A replay
+   failure would send the hook to review (and fail the step's expectations).
+3. **Replay every resolved hook:** `pbeta replay` with the older recordings on the hook's new RVA. All resolved hooks
+   are correct (the answer key), so none may fail; inconclusive is allowed. The script prints how many replayed.
+4. **Negative control:** v1's `price_lookup` cases replayed on the function the swapped manifest gives it
+   (`stock_level`'s), and the reverse, must fail.
+
+Which hooks replay: the leaf functions (`price_lookup`, `stock_level`, `apply_discount`, `checksum`) and
+`order_add` (its `Order` struct is recorded with its PDB layout). Those that print are inconclusive: `printf`
+family code reads the CRT's options global, and `log_event` also updates `g_events`.
+
+Recordings can contain the app's data. They stay under `target/`.
+
 ## Limits
 
 - One scripted scenario: a hook is only checked on the calls this run makes. A wrong target with identical

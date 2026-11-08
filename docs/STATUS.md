@@ -1,10 +1,37 @@
-# Status — where we left off (2026-11-07)
+# Status — where we left off (2026-11-08)
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
-(repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
-corpus variant, 0 wrong relocations in the hook loop.
+(repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
+the hook loop.
 
-Latest work: **unmatched callees in the AI prompt, measured and not adopted** (design §8). Sketching
+Latest work: **the recording harness: per-call test cases, replayed by emulation** (design §7.3, goal 4).
+- `pbeta harness-spec` writes a record spec from the hook manifest, the prototypes and the build's PDB struct
+  layouts: per argument its Win64 slot, value class and width, and what a pointer points to (a struct of N bytes,
+  a C string, a buffer sized by the next argument [Guess], or nothing).
+- The hook DLL's record mode (`PBETA_RECORD`, `PBETA_SPEC`) attaches a generic MASM thunk per hook: argument
+  registers and stack, the memory behind pointers before and after the call, rax/xmm0. One JSON case per distinct
+  call (model `TestCase`), memory as `sha256:` blobs, 32 per hook at most.
+- New crate `permanent-beta-replay` (model only; engine and CLI depend on it): maps the new build in Unicorn, places
+  the recorded memory, runs the candidate until it returns, compares the return value and the writes. An import
+  call, a read of a writable section (globals), uncaptured memory, an interrupt or no return is inconclusive, never
+  a pass. Changed struct layouts are translated by field name; a field that doesn't map is inconclusive.
+- `RecordedCasesRunner` (engine): pass if every replayable case matches, fail if any differs, inconclusive if none
+  replays. `pbeta repair --cases <dir> --new-binary` (with traces too, a failure of either fails) and
+  `pbeta replay`.
+- **Measured** on the hook loop (`corpus/build-hooks.ps1 -Run -Replay`, now in CI): v1 and v2 recorded, the
+  decisions given the recordings, every resolved hook replayed. **16 of 24** resolved hook repairs replay, all
+  passing (`price_lookup`, `stock_level`, `apply_discount` at /O2, `checksum`, `order_add` with its `Order`
+  struct, 20 of 21 cases). `format_receipt` and `ship_order` are inconclusive (the CRT's inline `snprintf` reads a
+  global). Repair outcomes and traces are unchanged. The swapped negative control fails replay both ways, at /O2
+  and /Od.
+- **Unicorn is GPL-2.0**, so it's the optional `emulator` feature, off by default (a default build has no GPL
+  code; a `pbeta` built with it is GPL-2.0; design §11.5). Building it needs CMake, Ninja and libclang
+  (`corpus/lib/emulator.ps1`), and a patched copy of `unicorn-engine-sys` 2.1.5 in `third_party/` (a hard link
+  instead of a symlink, so it builds without Windows Developer Mode).
+- Gates before and after: identical scorecards, 0 wrong everywhere (fixtures, zlib, Lua, zstd, TinyXML-2, yaml-cpp, the
+  hook loop). Lua `o2-pgo` 5.4.7 → 5.4.8 scored 838 before (an interrupted rebuild) and its 839 baseline after.
+
+Before that: **unmatched callees in the AI prompt, measured and not adopted** (design §8). Sketching
 each function's unmatched callees (size, top mnemonics, strings, constants) gained 5 correct answers over 182
 questions but went from 2 wrong to 6 wrong, 2 of which would pass verification: Claude started picking inside
 zstd's near-identical `noDict_*` family, wrongly, where it used to say `none`. The prompt is unchanged. The
@@ -160,6 +187,9 @@ What's new:
   (base relocations), call targets, address-taken code and code after `int3` padding, with chained `.pdata` fragments merged into their
   parent; with `--pdb`, names and signatures from the build's PDB; normalized and mnemonic hashes,
   callees in call order, strings, constants, imports, inferred register arguments, and entry hookability.
+- **Recorded test cases** (design §7.3): `pbeta harness-spec` (record spec), the hook DLL's record mode
+  (`corpus/hooks/hookdll`, MASM thunk), `pbeta replay` and `pbeta repair --cases` (replay by emulation,
+  `permanent-beta-replay`, feature `emulator`).
 - **`pbeta trace-diff`** (design §7.3, scenario trace diff): compares two runs' traces hook by hook (missed,
   different or failed calls, crashes, review hooks applied or silently skipped). `pbeta repair --old-trace
   --new-trace` adds the same evidence to verification (`TraceDiffRunner`).
@@ -206,7 +236,7 @@ What's new:
 | 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2 and yaml-cpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
 | 2. Verify it's the same function | Done for symbol-less binaries, including C++ vtable slots (code-tables check); with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
 | 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim) and for changed struct layouts (PDB types: changes, new definition, offsets) |
-| 4. Behavioral tests from the old version | Scenario trace diff and trial runs done (M4); recorded per-call test cases and replay not started |
+| 4. Behavioral tests from the old version | Done: scenario trace diff and trial runs (M4), and recorded per-call test cases replayed by emulation, with struct layouts translated by field name; on the hook loop 16 of 24 resolved hook repairs replay, all passing |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
 | Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; UI extension (M6) not started |
@@ -226,11 +256,20 @@ What's new:
 3. **Calibrate the C++ guesses:** the table-slot anchor count, the code-tables fail threshold and the wrapper
    callers threshold are single-project guesses; recheck them with `pbeta-corpus sweep`-style grids once a third
    C++ project exists.
-4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3), which can now use the
-   PDB struct layouts to type recorded memory. Struct proposals without a PDB (Ghidra types) are open.
-5. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
+4. **Widen replay** (§7.3): the CRT's printf options global makes every printing hook inconclusive; recording
+   the globals a function reads (the spec could list them from the PDB) would make them replayable. Also
+   pointers inside structs (depth > 1), callee sequences, and a real target with a changed struct to measure
+   layout translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
+5. **License decision** now has Unicorn (GPL-2.0) in it: an Apache-2.0 `pbeta` with replay needs the emulator out
+   of process or a permissive one (design §11.5).
+6. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 
 ## Known rough edges
+
+- Replay is inconclusive for any function that reads a writable global, which includes everything that calls the
+  CRT's inline `printf` family. The record spec's `sized` buffers are guessed from parameter names. The thunk forwards
+  at most 8 stack arguments and doesn't support variadic functions. The emulator build needs CMake, Ninja and
+  libclang; without the `emulator` feature every case is inconclusive (pbeta says so).
 
 - The hook manifest needs the build's SHA-256 typed in by hand (`pbeta analyze` prints it in its JSON);
   `pbeta-corpus hook-manifest` does it for the corpus only.

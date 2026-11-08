@@ -566,8 +566,51 @@ arguments and result by value (no pointers, which differ between runs), and `end
 `pbeta trace-diff` compares two runs hook by hook. Given the repair report, it also checks that every hook repair
 sent to review was held and every hook not applied was reported. Each hook is compared with the most recent run
 that applied it (`--old` repeatable), so a hook repaired from an older build is checked against that build's run.
-Not yet recorded: memory behind pointers, writes and callee sequences (the JSON test cases above), and comparison
-rules (`compare.ignore`). Each detour logs what its prototype makes meaningful, written by hand.
+Each detour logs what its prototype makes meaningful, written by hand.
+
+**Implemented (2026-11-08): recorded test cases, replayed by emulation (option 1).**
+
+- *Record spec* (`pbeta harness-spec --hooks --analysis`): per hook bound to the build, from its prototype and the
+  build's PDB struct layouts (`pbeta analyze --pdb`): each parameter's Win64 slot (`rcx`…`r9`, `xmm0`–`xmm3`,
+  `stack+0x28`…), its value class and width (`int:4`, `float:8`, `pointer:8`), and what a pointer points to: a
+  struct with a layout or a scalar (`fixed`, that many bytes), `char*` (`cstring`), a byte pointer directly followed
+  by an integer named like a length (`sized`, **[Guess]**), or nothing. TOML, meant to be read and edited.
+- *Recorder* (the hook DLL's record mode, `PBETA_RECORD` + `PBETA_SPEC`): a generic MASM thunk
+  (`corpus/hooks/hookdll/record_thunk.asm`) saves the argument registers and up to 8 stack arguments, the DLL
+  captures each pointer's memory (unreadable memory is left out, never a crash), calls the original, captures the
+  same memory again and writes one JSON case per distinct call, at most `max_cases` (32, **[Guess]**) per hook.
+  The format is `permanent_beta_model::TestCase`: entry registers and stack, `regions` (address, size, layout,
+  `before` and `after` as `sha256:` blobs), and `observed` rax and xmm0. A recording directory holds the spec,
+  `cases/<hook>/` and `blobs/`.
+- *Replay* (`permanent-beta-replay`, Unicorn): the new image mapped clear of the recorded memory (rebased if
+  needed), its IAT pointing at traps, the recorded memory at its recorded addresses, a fresh stack whose return
+  address is a trap. The candidate runs until it returns; the return value (its declared width: an `int` is eax)
+  and every region's bytes after the call must equal the recording. **Inconclusive, never a pass:** a call into an
+  import, a read of a writable image section (mutable globals the recording didn't capture; `__security_cookie`
+  excepted, it's given MSVC's default), a write outside the stack and the recorded memory, a read of memory nobody
+  recorded (except the rest of a 32-byte block that holds recorded bytes, for vectorized over-reads,
+  **[Guess]**), an interrupt or `syscall`, no return within 10M instructions, an unknown return type, nothing to
+  compare, or a pointer returned outside the recorded memory.
+- *Layout translation:* a recorded struct whose layout differs in the new build's PDB is rewritten into the new
+  layout by field name, and only its fields are compared. A field without its counterpart (added, removed, renamed,
+  resized or retyped, a moved bitfield) makes the case inconclusive; so does a struct with no layout for the new
+  build (analyzed without `--pdb`).
+- *Verification:* `RecordedCasesRunner` (§6.2), `pbeta repair --cases <dir> --new-binary`, and `pbeta replay`
+  for one old/new RVA pair.
+
+Measured on the hook loop (`corpus/build-hooks.ps1 -Run -Replay`): v1 and v2 recorded (77 cases of v1 at /O2 and
+/Od, 70–73 of v2), the decision steps given the recordings, every resolved hook replayed on its new RVA. **16 of
+24** resolved hook repairs replay, all passing: `price_lookup`, `stock_level`, `apply_discount` (/O2; its body was
+rewritten in v2, same results), `checksum`, and `order_add` (20 of 21 cases; the "order full" case calls
+`log_event`, which touches `g_events`). `format_receipt` and `ship_order` (which print) are inconclusive: the CRT's
+inline `snprintf` reads its options global. `log_event` stays in review and writes `g_events` anyway. Repair outcomes
+and traces are unchanged from the run without recordings. Negative control: `price_lookup`'s v1 cases replayed on
+`stock_level`'s v2 function fail, and the reverse (both flag sets). The hook app's `Order` never changes layout, so
+translation is covered by unit tests only.
+
+Not recorded: callee sequences, memory behind pointers inside structs (depth 1 only), and comparison rules
+(`compare.ignore`). Variadic functions and more than 8 stack arguments aren't supported by the thunk. Unicorn is
+GPL-2.0 and an optional feature (§11.5).
 
 **Privacy:** recorded memory can contain customer data. Recordings stay local by default, with redaction rules in
 the harness config. **[Validate]** with target customers.
@@ -955,7 +998,9 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
     (CBOR/protobuf) for large traces?
 11. Recording mechanism: own Detours-based harness, Windows Time Travel Debugging (TTD) traces (redistribution and
     licensing **[Validate]**), or DynamoRIO / Frida instrumentation?
-12. Replay mechanism: emulation, live in-process, scenario trace diff, or a combination (§7.3)?
+12. Replay mechanism: emulation, live in-process, scenario trace diff, or a combination (§7.3)? (Decided
+    2026-11-08: scenario trace diff and emulation with Unicorn, both implemented; live in-process not built.
+    Recording uses the own Detours harness, question 11.)
 13. Reuse existing behavioral-diffing research (e.g. blanket execution / BLEX-style approaches, differential
     tracing)? Needs a literature and tool survey. **[Validate]**
 
@@ -987,7 +1032,7 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | **M1 Spikes** (done 2026-11-07) | Native PE x64 analyzer on one real binary; Ghidra headless exporter; `pdb` crate on MSVC PDBs | Both analyzers export the same functions for a sample binary (diff report). Native analyzer, `pdb` crate (names and signatures), Ghidra headless exporter (§4.3) and `pbeta analysis-diff`, with a three-way diff report (native, Ghidra, PDB) on the newest tag of every corpus project and flag set (§4.4). Native stays the source of boundaries |
 | **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture. Since grown (2026-11-07) to five projects (+ TinyXML-2 and yaml-cpp, C++) and five flag sets (+ /LTCG and PGO; zstd not under those two): 50 variants, 0 wrong |
 | **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression. Done 2026-11-07 apart from the SQLite store (deferred until history size or the hosted service needs it) |
-| **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (at /O2 7 of 8 hooks resolved v1 → v2 and 6 of 8 v2 → v3, at /Od 6 and 5, including a high-criticality hook and two hooks without structural evidence through their trial runs; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Struct-layout proposals added 2026-11-07 (PDB types; checked on the `basic` fixture). Not built: the recording harness (per-call test cases) |
+| **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (at /O2 7 of 8 hooks resolved v1 → v2 and 6 of 8 v2 → v3, at /Od 6 and 5, including a high-criticality hook and two hooks without structural evidence through their trial runs; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Struct-layout proposals added 2026-11-07 (PDB types; checked on the `basic` fixture). Recording harness added 2026-11-08 (per-call test cases recorded by the hook DLL, replayed by emulation: 16 of 24 resolved hook repairs replay, all passing; the swapped negative control fails replay; §7.3) |
 | **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus. MCP server, review explanations, the proposer (`pbeta propose`) and its corpus scoring (`pbeta-corpus score-ai`) built 2026-11-07, first measured on Lua and zstd /O2: 31 of 32 proposals correct, the wrong one not passing verification (§8). `pbeta repair --propose` added 2026-11-07; latest measurement 75 of 77 proposals correct (/O2 and /Od), no wrong one passing verification |
 | **M6 Ghidra extension** | Exporter + review UI | Usable by an external tester |
 | Later | Hosted / on-prem history service, IDA plugin, ELF | Driven by §14 validation |
