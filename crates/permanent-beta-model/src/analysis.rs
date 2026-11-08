@@ -20,6 +20,42 @@ pub struct AnalysisExport {
     /// change the schema version; an export without it just gives table-based matching nothing to use.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_tables: Vec<CodeTable>,
+    /// Layouts of the structs, classes and unions that function signatures use (from a PDB: `pbeta analyze
+    /// --pdb`), for adapting hooks when a layout changes (design §7.2). Optional, so adding it didn't change the
+    /// schema version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<TypeLayout>,
+}
+
+impl AnalysisExport {
+    pub fn type_layout(&self, name: &str) -> Option<&TypeLayout> {
+        self.types.iter().find(|t| t.name == name)
+    }
+}
+
+/// A struct, class or union as laid out in one build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeLayout {
+    /// As the PDB names it, e.g. `Config` or `tinyxml2::XMLNode`.
+    pub name: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub union: bool,
+    /// Data members and base classes, in declaration order.
+    pub fields: Vec<FieldLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldLayout {
+    /// The member's name; a base class is `<base Name>`, the vtable pointer `<vfptr>`.
+    pub name: String,
+    pub offset: u64,
+    pub size: u64,
+    /// A C-like type name, e.g. `int`, `int[8]`, `struct Order*`.
+    pub ty: String,
+    /// Bit position and width, for a bitfield.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<(u8, u8)>,
 }
 
 /// A run of at least two consecutive 64-bit pointers in a non-executable section, each a relocated pointer to a

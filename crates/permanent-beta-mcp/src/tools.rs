@@ -318,6 +318,7 @@ fn list_review_items(args: &Value, queue: &dyn ReviewQueue) -> Result<Value> {
                     "verdict": c.verdict,
                 })).collect::<Vec<_>>(),
                 "proposals": i.proposals.len(),
+                "struct_proposals": i.struct_proposals.len(),
             }))
             .collect::<Vec<_>>()
     ))
@@ -404,6 +405,16 @@ pub fn explain(item: &ReviewItem, decisions: &[ReviewDecision]) -> String {
             p.candidate, p.prototype, p.basis
         ));
     }
+    for p in &item.struct_proposals {
+        out.push(format!(
+            "Struct {} changed layout ({:#x} -> {:#x} bytes): {}. New layout:\n{}",
+            p.name,
+            p.old_size,
+            p.new_size,
+            p.changes.join("; "),
+            p.definition
+        ));
+    }
     for d in decisions {
         let what = match &d.action {
             DecisionAction::Accept { new } => format!("accepted {new}"),
@@ -452,6 +463,10 @@ fn reason_text(r: ReviewReason) -> &'static str {
         }
         ReviewReason::AiProposal => {
             "proposed by an AI; it went through verification, and a human decides."
+        }
+        ReviewReason::StructLayoutChanged => {
+            "matched, but a struct the hook's prototype uses changed layout; the detour may read the wrong \
+             fields. The item lists the changes and the new offsets."
         }
     }
 }

@@ -66,3 +66,23 @@ pub struct PrototypeProposal {
     /// function forwards them.
     pub shim: String,
 }
+
+/// A struct the hook's prototype uses whose layout differs between the builds (design §7.2, struct layout
+/// adaptation), from both builds' PDB types. Text for a reviewer: nothing applies it, and the detour is never
+/// rewritten. Fields correspond by name, the PDB being the evidence; without layouts on both sides there's no
+/// proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructLayoutProposal {
+    /// The struct's name, e.g. `Config`.
+    #[serde(rename = "struct")]
+    pub name: String,
+    pub old_size: u64,
+    pub new_size: u64,
+    /// What changed, one line per field, e.g. `b: offset 0x4 -> 0x8`.
+    pub changes: Vec<String>,
+    /// The new layout as a C definition, each field's offset in a comment.
+    pub definition: String,
+    /// `offsetof` constants for the new layout, with `static_assert`s a detour built against the new header can
+    /// keep, for code that reads fields by offset.
+    pub offsets: String,
+}

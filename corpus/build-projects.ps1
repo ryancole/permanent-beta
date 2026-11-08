@@ -94,7 +94,15 @@ function Build-Version($recipe, [string] $tag, [string] $flagName) {
     if (-not (Get-ChildItem "$out\$exe!*.pgc" -ErrorAction SilentlyContinue)) {
         throw "$($recipe.Name) ${tag}: the training run left no profile (.pgc)"
     }
-    Invoke-Native 'link.exe' ($link + @("/USEPROFILE:PGD=$pgd"))
+    # The executable the training just ran can stay locked for a moment after it exits (seen once: LNK1104,
+    # most likely an antivirus scan of the new binary). Retry that error only, a few times.
+    for ($attempt = 1; ; $attempt++) {
+        & link.exe @($link + @("/USEPROFILE:PGD=$pgd"))
+        if ($LASTEXITCODE -eq 0) { break }
+        if ($LASTEXITCODE -ne 1104 -or $attempt -ge 5) { throw "link.exe failed with exit code $LASTEXITCODE" }
+        Write-Host "link.exe: $exe.exe is still locked (LNK1104); retrying in 2 s"
+        Start-Sleep -Seconds 2
+    }
 }
 
 # Run the recipe's `Train` workload against the instrumented build in $out. Each step: `Args` for the program

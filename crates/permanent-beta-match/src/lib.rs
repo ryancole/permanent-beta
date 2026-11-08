@@ -1624,6 +1624,7 @@ mod tests {
             },
             functions,
             code_tables: Vec::new(),
+            types: Vec::new(),
         }
     }
 

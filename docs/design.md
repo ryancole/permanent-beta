@@ -494,9 +494,15 @@ Generators (all output goes to review unless purely mechanical):
   shim: a new detour that stashes the added arguments and calls the existing detour, whose call to the original
   forwards them. Removed or reordered parameters aren't proposed (inferred arguments are a lower bound). The
   detour body is never rewritten automatically.
-- **Struct layout adaptation** (planned): when a struct used in the prototype changed, emit updated definitions or
-  field offset constants derived from PDB or Ghidra types. Field correspondence (old field → new field) is itself
-  a mapping with evidence. **[Validate]** feasibility without PDBs.
+- **Struct layout adaptation** (implemented 2026-11-07, PDB types): `pbeta analyze --pdb` records the layouts
+  (size; each field's name, offset, size, type and bitfield position) of the structs, classes and unions that
+  function signatures use, and of the structs inside them by value, as the export's `types`. When a struct the
+  hook's prototype names (`const Config* c` → `Config`) differs between the builds, the hook goes to review
+  (`struct_layout_changed`; a verified match stays the item's candidate, no mapping is recorded) with what
+  changed, the new C definition with offsets, and `offsetof` constants with `static_assert`s for the detour.
+  Fields correspond **by name**, the PDB being the evidence: a renamed field shows as removed plus added, never as
+  a guess. A hook already in review gets the proposal attached. No layouts on both sides (no PDB) means no
+  proposal. **[Validate]** feasibility without PDBs (Ghidra types).
 
 ### 7.3 Behavioral test corpus **[Provisional]**
 
@@ -596,7 +602,10 @@ Design points:
 - **Backend:** Claude through the Claude Code CLI in print mode (`claude -p --json-schema`), which runs on a Claude
   subscription; default model `claude-opus-5-5`. All tools, MCP servers and settings are off and it runs in an
   empty directory, so a reply can only be text. This is a remote provider: `pbeta propose` refuses to call it
-  without `--allow-remote`, and every exchange, prompt and reply, is appended to a log (`--log`). The same log
+  without `--allow-remote`, and every exchange, prompt and reply, is appended to a log (`--log`). `pbeta repair
+  --propose` (same switches) asks it about every hook matching left with no candidate (`unmatched`), from the
+  hook's own source build; each verified proposal is attached to that hook's review item as a candidate, the hook
+  stays in review, and a pair a reviewer rejected isn't attached again. The same log
   replays answers (`--replay`), which keeps corpus scores repeatable. A local OpenAI-compatible backend is not
   built yet (the `Model` trait is the seam).
 - **Routing:** every proposal is verified with `Engine::verify_candidate` (same checks and policy) and queued as an
@@ -796,6 +805,7 @@ pbeta trace-diff --old a.jsonl [--old older.jsonl]... --new b.jsonl --hooks hook
 pbeta trace-diff --baseline a.jsonl --hooks hooks.toml   # every hook attached and fired
 pbeta pattern <binary> --rva <rva>                        # shortest unique AOB pattern
 pbeta header  --hooks a.toml [--hooks b.toml]... --out hooks.gen.h
+pbeta repair  ... --propose (--allow-remote | --replay)  # also ask the AI proposer about unmatched hooks
 pbeta propose --old a.json --new b.json [--store path] [--rva <rva>]... [--limit n] [--model id]
               (--allow-remote | --replay) [--log path] [--json]     # AI proposals into review (§8)
 pbeta review  list [--store path] [--all]

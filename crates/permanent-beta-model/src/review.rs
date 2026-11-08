@@ -1,6 +1,6 @@
 //! Review queue items and the decisions reviewers make on them (design §9.1: ReviewItem, ReviewDecision).
 
-use crate::hook::PrototypeProposal;
+use crate::hook::{PrototypeProposal, StructLayoutProposal};
 use crate::ids::{BuildId, Rva};
 use crate::mapping::{Mapping, VerificationReport};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,9 @@ pub enum ReviewReason {
     StaleLocator,
     /// Proposed by an AI proposer and awaiting a human.
     AiProposal,
+    /// Matched and verified, but a struct the hook's prototype uses changed layout (PDB types): the detour may
+    /// read the wrong fields.
+    StructLayoutChanged,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +53,9 @@ pub struct ReviewItem {
     /// Prototype proposals for candidates whose parameters seem to have changed. Suggestions only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposals: Vec<PrototypeProposal>,
+    /// Structs the hook's prototype uses whose layout changed. Suggestions only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub struct_proposals: Vec<StructLayoutProposal>,
     #[serde(default)]
     pub status: ReviewStatus,
 }

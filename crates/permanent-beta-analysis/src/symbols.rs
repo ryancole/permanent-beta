@@ -15,8 +15,8 @@
 use crate::AnalysisError;
 use pdb::{FallibleIterator, TypeData, TypeFinder, TypeIndex};
 use permanent_beta_model::{
-    ANALYSIS_SCHEMA_VERSION, AnalysisExport, BuildInfo, FunctionFeatures, FunctionSignature,
-    NameSource, Param, Producer, Rva,
+    ANALYSIS_SCHEMA_VERSION, AnalysisExport, BuildInfo, FieldLayout, FunctionFeatures,
+    FunctionSignature, NameSource, Param, Producer, Rva, TypeLayout,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -36,6 +36,9 @@ pub struct PdbSymbols {
     pub age: u32,
     /// Procedures by entry RVA. More than one at an entry means folded (ICF) code.
     pub procedures: BTreeMap<Rva, Vec<PdbProcedure>>,
+    /// Layouts of the structs, classes and unions the procedures' signatures use (and of the structs inside
+    /// them by value), sorted by name.
+    pub types: Vec<TypeLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,9 +87,21 @@ pub fn read(path: &Path) -> Result<PdbSymbols, AnalysisError> {
     let type_info = pdb.type_information().map_err(err)?;
     let mut finder = type_info.finder();
     let mut types = type_info.iter();
-    while types.next().map_err(err)?.is_some() {
+    let mut definitions = Definitions::new();
+    while let Some(item) = types.next().map_err(err)? {
         finder.update(&types);
+        let name = match item.parse() {
+            Ok(TypeData::Class(c)) if !c.properties.forward_reference() => {
+                c.name.to_string().into_owned()
+            }
+            Ok(TypeData::Union(u)) if !u.properties.forward_reference() => {
+                u.name.to_string().into_owned()
+            }
+            _ => continue,
+        };
+        definitions.entry(name).or_insert(item.index());
     }
+    let mut used_types: Vec<String> = Vec::new();
 
     let mut procedures: BTreeMap<Rva, Vec<PdbProcedure>> = BTreeMap::new();
     let mut modules = dbi.modules().map_err(err)?;
@@ -104,6 +119,7 @@ pub fn read(path: &Path) -> Result<PdbSymbols, AnalysisError> {
                 continue;
             };
             let rva = Rva(u64::from(rva.0));
+            used_types.extend(udts_of_procedure(&finder, p.type_index));
             let procedure = PdbProcedure {
                 rva,
                 len: p.len,
@@ -118,10 +134,14 @@ pub fn read(path: &Path) -> Result<PdbSymbols, AnalysisError> {
             }
         }
     }
+    used_types.sort();
+    used_types.dedup();
+    let types = layouts(&finder, &definitions, used_types);
     Ok(PdbSymbols {
         guid,
         age,
         procedures,
+        types,
     })
 }
 
@@ -172,6 +192,7 @@ pub fn apply(export: &mut AnalysisExport, symbols: &PdbSymbols) -> Result<ApplyR
         }
     }
     report.not_in_analysis = symbols.procedures.len() - seen;
+    export.types = symbols.types.clone();
     Ok(report)
 }
 
@@ -218,6 +239,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
         },
         functions,
         code_tables: Vec::new(),
+        types: Vec::new(),
     }
 }
 
@@ -261,6 +283,196 @@ fn signature(finder: &TypeFinder<'_>, index: TypeIndex) -> Option<FunctionSignat
         return_type: return_type.map(|t| type_name(finder, t, 0)),
         params,
     })
+}
+
+/// How many levels of by-value members are followed from a struct a signature uses (a struct inside a struct).
+const MAX_NESTED_LAYOUTS: u32 = 3;
+
+/// Full (non-forward) definitions of named structs, classes and unions, by name. The first definition of a
+/// name wins; a forward reference has no fields and is resolved through this.
+type Definitions = BTreeMap<String, TypeIndex>;
+
+/// Struct, class and union names a procedure type uses, through pointers, references, modifiers and arrays.
+fn udts_of_procedure(finder: &TypeFinder<'_>, index: TypeIndex) -> Vec<String> {
+    let Some(data) = finder.find(index).ok().and_then(|t| t.parse().ok()) else {
+        return Vec::new();
+    };
+    let (ret, args, this) = match data {
+        TypeData::Procedure(p) => (p.return_type, p.argument_list, None),
+        TypeData::MemberFunction(m) => (Some(m.return_type), m.argument_list, m.this_pointer_type),
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut roots: Vec<TypeIndex> = ret.into_iter().chain(this).collect();
+    if let Some(TypeData::ArgumentList(list)) = finder.find(args).ok().and_then(|t| t.parse().ok())
+    {
+        roots.extend(list.arguments);
+    }
+    for r in roots {
+        if let Some(name) = udt_behind(finder, r, 0) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The struct, class or union a type is, or points to.
+fn udt_behind(finder: &TypeFinder<'_>, index: TypeIndex, depth: u32) -> Option<String> {
+    if depth > MAX_TYPE_DEPTH {
+        return None;
+    }
+    match finder.find(index).ok()?.parse().ok()? {
+        TypeData::Class(c) => Some(c.name.to_string().into_owned()),
+        TypeData::Union(u) => Some(u.name.to_string().into_owned()),
+        TypeData::Pointer(p) => udt_behind(finder, p.underlying_type, depth + 1),
+        TypeData::Modifier(m) => udt_behind(finder, m.underlying_type, depth + 1),
+        TypeData::Array(a) => udt_behind(finder, a.element_type, depth + 1),
+        _ => None,
+    }
+}
+
+/// A type's size in bytes, resolving forward references by name. 0 when unknown.
+fn type_size(finder: &TypeFinder<'_>, defs: &Definitions, index: TypeIndex, depth: u32) -> u64 {
+    if depth > MAX_TYPE_DEPTH {
+        return 0;
+    }
+    let Some(data) = finder.find(index).ok().and_then(|t| t.parse().ok()) else {
+        return 0;
+    };
+    let by_name = |name: &str| {
+        defs.get(name)
+            .filter(|&&d| d != index)
+            .map_or(0, |&d| type_size(finder, defs, d, depth + 1))
+    };
+    match data {
+        TypeData::Primitive(p) if p.indirection.is_some() => 8,
+        TypeData::Primitive(p) => primitive_size(p.kind),
+        TypeData::Pointer(p) => u64::from(p.attributes.size()),
+        TypeData::Modifier(m) => type_size(finder, defs, m.underlying_type, depth + 1),
+        TypeData::Class(c) if c.properties.forward_reference() => by_name(&c.name.to_string()),
+        TypeData::Class(c) => c.size,
+        TypeData::Union(u) if u.properties.forward_reference() => by_name(&u.name.to_string()),
+        TypeData::Union(u) => u.size,
+        TypeData::Enumeration(e) => type_size(finder, defs, e.underlying_type, depth + 1),
+        // CodeView array dimensions are in bytes; the last is the whole array.
+        TypeData::Array(a) => a.dimensions.last().copied().map_or(0, u64::from),
+        TypeData::Bitfield(b) => type_size(finder, defs, b.underlying_type, depth + 1),
+        _ => 0,
+    }
+}
+
+fn primitive_size(kind: pdb::PrimitiveKind) -> u64 {
+    use pdb::PrimitiveKind as K;
+    match kind {
+        K::Char | K::RChar | K::UChar | K::I8 | K::U8 | K::Bool8 => 1,
+        K::WChar | K::RChar16 | K::Short | K::UShort | K::I16 | K::U16 | K::Bool16 => 2,
+        K::RChar32 | K::Long | K::ULong | K::I32 | K::U32 | K::F32 | K::Bool32 | K::HRESULT => 4,
+        K::Quad | K::UQuad | K::I64 | K::U64 | K::F64 | K::Bool64 => 8,
+        K::F80 => 10,
+        K::Octa | K::UOcta | K::I128 | K::U128 | K::F128 => 16,
+        _ => 0,
+    }
+}
+
+/// The layout of the full definition at `index`, and the struct types its by-value members use.
+fn layout(
+    finder: &TypeFinder<'_>,
+    defs: &Definitions,
+    index: TypeIndex,
+) -> Option<(TypeLayout, Vec<String>)> {
+    let (name, size, union, mut list) = match finder.find(index).ok()?.parse().ok()? {
+        TypeData::Class(c) => (c.name.to_string().into_owned(), c.size, false, c.fields),
+        TypeData::Union(u) => (
+            u.name.to_string().into_owned(),
+            u.size,
+            true,
+            Some(u.fields),
+        ),
+        _ => return None,
+    };
+    let mut fields = Vec::new();
+    let mut nested = Vec::new();
+    while let Some(at) = list.take() {
+        let Some(TypeData::FieldList(fl)) = finder.find(at).ok().and_then(|t| t.parse().ok())
+        else {
+            break;
+        };
+        for f in fl.fields {
+            match f {
+                TypeData::Member(m) => {
+                    let bits = match finder.find(m.field_type).ok().and_then(|t| t.parse().ok()) {
+                        Some(TypeData::Bitfield(b)) => Some((b.position, b.length)),
+                        _ => None,
+                    };
+                    if let Some(TypeData::Class(_) | TypeData::Union(_)) =
+                        finder.find(m.field_type).ok().and_then(|t| t.parse().ok())
+                    {
+                        nested.extend(udt_behind(finder, m.field_type, 0));
+                    }
+                    fields.push(FieldLayout {
+                        name: m.name.to_string().into_owned(),
+                        offset: m.offset,
+                        size: type_size(finder, defs, m.field_type, 0),
+                        ty: type_name(finder, m.field_type, 0),
+                        bits,
+                    });
+                }
+                TypeData::BaseClass(b) => {
+                    let base = type_name(finder, b.base_class, 0);
+                    nested.extend(udt_behind(finder, b.base_class, 0));
+                    fields.push(FieldLayout {
+                        name: format!("<base {}>", base.trim_start_matches("struct ")),
+                        offset: u64::from(b.offset),
+                        size: type_size(finder, defs, b.base_class, 0),
+                        ty: base,
+                        bits: None,
+                    });
+                }
+                TypeData::VirtualFunctionTablePointer(_) => fields.push(FieldLayout {
+                    name: "<vfptr>".into(),
+                    offset: 0,
+                    size: 8,
+                    ty: "void**".into(),
+                    bits: None,
+                }),
+                _ => {}
+            }
+        }
+        list = fl.continuation;
+    }
+    Some((
+        TypeLayout {
+            name,
+            size,
+            union,
+            fields,
+        },
+        nested,
+    ))
+}
+
+/// Layouts of the structs the procedures' signatures use, and of their by-value members' structs, sorted by
+/// name. Names without a full definition in this PDB are left out.
+fn layouts(finder: &TypeFinder<'_>, defs: &Definitions, roots: Vec<String>) -> Vec<TypeLayout> {
+    let mut done: BTreeMap<String, TypeLayout> = BTreeMap::new();
+    let mut level: Vec<String> = roots;
+    for _ in 0..=MAX_NESTED_LAYOUTS {
+        let mut next = Vec::new();
+        for name in level {
+            if done.contains_key(&name) {
+                continue;
+            }
+            let Some(&index) = defs.get(&name) else {
+                continue;
+            };
+            if let Some((l, nested)) = layout(finder, defs, index) {
+                next.extend(nested);
+                done.insert(name, l);
+            }
+        }
+        level = next;
+    }
+    done.into_values().collect()
 }
 
 /// CodeView `CV_call_e`. On x64 every convention but `__vectorcall` is the same ABI; the name is recorded as
@@ -371,6 +583,7 @@ mod tests {
                 guid: String::new(),
                 age: 0,
                 procedures: BTreeMap::new(),
+                types: Vec::new(),
             },
         );
         e.functions = rvas
@@ -410,6 +623,7 @@ mod tests {
             guid: "AAAAAAAA-0000-0000-0000-000000000001".into(),
             age: 3,
             procedures,
+            types: Vec::new(),
         }
     }
 

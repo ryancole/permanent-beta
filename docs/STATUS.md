@@ -4,7 +4,18 @@
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **/LTCG and PGO flag sets** (`o2-ltcg`: /GL + /LTCG; `o2-pgo`: built instrumented, run on each
+Latest work: **struct layout proposals and the AI proposer in repair** (design §7.2, §8).
+- `pbeta analyze --pdb` now records the layouts of the structs signatures use (`types`). When a struct a hook's
+  prototype names changed layout, the hook goes to review (`struct_layout_changed`) with the field changes, the
+  new definition and `offsetof` constants with `static_assert`s. Fields correspond by name. On the `basic`
+  fixture's S5 (`Config` gains a field before `b`) the hook on `pb_struct_reader` gets `b: offset 0x4 -> 0x8` on
+  every flag set; a hook whose struct didn't change is repaired as before (corpus tests, run in CI).
+- `pbeta repair --propose` (`--allow-remote` or `--replay`, every exchange logged) asks the AI proposer about
+  hooks matching left `unmatched` and attaches each verified proposal to the hook's review item. It never becomes
+  the target or a mapping, and a pair a reviewer rejected isn't attached again. Not yet run against the live
+  model on the hook loop.
+
+Before that: **/LTCG and PGO flag sets** (`o2-ltcg`: /GL + /LTCG; `o2-pgo`: built instrumented, run on each
 recipe's `Train` workload, relinked with the profile). 0 wrong on every new variant scored: zlib, Lua, TinyXML-2,
 yaml-cpp and the `basic` fixture (/LTCG only; it has no training workload). /LTCG inlines across objects, so
 fewer functions survive (zlib 51 vs 69 at /O2); PGO splits hot and cold code. New in similarity: a pair is held
@@ -182,9 +193,9 @@ What's new:
 
 | Goal | State |
 |---|---|
-| 1. Find the new location | Done; measured on zlib, Lua and zstd |
+| 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2 and yaml-cpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
 | 2. Verify it's the same function | Done for symbol-less binaries; with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
-| 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim); struct layouts not started |
+| 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim) and for changed struct layouts (PDB types: changes, new definition, offsets) |
 | 4. Behavioral tests from the old version | Scenario trace diff and trial runs done (M4); recorded per-call test cases and replay not started |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
@@ -195,9 +206,8 @@ What's new:
 
 ## Suggested next steps
 
-1. **Decide whether `pbeta propose` runs as part of `repair`** for unmatched hook targets (proposals into the
-   hook's review item, never applied). Optionally describe unmatched callees in the prompt, the lever for zstd's
-   `*_noDict_*` family; instruction text wouldn't separate it (design §8).
+1. **Measure `repair --propose` live** on the hook loop's unmatched hooks (`apply_discount` at /Od), and
+   optionally describe unmatched callees in the prompt, the lever for zstd's `*_noDict_*` family (design §8).
 2. **Swapped inlining (zstd under /LTCG and PGO):** when the compiler keeps a different one of two related
    functions out of line in each build, decide what the right answer even is (the survivor does the old one's
    work) and how to detect it: e.g. the new function's callees include the old function's callees *and* its
@@ -205,8 +215,8 @@ What's new:
 3. **Calibrate the C++ guesses:** the table-slot anchor count, the code-tables fail threshold and the wrapper
    callers threshold are single-project guesses; recheck them with `pbeta-corpus sweep`-style grids once a third
    C++ project exists.
-4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
-   proposals; both lean on PDB or Ghidra types.
+4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3), which can now use the
+   PDB struct layouts to type recorded memory. Struct proposals without a PDB (Ghidra types) are open.
 5. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 
 ## Known rough edges

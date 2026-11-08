@@ -6,11 +6,11 @@ use permanent_beta_match::{MatchOutcome, Matcher, default_matchers, run_passes};
 use permanent_beta_model::{
     Ambiguity, AnalysisExport, BuildId, Candidate, CandidateSource, Criticality, Decider, Evidence,
     FunctionFeatures, HookManifest, HookSpec, Mapping, MappingStatus, PriorDecisions, ReviewItem,
-    Rva, VerificationReport,
+    ReviewReason, Rva, VerificationReport,
 };
 use permanent_beta_repair::{
-    HookRepair, RepairAction, decide, from_review, prototype, review_items, rewrite_manifest,
-    stale_locator,
+    HookRepair, RepairAction, decide, from_review, layout, prototype, review_items,
+    rewrite_manifest, stale_locator,
 };
 use permanent_beta_verify::{BehavioralRunner, Policy, Verifier, VerifyContext};
 use serde::Serialize;
@@ -50,6 +50,44 @@ pub struct RepairReport {
 impl RepairReport {
     pub fn needs_review(&self) -> bool {
         !self.review_items.is_empty()
+    }
+
+    /// Attach verified outside proposals (the AI proposer, design §8) to a hook that matching left with no
+    /// candidate at all (`unmatched`). They become alternatives in that hook's review item, for a reviewer to
+    /// pick or reject: never the hook's target, never a mapping, and the hook stays in review. Proposals for
+    /// another old function are dropped. Returns how many were attached; 0 if the hook isn't unmatched.
+    pub fn attach_proposals(&mut self, hook: &str, proposals: Vec<VerificationReport>) -> usize {
+        let Some(r) = self.repairs.iter_mut().find(|r| {
+            r.hook == hook
+                && matches!(
+                    r.action,
+                    RepairAction::NeedsReview {
+                        reason: ReviewReason::Unmatched,
+                        ..
+                    }
+                )
+        }) else {
+            return 0;
+        };
+        let before = r.alternatives.len();
+        for p in proposals {
+            let new = p.candidate.new;
+            if Some(p.candidate.old) == r.old
+                && !r.alternatives.iter().any(|a| a.candidate.new == new)
+            {
+                r.alternatives.push(p);
+            }
+        }
+        let added = r.alternatives.len() - before;
+        if added > 0 {
+            if let RepairAction::NeedsReview { detail, .. } = &mut r.action {
+                detail.push_str(&format!(
+                    "; {added} outside proposal(s) attached for review, never applied"
+                ));
+            }
+            self.review_items = review_items(&self.repairs, &self.from_build, &self.to_build);
+        }
+        added
     }
 }
 
@@ -284,6 +322,34 @@ impl Engine {
                 })
                 .collect();
         }
+        // A struct the prototype uses changed layout (both builds' PDB types, design §7.2): even a verified match
+        // goes to review, since the detour may read the wrong fields. The function match itself still stands
+        // as the review item's candidate; no mapping is recorded until a reviewer accepts it.
+        repair.struct_proposals = layout::propose(hook, pair.old, new);
+        if !repair.struct_proposals.is_empty() {
+            let what: Vec<String> = repair
+                .struct_proposals
+                .iter()
+                .map(|p| format!("{} ({})", p.name, p.changes.join("; ")))
+                .collect();
+            let resolved_at = repair.new_rva();
+            match (&mut repair.action, resolved_at) {
+                (RepairAction::NeedsReview { detail, .. }, _) => {
+                    detail.push_str(&format!("; struct layout changed: {}", what.join(", ")));
+                }
+                (_, Some(at)) => {
+                    repair.action = RepairAction::NeedsReview {
+                        reason: ReviewReason::StructLayoutChanged,
+                        detail: format!(
+                            "matched {at}, but a struct the hook uses changed layout: {}; the detour may read \
+                             the wrong fields",
+                            what.join(", ")
+                        ),
+                    };
+                }
+                _ => {}
+            }
+        }
         repair
     }
 
@@ -406,6 +472,7 @@ mod tests {
             },
             functions,
             code_tables: Vec::new(),
+            types: Vec::new(),
         }
     }
 
@@ -632,5 +699,79 @@ mod tests {
             .map(|c| c.candidate.new)
             .collect();
         assert_eq!(news, vec![Rva(0x120)]);
+    }
+
+    fn ai_candidate(old: u64, new: u64) -> Candidate {
+        Candidate {
+            old: Rva(old),
+            new: Rva(new),
+            source: CandidateSource::Ai {
+                model: "claude-opus-5-5".into(),
+            },
+            score: 0.9,
+            evidence: vec![Evidence {
+                kind: permanent_beta_model::evidence_kind::AI.into(),
+                detail: "same role".into(),
+            }],
+        }
+    }
+
+    /// The hook target 0x10 has no counterpart the passes can find.
+    fn unmatched_pair() -> (AnalysisExport, AnalysisExport) {
+        (
+            export("a", vec![func(0x10, "k")]),
+            export("b", vec![func(0x110, "z")]),
+        )
+    }
+
+    #[test]
+    fn an_ai_proposal_is_attached_to_an_unmatched_hooks_review_item_and_never_applied() {
+        let (old, new) = unmatched_pair();
+        let engine = Engine::with_defaults();
+        let mut r = engine.repair(&manifest(), &old, &new);
+        assert!(matches!(
+            r.repairs[0].action,
+            RepairAction::NeedsReview {
+                reason: ReviewReason::Unmatched,
+                ..
+            }
+        ));
+        let v = engine
+            .verify_candidate(&old, &new, &ai_candidate(0x10, 0x110), Criticality::Normal)
+            .unwrap();
+        assert_eq!(r.attach_proposals("H", vec![v]), 1);
+        // Still in review, no mapping, the manifest unchanged; the proposal is a candidate in the review item.
+        assert!(!r.repairs[0].is_resolved());
+        assert!(r.mappings.is_empty());
+        assert_eq!(r.updated_manifest.hooks[0].target.rva, Some(Rva(0x10)));
+        assert_eq!(r.review_items.len(), 1);
+        let item = &r.review_items[0];
+        assert_eq!(item.reason, ReviewReason::Unmatched);
+        assert_eq!(item.candidates.len(), 1);
+        assert_eq!(item.candidates[0].candidate.new, Rva(0x110));
+        assert!(item.detail.contains("never applied"), "{}", item.detail);
+    }
+
+    #[test]
+    fn proposals_attach_only_to_unmatched_hooks_and_their_own_function() {
+        // Negative: an ambiguous hook already has the engine's competitors; it takes no outside proposal.
+        let (old, new) = ambiguous_pair();
+        let engine = Engine::with_defaults();
+        let mut r = engine.repair(&manifest(), &old, &new);
+        let v = engine
+            .verify_candidate(&old, &new, &ai_candidate(0x10, 0x110), Criticality::Normal)
+            .unwrap();
+        assert_eq!(r.attach_proposals("H", vec![v]), 0);
+        // Negative: a proposal about another old function is dropped.
+        let (old, new) = unmatched_pair();
+        let mut r = engine.repair(&manifest(), &old, &new);
+        let mut v = engine
+            .verify_candidate(&old, &new, &ai_candidate(0x10, 0x110), Criticality::Normal)
+            .unwrap();
+        v.candidate.old = Rva(0x99);
+        assert_eq!(r.attach_proposals("H", vec![v]), 0);
+        assert!(r.review_items[0].candidates.is_empty());
+        // Negative: an unknown hook.
+        assert_eq!(r.attach_proposals("nope", vec![]), 0);
     }
 }

@@ -452,6 +452,7 @@ mod tests {
             detail: String::new(),
             candidates,
             proposals: vec![],
+            struct_proposals: Vec::new(),
             status: ReviewStatus::Open,
         }
     }

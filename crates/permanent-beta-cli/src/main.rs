@@ -26,6 +26,58 @@ const EXIT_OK: u8 = 0;
 const EXIT_NEEDS_REVIEW: u8 = 1;
 const EXIT_ERROR: u8 = 2;
 
+/// The AI proposer's model and its safety switches (design §8), shared by `propose` and `repair --propose`.
+#[derive(clap::Args)]
+struct AiArgs {
+    /// Claude model id.
+    #[arg(long, default_value = "claude-opus-5-5")]
+    model: String,
+    #[arg(long)]
+    effort: Option<String>,
+    /// The Claude Code CLI (it runs on your Claude subscription after `/login`).
+    #[arg(long, env = "PBETA_CLAUDE", default_value = "claude")]
+    claude: PathBuf,
+    /// Every exchange with the model, prompt and reply, is appended here, and recorded answers are replayed
+    /// from it.
+    #[arg(long, default_value = ".pbeta/ai-log.jsonl")]
+    log: PathBuf,
+    /// Claude is a remote model: function features (strings included) leave this machine. Required to ask
+    /// it (design §8: remote providers are opt-in and logged).
+    #[arg(long)]
+    allow_remote: bool,
+    /// Only use answers already recorded in --log; never call the model.
+    #[arg(long, conflicts_with = "allow_remote")]
+    replay: bool,
+    /// Candidates shown per question.
+    #[arg(long, default_value_t = permanent_beta_ai::shortlist::SHORTLIST_LEN)]
+    shortlist: usize,
+}
+
+impl AiArgs {
+    /// The logged model backend: live only with --allow-remote, recorded answers only with --replay.
+    fn backend(&self) -> Result<permanent_beta_ai::backend::Cassette> {
+        anyhow::ensure!(
+            self.allow_remote || self.replay,
+            "Claude is a remote model: function features, strings included, would leave this machine. Pass \
+             --allow-remote to ask it (every exchange is logged to {}), or --replay to use recorded answers",
+            self.log.display()
+        );
+        let live: Option<Box<dyn permanent_beta_ai::backend::Model>> = (!self.replay).then(|| {
+            Box::new(permanent_beta_ai::backend::ClaudeCode {
+                program: self.claude.clone(),
+                model: self.model.clone(),
+                effort: self.effort.clone(),
+            }) as Box<dyn permanent_beta_ai::backend::Model>
+        });
+        permanent_beta_ai::backend::Cassette::open(
+            &self.log,
+            &format!("claude-code:{}", self.model),
+            live,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "pbeta",
@@ -115,6 +167,13 @@ enum Command {
         /// The same scenario on the new build with hooks at the candidates' RVAs (e.g. the --trial-out run).
         #[arg(long, requires = "old_trace")]
         new_trace: Option<PathBuf>,
+        /// Ask the AI proposer (design §8) about hooks matching left with no candidate at all. Each proposal is
+        /// verified with the hook's criticality and attached to the hook's review item; it never becomes the
+        /// hook's target or a mapping, and the hook stays in review. Needs --allow-remote or --replay.
+        #[arg(long)]
+        propose: bool,
+        #[command(flatten)]
+        ai: AiArgs,
         #[arg(long)]
         json: bool,
     },
@@ -175,28 +234,8 @@ enum Command {
         /// Ask about at most this many functions.
         #[arg(long)]
         limit: Option<usize>,
-        /// Claude model id.
-        #[arg(long, default_value = "claude-opus-5-5")]
-        model: String,
-        #[arg(long)]
-        effort: Option<String>,
-        /// The Claude Code CLI (it runs on your Claude subscription after `/login`).
-        #[arg(long, env = "PBETA_CLAUDE", default_value = "claude")]
-        claude: PathBuf,
-        /// Every exchange with the model, prompt and reply, is appended here, and recorded answers are replayed
-        /// from it.
-        #[arg(long, default_value = ".pbeta/ai-log.jsonl")]
-        log: PathBuf,
-        /// Claude is a remote model: function features (strings included) leave this machine. Required to ask
-        /// it (design §8: remote providers are opt-in and logged).
-        #[arg(long)]
-        allow_remote: bool,
-        /// Only use answers already recorded in --log; never call the model.
-        #[arg(long, conflicts_with = "allow_remote")]
-        replay: bool,
-        /// Candidates shown per question.
-        #[arg(long, default_value_t = permanent_beta_ai::shortlist::SHORTLIST_LEN)]
-        shortlist: usize,
+        #[command(flatten)]
+        ai: AiArgs,
         #[arg(long)]
         json: bool,
     },
@@ -285,8 +324,11 @@ fn run(cli: Cli) -> Result<u8> {
             store,
             old_trace,
             new_trace,
+            propose,
+            ai,
             json,
         } => {
+            let backend = propose.then(|| ai.backend()).transpose()?;
             let traces = match new_trace {
                 Some(n) => Some((
                     old_trace
@@ -307,6 +349,9 @@ fn run(cli: Cli) -> Result<u8> {
                 trial_out: trial_out.as_deref(),
                 store: store.as_deref(),
                 traces,
+                proposer: backend
+                    .as_ref()
+                    .map(|b| (b as &dyn permanent_beta_ai::backend::Model, ai.shortlist)),
                 json,
             })
         }
@@ -317,41 +362,17 @@ fn run(cli: Cli) -> Result<u8> {
             store,
             rva,
             limit,
-            model,
-            effort,
-            claude,
-            log,
-            allow_remote,
-            replay,
-            shortlist,
+            ai,
             json,
         } => {
-            anyhow::ensure!(
-                allow_remote || replay,
-                "Claude is a remote model: function features, strings included, would leave this machine. Pass \
-                 --allow-remote to ask it (every exchange is logged to {}), or --replay to use recorded answers",
-                log.display()
-            );
-            let live: Option<Box<dyn permanent_beta_ai::backend::Model>> = (!replay).then(|| {
-                Box::new(permanent_beta_ai::backend::ClaudeCode {
-                    program: claude,
-                    model: model.clone(),
-                    effort,
-                }) as Box<dyn permanent_beta_ai::backend::Model>
-            });
-            let backend = permanent_beta_ai::backend::Cassette::open(
-                &log,
-                &format!("claude-code:{model}"),
-                live,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let backend = ai.backend()?;
             cmd_propose(ProposeArgs {
                 old: &old,
                 new: &new,
                 store: store.as_deref(),
                 only: &rva,
                 limit,
-                shortlist,
+                shortlist: ai.shortlist,
                 model: &backend,
                 json,
             })
@@ -452,7 +473,101 @@ struct RepairArgs<'a> {
     trial_out: Option<&'a Path>,
     store: Option<&'a Path>,
     traces: Option<(Vec<Trace>, Trace)>,
+    /// `--propose`: the AI model and its shortlist length.
+    proposer: Option<(&'a dyn permanent_beta_ai::backend::Model, usize)>,
     json: bool,
+}
+
+/// `repair --propose`: ask the AI proposer about every hook matching left with no candidate, from the hook's own
+/// source build, and attach each verified proposal to that hook's review item. A pair a reviewer already
+/// rejected is not attached again. Returns one line per hook asked.
+#[allow(clippy::too_many_arguments)]
+fn propose_for_unmatched(
+    engine: &Engine,
+    report: &mut permanent_beta_engine::RepairReport,
+    manifest: &HookManifest,
+    old: &permanent_beta_model::AnalysisExport,
+    earlier: &[permanent_beta_model::AnalysisExport],
+    new: &permanent_beta_model::AnalysisExport,
+    priors: &BTreeMap<BuildId, PriorDecisions>,
+    model: &dyn permanent_beta_ai::backend::Model,
+    shortlist: usize,
+) -> Vec<String> {
+    use permanent_beta_ai::{Outcome, Proposer, shortlist::Matched};
+    use permanent_beta_model::ReviewReason;
+    let asks: Vec<(String, Rva, BuildId)> = report
+        .repairs
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.action,
+                RepairAction::NeedsReview {
+                    reason: ReviewReason::Unmatched,
+                    ..
+                }
+            )
+        })
+        .filter_map(|r| {
+            let from = r.from_build.clone().unwrap_or_else(|| old.build.id.clone());
+            Some((r.hook.clone(), r.old?, from))
+        })
+        .collect();
+    let mut proposer = Proposer::new(model);
+    proposer.shortlist_len = shortlist;
+    let mut pairs_by_build: BTreeMap<BuildId, Vec<permanent_beta_model::Candidate>> =
+        BTreeMap::new();
+    let mut notes = Vec::new();
+    for (hook, rva, from) in asks {
+        let Some(src) = std::iter::once(old)
+            .chain(earlier)
+            .find(|e| e.build.id == from)
+        else {
+            continue;
+        };
+        let pairs = pairs_by_build.entry(from.clone()).or_insert_with(|| {
+            engine
+                .match_builds(src, new)
+                .reports
+                .into_iter()
+                .map(|r| r.candidate)
+                .collect()
+        });
+        let criticality = manifest
+            .hooks
+            .iter()
+            .find(|h| h.name == hook)
+            .map_or(Criticality::Normal, |h| h.criticality);
+        let asked = proposer.ask_with(&Matched::new(src, new, pairs), src, new, rva);
+        let note = match &asked.outcome {
+            Outcome::Proposed { candidate } => {
+                let rejected = priors
+                    .get(&from)
+                    .is_some_and(|p| p.rejected.contains(&(candidate.old, candidate.new)));
+                match engine.verify_candidate(src, new, candidate, criticality) {
+                    _ if rejected => {
+                        format!("proposed {}, already rejected by a reviewer", candidate.new)
+                    }
+                    Some(v) => {
+                        let verdict = verdict_str(v.verdict);
+                        report.attach_proposals(&hook, vec![v]);
+                        format!(
+                            "proposed {} (confidence {:.2}; verification: {verdict}); attached for review",
+                            candidate.new, candidate.score
+                        )
+                    }
+                    None => format!("proposed {} (couldn't be verified)", candidate.new),
+                }
+            }
+            Outcome::Abstained { confidence, .. } => format!(
+                "none of {} candidates (confidence {confidence:.2})",
+                asked.shortlist.len()
+            ),
+            Outcome::NoShortlist => "no unmatched function close enough to ask".into(),
+            Outcome::Failed { error } => format!("FAILED: {error}"),
+        };
+        notes.push(format!("{hook}: {note}"));
+    }
+    notes
 }
 
 fn cmd_repair(a: RepairArgs) -> Result<u8> {
@@ -486,6 +601,20 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
         None => Engine::with_defaults(),
     };
     let mut report = engine.repair_across(&manifest, &old, &earlier, &new, &priors);
+    let proposal_notes = match a.proposer {
+        Some((model, shortlist)) => propose_for_unmatched(
+            &engine,
+            &mut report,
+            &manifest,
+            &old,
+            &earlier,
+            &new,
+            &priors,
+            model,
+            shortlist,
+        ),
+        None => Vec::new(),
+    };
 
     // AOB patterns for re-bound hooks, from the new binary (rewrite_manifest dropped the old ones).
     let mut pattern_notes: Vec<String> = Vec::new();
@@ -574,11 +703,27 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
                     "", p.candidate, p.prototype
                 );
             }
+            for p in &r.struct_proposals {
+                println!(
+                    "{:<18}   struct {} changed ({:#x} -> {:#x} bytes): {}",
+                    "",
+                    p.name,
+                    p.old_size,
+                    p.new_size,
+                    p.changes.join("; ")
+                );
+                for line in p.offsets.lines() {
+                    println!("{:<18}     {line}", "");
+                }
+            }
         }
         let resolved = report.repairs.iter().filter(|r| r.is_resolved()).count();
         println!("\n{resolved}/{} hooks resolved", report.repairs.len());
         for n in &pattern_notes {
             println!("pattern: {n}");
+        }
+        for n in &proposal_notes {
+            println!("AI proposer: {n}");
         }
         if let Some(out) = a.out {
             println!("repaired manifest written to {}", out.display());
@@ -1102,5 +1247,112 @@ fn source_str(s: &CandidateSource) -> String {
         CandidateSource::Deterministic { matcher } => matcher.clone(),
         CandidateSource::Ai { model } => format!("ai:{model}"),
         CandidateSource::Human { reviewer } => format!("human:{reviewer}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use permanent_beta_model::{AnalysisExport, ReviewReason};
+
+    /// Always picks the first shortlisted candidate.
+    struct PickFirst;
+    impl permanent_beta_ai::backend::Model for PickFirst {
+        fn name(&self) -> String {
+            "stub".into()
+        }
+        fn complete(&self, _: &permanent_beta_ai::prompt::Prompt) -> Result<String, String> {
+            Ok(r#"{"choice":"c1","confidence":0.8,"rationale":"same string"}"#.into())
+        }
+    }
+
+    fn export(id: &str, functions: serde_json::Value) -> AnalysisExport {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": permanent_beta_model::ANALYSIS_SCHEMA_VERSION,
+            "build": { "id": id, "file_name": "t.exe", "version": null, "machine": "x64", "pdb": null },
+            "producer": { "tool": "test", "version": "0" },
+            "functions": functions,
+        }))
+        .unwrap()
+    }
+
+    /// The hook target 0x10 shares a string with 0x110 but nothing the passes match on: unmatched.
+    fn unmatched() -> (AnalysisExport, AnalysisExport, HookManifest) {
+        let old = export(
+            "a",
+            serde_json::json!([{ "rva": "0x10", "size": 64, "name": null, "name_source": null,
+                "normalized_hash": "h1", "mnemonic_hash": null, "basic_blocks": null, "edges": null,
+                "strings": ["price %d", "total"], "signature": null }]),
+        );
+        let new = export(
+            "b",
+            serde_json::json!([{ "rva": "0x110", "size": 64, "name": null, "name_source": null,
+                "normalized_hash": "h2", "mnemonic_hash": null, "basic_blocks": null, "edges": null,
+                "strings": ["price %d"], "signature": null }]),
+        );
+        let manifest: HookManifest = toml::from_str(
+            "[[hook]]\nname = \"price\"\n[hook.target]\nbuild = \"a\"\nrva = \"0x10\"\n",
+        )
+        .unwrap();
+        (old, new, manifest)
+    }
+
+    #[test]
+    fn repair_propose_attaches_ai_proposals_to_review_and_never_applies_them() {
+        let (old, new, manifest) = unmatched();
+        let engine = Engine::with_defaults();
+        let none = BTreeMap::new();
+        let mut report = engine.repair_across(&manifest, &old, &[], &new, &none);
+        let notes = propose_for_unmatched(
+            &engine,
+            &mut report,
+            &manifest,
+            &old,
+            &[],
+            &new,
+            &none,
+            &PickFirst,
+            5,
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("attached for review"), "{notes:?}");
+        assert!(!report.repairs[0].is_resolved());
+        assert!(report.mappings.is_empty());
+        assert_eq!(report.updated_manifest.hooks[0].target.rva, Some(Rva(0x10)));
+        let item = &report.review_items[0];
+        assert_eq!(item.reason, ReviewReason::Unmatched);
+        assert_eq!(item.candidates.len(), 1);
+        assert!(matches!(
+            item.candidates[0].candidate.source,
+            CandidateSource::Ai { .. }
+        ));
+    }
+
+    #[test]
+    fn a_proposal_a_reviewer_rejected_is_not_attached_again() {
+        // Negative: the store says 0x10 -> 0x110 is not a counterpart.
+        let (old, new, manifest) = unmatched();
+        let engine = Engine::with_defaults();
+        let priors = BTreeMap::from([(
+            old.build.id.clone(),
+            PriorDecisions {
+                accepted: vec![],
+                rejected: vec![(Rva(0x10), Rva(0x110))],
+            },
+        )]);
+        let mut report = engine.repair_across(&manifest, &old, &[], &new, &priors);
+        let notes = propose_for_unmatched(
+            &engine,
+            &mut report,
+            &manifest,
+            &old,
+            &[],
+            &new,
+            &priors,
+            &PickFirst,
+            5,
+        );
+        assert!(notes[0].contains("already rejected"), "{notes:?}");
+        assert!(report.review_items[0].candidates.is_empty());
     }
 }

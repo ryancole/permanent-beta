@@ -133,6 +133,7 @@ pub(crate) fn analyze_ranges(
         producer,
         functions,
         code_tables,
+        types: Vec::new(),
     }
 }
 

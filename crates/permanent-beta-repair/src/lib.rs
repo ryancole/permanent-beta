@@ -6,11 +6,13 @@
 //! The detour body is never rewritten automatically.
 
 pub mod header;
+pub mod layout;
 pub mod prototype;
 
 use permanent_beta_model::{
     AnalysisExport, BuildId, CheckOutcome, FunctionFeatures, HookManifest, HookSpec,
-    PrototypeProposal, ReviewItem, ReviewReason, Rva, Verdict, VerificationReport,
+    PrototypeProposal, ReviewItem, ReviewReason, Rva, StructLayoutProposal, Verdict,
+    VerificationReport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +52,9 @@ pub struct HookRepair {
     /// Prototype proposals for candidates whose parameters seem to have changed (review only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposals: Vec<PrototypeProposal>,
+    /// Structs the hook's prototype uses whose layout changed between the builds (review only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub struct_proposals: Vec<StructLayoutProposal>,
 }
 
 impl HookRepair {
@@ -63,6 +68,7 @@ impl HookRepair {
             reviewed_by: None,
             from_build: None,
             proposals: Vec::new(),
+            struct_proposals: Vec::new(),
         }
     }
 
@@ -393,6 +399,7 @@ pub fn review_items(repairs: &[HookRepair], from: &BuildId, to: &BuildId) -> Vec
                     .cloned()
                     .collect(),
                 proposals: r.proposals.clone(),
+                struct_proposals: r.struct_proposals.clone(),
                 status: Default::default(),
             }),
             _ => None,
@@ -431,6 +438,7 @@ pub fn proposal_review_item(
         ),
         candidates: vec![report.clone()],
         proposals: Vec::new(),
+        struct_proposals: Vec::new(),
         status: Default::default(),
     }
 }
