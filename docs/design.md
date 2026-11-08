@@ -605,7 +605,8 @@ Design points:
   without `--allow-remote`, and every exchange, prompt and reply, is appended to a log (`--log`). `pbeta repair
   --propose` (same switches) asks it about every hook matching left with no candidate (`unmatched`), from the
   hook's own source build; each verified proposal is attached to that hook's review item as a candidate, the hook
-  stays in review, and a pair a reviewer rejected isn't attached again. The same log
+  stays in review, and a pair a reviewer rejected isn't attached again. First live run (2026-11-07), the hook
+  loop's only unmatched hook (`apply_discount` at /Od, rewritten in v2): the right function, both steps. The same log
   replays answers (`--replay`), which keeps corpus scores repeatable. A local OpenAI-compatible backend is not
   built yet (the `Model` trait is the seam).
 - **Routing:** every proposal is verified with `Engine::verify_candidate` (same checks and policy) and queued as an

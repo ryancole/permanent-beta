@@ -12,8 +12,11 @@ Latest work: **struct layout proposals and the AI proposer in repair** (design �
   every flag set; a hook whose struct didn't change is repaired as before (corpus tests, run in CI).
 - `pbeta repair --propose` (`--allow-remote` or `--replay`, every exchange logged) asks the AI proposer about
   hooks matching left `unmatched` and attaches each verified proposal to the hook's review item. It never becomes
-  the target or a mapping, and a pair a reviewer rejected isn't attached again. Not yet run against the live
-  model on the hook loop.
+  the target or a mapping, and a pair a reviewer rejected isn't attached again. **Measured live** on the hook
+  loop: its only unmatched hook, `apply_discount` at /Od (rewritten in v2, same results), v1 → v2 and v2 → v3
+  (repaired from v1): Claude proposed `0x1140` both times (confidence 0.60), verification would accept it, and the
+  map files confirm it is `apply_discount`. It stays in review. Answers recorded in
+  `corpus/ai/claude-opus-5-5.jsonl` (replay with `--replay`).
 
 Before that: **/LTCG and PGO flag sets** (`o2-ltcg`: /GL + /LTCG; `o2-pgo`: built instrumented, run on each
 recipe's `Train` workload, relinked with the profile). 0 wrong on every new variant scored: zlib, Lua, TinyXML-2,
@@ -206,8 +209,8 @@ What's new:
 
 ## Suggested next steps
 
-1. **Measure `repair --propose` live** on the hook loop's unmatched hooks (`apply_discount` at /Od), and
-   optionally describe unmatched callees in the prompt, the lever for zstd's `*_noDict_*` family (design §8).
+1. **AI prompt context:** describe unmatched callees in the prompt, the lever for zstd's `*_noDict_*` family
+   (design §8); measure with `pbeta-corpus score-ai`.
 2. **Swapped inlining (zstd under /LTCG and PGO):** when the compiler keeps a different one of two related
    functions out of line in each build, decide what the right answer even is (the survivor does the old one's
    work) and how to detect it: e.g. the new function's callees include the old function's callees *and* its
