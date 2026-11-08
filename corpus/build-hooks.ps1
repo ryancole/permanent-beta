@@ -30,20 +30,30 @@
        and the trace diff catch it.
   Fails on any wrong relocation, behavioral mismatch, or a missed negative control.
 
+  Recorded test cases (-Replay, with -Run; design §7.3): each version but the last is also run once under the
+  recording hook DLL (PBETA_RECORD, spec from `pbeta harness-spec` on its PDB analysis). The decision step adds
+  the older versions' recordings as behavioral evidence (`pbeta repair --cases`), every resolved hook's cases are
+  replayed on its new RVA (`pbeta replay`: a correct candidate must never fail), and the negative control's swapped
+  hooks must fail replay. Needs pbeta built with the `emulator` feature: CMake, Ninja and libclang
+  (corpus/lib/emulator.ps1, third_party/README.md).
+
   Requires Visual Studio (or Build Tools) with the x64 C++ toolset, git (first run), and cargo.
 
 .EXAMPLE
   pwsh corpus/build-hooks.ps1 -Run
   pwsh corpus/build-hooks.ps1 -Flags o2 -Run
+  pwsh corpus/build-hooks.ps1 -Run -Replay
 #>
 [CmdletBinding()]
 param(
     [string[]] $Flags,
-    [switch] $Run
+    [switch] $Run,
+    [switch] $Replay
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib/msvc.ps1')
+. (Join-Path $PSScriptRoot 'lib/emulator.ps1')
 $repo = Split-Path -Parent $PSScriptRoot
 $hooksDir = Join-Path $PSScriptRoot 'hooks'
 $outRoot = Join-Path $repo 'target/hooks'
@@ -135,6 +145,12 @@ function Invoke-Loop([string] $flagName) {
 
     foreach ($version in $versions) {
         Invoke-Native $pbeta @('analyze', "$dir\$version\app.exe", '--out', "$dir\$version\analysis.json")
+        if ($Replay) {
+            # With the PDB: struct layouts for the record spec and for replaying recorded structs. Matching keeps
+            # using the symbol-less analysis.
+            Invoke-Native $pbeta @('analyze', "$dir\$version\app.exe", '--pdb', "$dir\$version\app.pdb", '--out',
+                "$dir\$version\analysis-pdb.json")
+        }
     }
     Invoke-Native $corpus @('hook-manifest', '--template', (Join-Path $hooksDir 'hooks.template.toml'),
         '--map', "$dir\v1\app.map", '--analysis', "$dir\v1\analysis.json", '--out', "$dir\v1\hooks.toml")
@@ -146,10 +162,31 @@ function Invoke-Loop([string] $flagName) {
         $LASTEXITCODE
     }
 
+    # Records every call of the hooks bound to this version (its manifest) as test cases, in a run of its own.
+    $record = {
+        param([string] $version)
+        $rec = "$dir\$version\rec"
+        if (Test-Path $rec) { Remove-Item -Recurse -Force $rec }
+        Invoke-Native $pbeta @('harness-spec', '--hooks', "$dir\$version\hooks.toml", '--analysis', "$dir\$version\analysis-pdb.json",
+            '--out', "$dir\$version\spec.toml")
+        $env:PBETA_RECORD = $rec
+        $env:PBETA_SPEC = "$dir\$version\spec.toml"
+        try {
+            & "$bin\launcher.exe" "$bin\hookdll.dll" "$dir\$version\hooks.toml" "$dir\$version\rec-trace.jsonl" "$dir\$version\app.exe" | Out-Null
+            $code = $LASTEXITCODE
+        } finally {
+            Remove-Item Env:PBETA_RECORD, Env:PBETA_SPEC
+        }
+        if ($code -ne 0) { $script:failures += "$version exited with $code under the recorder" }
+        $n = @(Get-ChildItem "$rec\cases" -Recurse -Filter *.json).Count
+        Write-Host "[$flagName] recorded $n test cases of $version"
+    }
+
     Write-Host "`n== [$flagName] v1 baseline"
     $code = & $runApp 'v1' "$dir\v1\hooks.toml" "$dir\v1\trace.jsonl"
     if ($code -ne 0) { throw "v1 exited with $code under the hooks" }
     Invoke-Native $pbeta @('trace-diff', '--baseline', "$dir\v1\trace.jsonl", '--hooks', "$dir\v1\hooks.toml")
+    if ($Replay) { & $record 'v1' }
 
     for ($i = 1; $i -lt $versions.Count; $i++) {
         $old, $new = $versions[$i - 1], $versions[$i]
@@ -163,6 +200,8 @@ function Invoke-Loop([string] $flagName) {
         foreach ($e in $earlier) { $pair += @('--earlier', "$dir\$e\analysis.json") }
         $oldTraces = @()
         foreach ($o in $older) { $oldTraces += @('--old-trace', "$dir\$o\trace.jsonl") }
+        $cases = @()
+        if ($Replay) { foreach ($o in $older) { $cases += @('--cases', "$dir\$o\rec") } }
         Write-Host "`n== [$flagName] $step"
 
         # a. Trial run: review candidates that only lack behavioral evidence run in place, in a test run.
@@ -171,7 +210,7 @@ function Invoke-Loop([string] $flagName) {
         if ($code -ne 0) { Write-Host "$new exited with $code in the trial run" }
 
         # b. Decide with the behavioral evidence of the trial run.
-        $decide = @('repair') + $pair + $oldTraces + @('--new-trace', "$dir\$new\trial.jsonl", '--out', "$dir\$new\hooks.toml")
+        $decide = @('repair') + $pair + $oldTraces + $cases + @('--new-trace', "$dir\$new\trial.jsonl", '--out', "$dir\$new\hooks.toml")
         & $pbeta @decide --json | Set-Content "$dir\$new\repair.json"
         if ($LASTEXITCODE -notin 0, 1) { throw "pbeta repair failed with exit code $LASTEXITCODE" }
         $null = Invoke-Allowing $pbeta $decide @(0, 1)
@@ -217,6 +256,24 @@ function Invoke-Loop([string] $flagName) {
             }
         }
 
+        # f. Recorded cases replayed on every resolved hook (all correct, per the answer key): none may fail.
+        $replayed = @{}
+        if ($Replay) {
+            foreach ($r in $repairJson.repairs) {
+                $to = switch ($r.action.action) { 'relocated' { $r.action.new } 'unchanged' { $r.action.rva } default { $null } }
+                if (-not $to) { continue }
+                $j = & $pbeta (@('replay', '--binary', "$dir\$new\app.exe", '--old-rva', $r.old, '--new-rva', $to,
+                    '--new-analysis', "$dir\$new\analysis-pdb.json", '--json') + $cases) | ConvertFrom-Json
+                $pass = @($j.cases | Where-Object outcome -eq 'pass').Count
+                $replayed[$r.hook] = "$($j.outcome) ($pass/$(@($j.cases).Count))"
+                if ($j.outcome -eq 'fail') { $script:failures += "$step $($r.hook): recorded case failed replay ($($j.detail))" }
+                $script:replaySummary += [pscustomobject]@{
+                    Flags = $flagName; Step = $step; Hook = $r.hook; Replay = $j.outcome; Cases = @($j.cases).Count
+                    Passed = $pass; Detail = $j.detail
+                }
+            }
+        }
+
         $diffJson = & $pbeta @diffArgs --json | ConvertFrom-Json
         $trialed = @((Get-Content "$dir\$new\trial.toml" -Raw | Select-String -Pattern '(?m)^trial = true' -AllMatches).Matches).Count
         foreach ($r in $repairJson.repairs) {
@@ -224,11 +281,12 @@ function Invoke-Loop([string] $flagName) {
             if ($action -eq 'needs_review') { $action = "review: $($r.action.reason)" }
             if ($r.from_build) { $action += ' (from v1)' }
             $h = $diffJson.hooks | Where-Object hook -eq $r.hook
-            $script:summary += [pscustomobject]@{
-                Flags = $flagName; Step = $step; Hook = $r.hook; Repair = $action; Behavior = $h.outcome
-            }
+            $row = [ordered]@{ Flags = $flagName; Step = $step; Hook = $r.hook; Repair = $action; Behavior = $h.outcome }
+            if ($Replay) { $row.Replay = $replayed[$r.hook] }
+            $script:summary += [pscustomobject]$row
         }
         Write-Host "[$flagName] $step trial bindings: $trialed"
+        if ($Replay -and $i -lt $versions.Count - 1) { & $record $new }
     }
 
     # Offsets header from every manifest of the line; it must compile as C and as C++.
@@ -254,18 +312,33 @@ function Invoke-Loop([string] $flagName) {
     $diff = Invoke-Allowing $pbeta @('trace-diff', '--old', "$dir\v1\trace.jsonl", '--new', "$dir\v2\trace.swapped.jsonl",
         '--hooks', $swapped) @(0, 1)
     if ($diff -ne 1) { $script:failures += 'negative control: trace diff missed the swapped hooks' }
+    if ($Replay) {
+        # v1's recorded cases of each swapped hook, replayed on the function the swapped manifest points it at.
+        $v2 = Get-Content "$dir\v2\repair.json" -Raw | ConvertFrom-Json
+        $at = @{}
+        foreach ($r in $v2.repairs) { $at[$r.hook] = @($r.old, $(if ($r.action.new) { $r.action.new } else { $r.action.rva })) }
+        foreach ($swap in @(@('price_lookup', 'stock_level'), @('stock_level', 'price_lookup'))) {
+            $j = & $pbeta @('replay', '--cases', "$dir\v1\rec", '--binary', "$dir\v2\app.exe", '--old-rva', $at[$swap[0]][0],
+                '--new-rva', $at[$swap[1]][1], '--json') | ConvertFrom-Json
+            Write-Host "[$flagName] negative control replay: $($swap[0]) cases on $($swap[1]): $($j.outcome) ($($j.detail))"
+            if ($j.outcome -ne 'fail') { $script:failures += "negative control: replay didn't fail $($swap[0])'s cases on $($swap[1])" }
+        }
+    }
 }
 
 Import-VsDevEnvironment
+if ($Replay) { Use-EmulatorToolchain }
 Build-Detours
 Build-Harness
 $flagNames = if ($Flags) { $Flags } else { @('o2', 'od') }
 foreach ($flagName in $flagNames) { Build-App $flagName }
 
 if ($Run) {
-    Invoke-Native 'cargo' @('build', '-q', '-p', 'permanent-beta-cli', '-p', 'permanent-beta-corpus')
+    $features = if ($Replay) { @('--features', 'permanent-beta-cli/emulator') } else { @() }
+    Invoke-Native 'cargo' (@('build', '-q', '-p', 'permanent-beta-cli', '-p', 'permanent-beta-corpus') + $features)
     $script:failures = @()
     $script:summary = @()
+    $script:replaySummary = @()
     foreach ($flagName in $flagNames) {
         $before = $script:failures.Count
         Invoke-Loop $flagName
@@ -273,6 +346,12 @@ if ($Run) {
     }
     Write-Host "`nPer-hook results (Repair: pbeta repair's outcome; Behavior: trace diff against the previous version)"
     $script:summary | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+    if ($Replay) {
+        Write-Host 'Recorded cases replayed on each resolved hook (pass: every replayable case matched; inconclusive: none could)'
+        $script:replaySummary | Format-Table -AutoSize -Wrap | Out-String -Width 220 | Write-Host
+        $replayable = @($script:replaySummary | Where-Object Replay -eq 'pass').Count
+        Write-Host "replayable: $replayable of $($script:replaySummary.Count) resolved hooks had cases replay, all matching"
+    }
     $failures = $script:failures
     if ($failures) {
         Write-Host "`nFAILED:"

@@ -12,7 +12,7 @@ use permanent_beta_model::{
 use std::collections::{HashMap, HashSet};
 
 pub mod behavioral;
-pub use behavioral::TraceDiffRunner;
+pub use behavioral::{AllOf, TraceDiffRunner};
 
 /// What checks can see beyond the two functions: the other candidates of this run and call-graph indexes.
 ///
@@ -767,6 +767,29 @@ mod tests {
         ) -> CheckResult {
             CheckResult::new("behavioral", self.0, "fixed")
         }
+    }
+
+    #[test]
+    fn all_of_fails_on_any_failure_and_passes_on_any_pass() {
+        use CheckOutcome::{Fail, Inconclusive, Pass};
+        let f = func(0x10, 100, &[], None);
+        let c = cand(0x10, 0x10, evidence_kind::NORMALIZED_HASH);
+        let all = |outcomes: &[CheckOutcome]| {
+            behavioral::AllOf(
+                outcomes
+                    .iter()
+                    .map(|&o| Box::new(Fixed(o)) as Box<dyn BehavioralRunner>)
+                    .collect(),
+            )
+            .run(&VerifyContext::default(), &c, &f, &f)
+            .outcome
+        };
+        assert_eq!(all(&[Pass, Inconclusive]), Pass);
+        // Negative: one failure outweighs any number of passes.
+        assert_eq!(all(&[Pass, Fail, Pass]), Fail);
+        // Negative: nothing conclusive is no evidence.
+        assert_eq!(all(&[Inconclusive, Inconclusive]), Inconclusive);
+        assert_eq!(all(&[]), Inconclusive);
     }
 
     fn verify_with(

@@ -16,8 +16,11 @@ use permanent_beta_verify::{BehavioralRunner, Policy, Verifier, VerifyContext};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+pub mod recorded;
+
 pub use permanent_beta_match;
 pub use permanent_beta_repair;
+pub use permanent_beta_replay;
 pub use permanent_beta_verify;
 
 pub struct Engine {

@@ -403,6 +403,43 @@ impl BehavioralRunner for TraceDiffRunner {
     }
 }
 
+/// Several sources of behavioral evidence for one candidate (e.g. scenario traces and recorded cases): fails if
+/// any fails, passes if any passes and none fails, and is inconclusive otherwise. The detail lists each runner's.
+pub struct AllOf(pub Vec<Box<dyn BehavioralRunner>>);
+
+impl BehavioralRunner for AllOf {
+    fn run(
+        &self,
+        ctx: &VerifyContext,
+        candidate: &Candidate,
+        old: &FunctionFeatures,
+        new: &FunctionFeatures,
+    ) -> CheckResult {
+        let results: Vec<CheckResult> = self
+            .0
+            .iter()
+            .map(|r| r.run(ctx, candidate, old, new))
+            .collect();
+        let outcome = if results.iter().any(|r| r.outcome == CheckOutcome::Fail) {
+            CheckOutcome::Fail
+        } else if results.iter().any(|r| r.outcome == CheckOutcome::Pass) {
+            CheckOutcome::Pass
+        } else {
+            CheckOutcome::Inconclusive
+        };
+        // The deciding results first, so the detail leads with why.
+        let mut details: Vec<&CheckResult> =
+            results.iter().filter(|r| r.outcome == outcome).collect();
+        details.extend(results.iter().filter(|r| r.outcome != outcome));
+        let detail = details
+            .iter()
+            .map(|r| r.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        CheckResult::new("behavioral", outcome, detail)
+    }
+}
+
 fn short(id: &BuildId) -> &str {
     id.0.get(..12).unwrap_or(&id.0)
 }

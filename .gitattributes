@@ -1,0 +1,2 @@
+# Vendored third-party sources stay byte-for-byte as published.
+third_party/** -text

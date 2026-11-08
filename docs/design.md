@@ -125,8 +125,9 @@ flowchart LR
 | `permanent-beta-verify` | Structural checks, behavioral test runner interface, acceptance policy → `Verdict`. | model |
 | `permanent-beta-repair` | Per-hook decisions, manifest rewrite, generated code. | model |
 | `permanent-beta-store` | Versioned mapping history, evidence, review queue persistence. | model |
-| `permanent-beta-engine` | Orchestrates analysis output → match → verify → repair. | model, match, verify, repair |
-| `permanent-beta-cli` | `pbeta` binary; argument parsing, I/O, exit codes. | engine, analysis, store, model |
+| `permanent-beta-engine` | Orchestrates analysis output → match → verify → repair. | model, match, verify, repair, replay |
+| `permanent-beta-replay` | Replays recorded per-call test cases (§7.3) on a new build by emulation: image mapping, memory placement, layout translation, comparison. Reports pass, fail or inconclusive per case; verification decides what that's worth. Emulation (Unicorn, GPL-2.0) is its optional `emulator` feature. Only engine and CLI may depend on it. | model |
+| `permanent-beta-cli` | `pbeta` binary; argument parsing, I/O, exit codes. | engine, analysis, store, model, ai, replay |
 | `permanent-beta-corpus` | Test tooling: linker map parser, ground-truth answer keys (`pbeta-corpus`). Nothing depends on it. | model |
 | `permanent-beta-ai` | AI proposer (§8): shortlist, prompt, strict answer parsing, model backends, recordings. Emits `Candidate`s only. | model |
 | `permanent-beta-mcp` | MCP server over the engine (`pbeta-mcp`, §11.2). Reads the store and adds review items; never decides one. | engine, store, model |
@@ -403,7 +404,13 @@ detour at the candidate's RVA saw in the new run. Traces are matched to builds b
 trace is always a run of the candidate's own old build (an RVA means nothing in another build). It's inconclusive
 when there's no trace of either build or either side has no hook there, and fails on any difference or a crashed
 run. `pbeta repair --old-trace ... --new-trace` uses it; the new trace is usually a trial run (§7.2), so review
-candidates can be judged too. How a behavioral pass counts toward acceptance is part of the policy (§6.3).
+candidates can be judged too.
+
+`RecordedCasesRunner` (implemented 2026-11-08, in the engine) replays the per-call test cases recorded at the
+candidate's old RVA in its old build (§7.3) on the candidate in the new binary, by emulation: pass if every case that
+can be replayed matches and at least one can, fail if any differs, inconclusive if none can (or there are none).
+`pbeta repair --cases <recording> --new-binary` uses it; with traces as well, both run and a failure of either fails
+(`AllOf`). How a behavioral pass counts toward acceptance is part of the policy (§6.3).
 
 ### 6.3 Acceptance policy
 
@@ -890,6 +897,13 @@ validated on the corpus.
 | Signature database, test corpus (beyond the public ground-truth set), hosted history service | Proprietary, in **separate repositories**. |
 
 The repo currently has a placeholder `LICENSE`. Until a license is chosen, nothing is licensed for reuse.
+
+**Unicorn is GPL-2.0** (decided 2026-11-08 to replay by emulating with it, §7.3). It's linked only by
+`permanent-beta-replay`'s optional `emulator` feature, off by default: a default build contains no GPL code, and any
+`pbeta` built with the feature is GPL-2.0 as a whole. GPL-2.0 and Apache-2.0 are generally considered incompatible,
+so shipping an Apache-2.0 `pbeta` with replay would need the emulator moved out of process (a separate GPL helper
+binary) or replaced by a permissive one (icicle-emu, MIT/Apache-2.0). The patched copy of its sys crate in
+`third_party/` keeps its own license. Not legal advice; part of the license decision.
 Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing options open but deters contributors.
 
 ---

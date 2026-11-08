@@ -9,9 +9,12 @@ stop plausible-but-wrong matching logic from merging.
 - Allowed internal dependencies (enforced by Cargo.toml review):
   - `permanent-beta-model`: none
   - `permanent-beta-analysis`, `permanent-beta-match`, `permanent-beta-verify`, `permanent-beta-repair`, `permanent-beta-store`: `permanent-beta-model` only
-  - `permanent-beta-engine`: model, match, verify, repair
+  - `permanent-beta-engine`: model, match, verify, repair, replay
+  - `permanent-beta-replay`: model only; only engine and CLI may depend on it. It replays recorded test cases by
+    emulation and reports pass/fail/inconclusive; verification decides what that's worth. Its `emulator` feature
+    links Unicorn (GPL-2.0, patched copy in `third_party/`): keep it optional and off by default.
   - `permanent-beta-ai`: model only. It proposes candidates; callers verify them and queue them for review.
-  - `permanent-beta-cli`: engine, analysis, store, model, ai. `pbeta propose` queues AI proposals for review and
+  - `permanent-beta-cli`: engine, analysis, store, model, ai, replay. `pbeta propose` queues AI proposals for review and
     never writes a mapping.
   - `permanent-beta-mcp`: engine, store, model. It may only read the store and add review items to it
     (`tools::ReviewQueue`); no tool may decide a review item or write a mapping.

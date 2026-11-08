@@ -25,6 +25,17 @@ jobs:
           cargo run -q -p permanent-beta-cli -- repair --old examples/demo/v1.json --new examples/demo/v2.json --hooks examples/demo/hooks.toml
           code=$?
           test "$code" -eq 1
+      - name: emulator toolchain (CMake, Ninja, libclang for Unicorn; third_party/README.md)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python -m pip install --user cmake ninja libclang
+      - name: replay tests with the emulator (Unicorn)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          . ./corpus/lib/msvc.ps1; . ./corpus/lib/emulator.ps1; Use-EmulatorToolchain
+          cargo test -p permanent-beta-replay -p permanent-beta-cli --features permanent-beta-replay/emulator
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: build test fixtures with MSVC and generate answer keys
         if: runner.os == 'Windows'
         shell: pwsh
@@ -40,7 +51,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./corpus/build-projects.ps1 -Score
-      - name: hook-repair loop (Detours hooks repaired v1 -> v2 -> v3 and run; zero wrong relocations, identical traces)
+      - name: hook-repair loop (Detours hooks repaired v1 -> v2 -> v3 and run; zero wrong relocations, identical traces; recorded cases replayed)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./corpus/build-hooks.ps1 -Run
+        run: ./corpus/build-hooks.ps1 -Run -Replay

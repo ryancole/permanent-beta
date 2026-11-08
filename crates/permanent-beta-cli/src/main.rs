@@ -10,7 +10,7 @@ use permanent_beta_analysis::{
 use permanent_beta_engine::Engine;
 use permanent_beta_engine::permanent_beta_repair::{HookRepair, RepairAction};
 use permanent_beta_engine::permanent_beta_verify::{
-    TraceDiffRunner,
+    AllOf, BehavioralRunner, TraceDiffRunner,
     behavioral::{self, HookOutcome, TraceDiff},
 };
 use permanent_beta_model::{
@@ -167,6 +167,11 @@ enum Command {
         /// The same scenario on the new build with hooks at the candidates' RVAs (e.g. the --trial-out run).
         #[arg(long, requires = "old_trace")]
         new_trace: Option<PathBuf>,
+        /// Behavioral evidence (design §7.3): a recording of an old build's calls (the recording hook DLL's
+        /// PBETA_RECORD directory). Each candidate's recorded cases are replayed on --new-binary by emulation;
+        /// with --old-trace too, a failure of either fails. Repeatable; needs --new-binary.
+        #[arg(long, requires = "new_binary")]
+        cases: Vec<PathBuf>,
         /// Ask the AI proposer (design §8) about hooks matching left with no candidate at all. Each proposal is
         /// verified with the hook's criticality and attached to the hook's review item; it never becomes the
         /// hook's target or a mapping, and the hook stays in review. Needs --allow-remote or --replay.
@@ -255,6 +260,28 @@ enum Command {
         #[arg(long, default_value_t = permanent_beta_engine::permanent_beta_repair::harness::DEFAULT_MAX_CASES)]
         max_cases: u32,
     },
+    /// Replay the cases recorded at an old RVA on a function of a new binary, by emulation (design §7.3). Exit
+    /// code 0 if every replayable case matches (and one could be replayed), 1 if one differs or none could.
+    Replay {
+        /// Recording directory (the recording hook DLL's PBETA_RECORD). Repeatable.
+        #[arg(long, required = true)]
+        cases: Vec<PathBuf>,
+        /// The new build's binary.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The recorded function's RVA in its build.
+        #[arg(long)]
+        old_rva: Rva,
+        /// The function to replay the cases on, in the new binary.
+        #[arg(long)]
+        new_rva: Rva,
+        /// Analysis of the new binary with `--pdb`: struct layouts, for translating recorded structs. Without
+        /// it, cases with struct memory are inconclusive.
+        #[arg(long)]
+        new_analysis: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and decide the review queue.
     Review {
         #[command(subcommand)]
@@ -340,6 +367,7 @@ fn run(cli: Cli) -> Result<u8> {
             store,
             old_trace,
             new_trace,
+            cases,
             propose,
             ai,
             json,
@@ -365,6 +393,7 @@ fn run(cli: Cli) -> Result<u8> {
                 trial_out: trial_out.as_deref(),
                 store: store.as_deref(),
                 traces,
+                cases: &cases,
                 proposer: backend
                     .as_ref()
                     .map(|b| (b as &dyn permanent_beta_ai::backend::Model, ai.shortlist)),
@@ -394,6 +423,21 @@ fn run(cli: Cli) -> Result<u8> {
             })
         }
         Command::Header { hooks, out } => cmd_header(&hooks, &out),
+        Command::Replay {
+            cases,
+            binary,
+            old_rva,
+            new_rva,
+            new_analysis,
+            json,
+        } => cmd_replay(ReplayArgs {
+            cases: &cases,
+            binary: &binary,
+            old_rva,
+            new_rva,
+            new_analysis: new_analysis.as_deref(),
+            json,
+        }),
         Command::HarnessSpec {
             hooks,
             analysis,
@@ -439,6 +483,92 @@ fn run(cli: Cli) -> Result<u8> {
             } => cmd_review_decide(&store, &id, &reviewer, Choice::Reject, note),
         },
     }
+}
+
+/// Recorded cases replayed on `binary`, which must be the build `new` analyzes; struct layouts from `new`.
+fn recorded_runner(
+    dirs: &[PathBuf],
+    binary: &Path,
+    new: &permanent_beta_model::AnalysisExport,
+) -> Result<permanent_beta_engine::recorded::RecordedCasesRunner> {
+    use permanent_beta_engine::permanent_beta_replay::{EMULATOR, Image, Recording};
+    let bytes = std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
+    let image = Image::parse(&bytes)
+        .map_err(|e| anyhow::anyhow!("{}: not a PE x64 image: {e}", binary.display()))?;
+    anyhow::ensure!(
+        image.build == new.build.id,
+        "{} is build {}, but the new analysis is of {}",
+        binary.display(),
+        image.build,
+        new.build.id
+    );
+    let recordings = dirs
+        .iter()
+        .map(|d| Recording::load(d).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    if !EMULATOR {
+        eprintln!(
+            "note: pbeta was built without the emulator (feature `emulator`): every recorded case is inconclusive"
+        );
+    }
+    Ok(permanent_beta_engine::recorded::RecordedCasesRunner::new(
+        recordings,
+        image,
+        new.types.clone(),
+    ))
+}
+
+struct ReplayArgs<'a> {
+    cases: &'a [PathBuf],
+    binary: &'a Path,
+    old_rva: Rva,
+    new_rva: Rva,
+    new_analysis: Option<&'a Path>,
+    json: bool,
+}
+
+fn cmd_replay(a: ReplayArgs) -> Result<u8> {
+    use permanent_beta_engine::permanent_beta_replay::CaseOutcome;
+    use permanent_beta_model::CheckOutcome;
+    let new = match a.new_analysis {
+        Some(p) => export::load(p)?,
+        // Without an analysis there are no layouts; the build id comes from the binary.
+        None => {
+            let bytes = std::fs::read(a.binary)
+                .with_context(|| format!("reading {}", a.binary.display()))?;
+            serde_json::from_value(serde_json::json!({
+                "schema_version": permanent_beta_model::ANALYSIS_SCHEMA_VERSION,
+                "build": { "id": permanent_beta_analysis::native::build_id(&bytes).0, "file_name": "",
+                           "version": null, "machine": "x64", "pdb": null },
+                "producer": { "tool": "pbeta replay", "version": "0" },
+                "functions": [],
+            }))?
+        }
+    };
+    let runner = recorded_runner(a.cases, a.binary, &new)?;
+    let j = runner.judge(None, a.old_rva, a.new_rva);
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&j)?);
+    } else {
+        for c in &j.cases {
+            let (what, text) = match &c.outcome {
+                CaseOutcome::Pass { detail } => ("pass", detail),
+                CaseOutcome::Fail { detail } => ("FAIL", detail),
+                CaseOutcome::Inconclusive { reason } => ("inconclusive", reason),
+            };
+            println!("{:<22} {what:<12} {text}", c.test_id);
+        }
+        let outcome = match j.outcome {
+            CheckOutcome::Pass => "pass",
+            CheckOutcome::Fail => "FAIL",
+            CheckOutcome::Inconclusive => "inconclusive",
+        };
+        println!("\n{outcome}: {}", j.detail);
+    }
+    Ok(match j.outcome {
+        CheckOutcome::Pass => EXIT_OK,
+        _ => EXIT_NEEDS_REVIEW,
+    })
 }
 
 fn cmd_harness_spec(hooks: &Path, analysis: &Path, out: &Path, max_cases: u32) -> Result<u8> {
@@ -547,6 +677,8 @@ struct RepairArgs<'a> {
     trial_out: Option<&'a Path>,
     store: Option<&'a Path>,
     traces: Option<(Vec<Trace>, Trace)>,
+    /// `--cases`: recording directories.
+    cases: &'a [PathBuf],
     /// `--propose`: the AI model and its shortlist length.
     proposer: Option<(&'a dyn permanent_beta_ai::backend::Model, usize)>,
     json: bool,
@@ -670,9 +802,18 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
                 .collect()
         })
         .unwrap_or_default();
-    let engine = match a.traces {
-        Some((o, n)) => Engine::with_behavioral(Box::new(TraceDiffRunner::with_baselines(o, n))),
-        None => Engine::with_defaults(),
+    let mut runners: Vec<Box<dyn BehavioralRunner>> = Vec::new();
+    if let Some((o, n)) = a.traces {
+        runners.push(Box::new(TraceDiffRunner::with_baselines(o, n)));
+    }
+    if !a.cases.is_empty() {
+        let bin = a.new_binary.context("--cases needs --new-binary")?;
+        runners.push(Box::new(recorded_runner(a.cases, bin, &new)?));
+    }
+    let engine = match runners.len() {
+        0 => Engine::with_defaults(),
+        1 => Engine::with_behavioral(runners.pop().expect("one runner")),
+        _ => Engine::with_behavioral(Box::new(AllOf(runners))),
     };
     let mut report = engine.repair_across(&manifest, &old, &earlier, &new, &priors);
     let proposal_notes = match a.proposer {
