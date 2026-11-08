@@ -24,10 +24,12 @@
 # 2026-11-07, lowered: three matching rules added for yaml-cpp's wrong matches (design §5.1) turn a few correct
 # candidates into review suggestions, never into wrong matches: the hash pass's caller veto, pairing copies by
 # elimination only with an agreeing neighbour, and the broader wrapper rule in similarity. /O2 724 and 731, /Od 1086 and 1092 (was 726/732, 1087/1093).
+# 2026-11-07, raised: the wrapper rule is overruled when >= 2 matched callers still call the function directly
+# and none calls the would-be wrapper (design §5.1 pass 6). o2-icf__v5.4.6__v5.4.7 724 -> 726, o2-icf__v5.4.7__v5.4.8 731 -> 732, o2__v5.4.6__v5.4.7 724 -> 726, o2__v5.4.7__v5.4.8 731 -> 732, od__v5.4.6__v5.4.7 1086 -> 1087.
 [gate.min_correct]
-"o2__v5.4.6__v5.4.7" = 724
-"o2__v5.4.7__v5.4.8" = 731
-"o2-icf__v5.4.6__v5.4.7" = 724
-"o2-icf__v5.4.7__v5.4.8" = 731
-"od__v5.4.6__v5.4.7" = 1086
+"o2__v5.4.6__v5.4.7" = 726
+"o2__v5.4.7__v5.4.8" = 732
+"o2-icf__v5.4.6__v5.4.7" = 726
+"o2-icf__v5.4.7__v5.4.8" = 732
+"od__v5.4.6__v5.4.7" = 1087
 "od__v5.4.7__v5.4.8" = 1092

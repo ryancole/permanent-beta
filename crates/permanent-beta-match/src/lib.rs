@@ -1197,6 +1197,9 @@ pub const SIM_MIN_MARGIN: f32 = 0.05;
 pub const SIM_MIN_SIZE: u32 = 16;
 /// Anchors shared by more functions than this are ignored when picking candidates. [Guess]
 pub const SIM_MAX_BUCKET: usize = 32;
+/// Matched callers that must call a candidate directly (and none its would-be wrapper) before the wrapper rule
+/// is overruled. [Guess]: 1 let zstd 1.5.6's BIT_reloadDStreamFast through as a wrong match.
+pub const WRAPPER_MIN_DIRECT_CALLERS: usize = 2;
 
 /// Component weights. [Guess]
 const SIM_WEIGHTS: [(&str, f32); 8] = [
@@ -1465,13 +1468,34 @@ impl Matcher for SimilarityMatcher {
                                     .all(|c| *c == n || ctx.matched_new.contains(c))
                         })
                 });
+            // The old function's matched callers decide: if at least WRAPPER_MIN_DIRECT_CALLERS of their
+            // counterparts call this function directly and none calls the wrapper, nothing moved behind it
+            // (Lua's lua_tolstring: 34 of 34 matched callers still call it, and some unrelated new helper calls
+            // it too). One caller isn't enough: zstd 1.5.6's BIT_reloadDStream was retargeted from the old
+            // BIT_reloadDStreamFast to the new body while other callers went through the new wrapper.
+            let callers_calling = |target: Rva| {
+                old_callers
+                    .get(&o)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| map.get(c))
+                    .filter(|nc| {
+                        ctx.new
+                            .function(**nc)
+                            .is_some_and(|f| f.callees.contains(&target))
+                    })
+                    .count()
+            };
+            let wrapper = wrapper.filter(|&w| {
+                callers_calling(n) < WRAPPER_MIN_DIRECT_CALLERS || callers_calling(w) > 0
+            });
             if let Some(w) = wrapper {
                 proposals.ambiguities.push(Ambiguity {
                     matcher: self.name().to_owned(),
                     old: vec![o],
                     new: vec![w, n],
                     detail: format!(
-                        "similar code (best {best:.2}), but it's the only callee of an unmatched new                          function: the old code may have moved behind a new wrapper"
+                        "similar code (best {best:.2}), but a smaller unmatched new function calls it: the old                          code may have moved behind a new wrapper"
                     ),
                 });
             } else if mutual
@@ -2754,5 +2778,59 @@ mod tests {
         // Control: both call matched x, so the pair is anchored.
         let (old, new) = copies(true);
         assert!(pairs(&old, &new).contains(&(0x30, 0x130)));
+    }
+
+    /// old: callers c1, c2 → f(0x10) → x. new: the edited f at 0x110, called by c1 and c2 if `direct` callers
+    /// (else c1 only), plus a small new helper w(0x130) that also calls it.
+    fn edited_with_helper(direct: usize) -> (AnalysisExport, AnalysisExport) {
+        let old = export(
+            "a",
+            vec![
+                named_calling(1, "c1", &[0x10]),
+                named_calling(3, "c2", &[0x10]),
+                named_calling(0x50, "x", &[]),
+                body(0x10, "h1", 5, &[0x50], 64),
+            ],
+        );
+        let c2_new: &[u64] = if direct >= 2 { &[0x110] } else { &[] };
+        let new = export(
+            "b",
+            vec![
+                named_calling(2, "c1", &[0x110]),
+                named_calling(4, "c2", c2_new),
+                named_calling(0x150, "x", &[]),
+                body(0x130, "hw", 0, &[0x110], 12),
+                body(0x110, "h2", 6, &[0x150], 66),
+            ],
+        );
+        (old, new)
+    }
+
+    #[test]
+    fn callers_still_calling_a_function_directly_overrule_the_wrapper_rule() {
+        // Lua's lua_tolstring: matched callers still call the edited function, so the small new helper that
+        // also calls it is not a wrapper it moved behind.
+        let (old, new) = edited_with_helper(2);
+        assert!(pairs(&old, &new).contains(&(0x10, 0x110)));
+    }
+
+    #[test]
+    fn one_direct_caller_does_not_overrule_the_wrapper_rule() {
+        // Negative (zstd 1.5.6's BIT_reloadDStreamFast): one matched caller was retargeted to the new body while
+        // the rest went through the new wrapper. One caller isn't enough to rule the wrapper out.
+        let (old, new) = edited_with_helper(1);
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x10)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(
+            got.ambiguities
+                .iter()
+                .any(|a| a.old == vec![Rva(0x10)] && a.new == vec![Rva(0x130), Rva(0x110)]),
+            "{:?}",
+            got.ambiguities
+        );
     }
 }
