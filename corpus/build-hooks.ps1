@@ -81,8 +81,11 @@ function Build-Harness {
     $lib = Join-Path $detoursDir 'lib.X64/detours.lib'
     $cl = @('/nologo', '/MD', '/O2', '/EHsc', '/W4', '/WX', '/std:c++17', '/Zi', '/D_CRT_SECURE_NO_WARNINGS', $inc)
     Write-Host 'building hookdll.dll and launcher.exe'
-    Invoke-Native 'cl.exe' ($cl + @('/LD', (Join-Path $hooksDir 'hookdll/hookdll.cpp'), "/Fo$bin\", "/Fd$bin\hookdll-cl.pdb",
-            "/Fe$bin\hookdll.dll", '/link', $lib, "/PDB:$bin\hookdll.pdb"))
+    # The record mode's register-capturing thunk (design §7.3).
+    Invoke-Native 'ml64.exe' @('/nologo', '/c', '/W3', '/WX', '/Zi', "/Fo$bin\record_thunk.obj",
+        (Join-Path $hooksDir 'hookdll/record_thunk.asm'))
+    Invoke-Native 'cl.exe' ($cl + @('/LD', (Join-Path $hooksDir 'hookdll/hookdll.cpp'), "$bin\record_thunk.obj", "/Fo$bin\",
+            "/Fd$bin\hookdll-cl.pdb", "/Fe$bin\hookdll.dll", '/link', $lib, "/PDB:$bin\hookdll.pdb"))
     Invoke-Native 'cl.exe' ($cl + @((Join-Path $hooksDir 'launcher/launcher.cpp'), "/Fo$bin\", "/Fd$bin\launcher-cl.pdb",
             "/Fe$bin\launcher.exe", '/link', $lib, "/PDB:$bin\launcher.pdb"))
 }

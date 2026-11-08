@@ -15,6 +15,8 @@
 //
 // Configuration comes from the environment, set by the launcher:
 //   PBETA_HOOKS  manifest path    PBETA_TRACE  trace output path    PBETA_BUILD  SHA-256 of the app's .exe
+// Record mode (below, "Record mode"), set by the caller of the launcher:
+//   PBETA_RECORD  recording directory    PBETA_SPEC  record spec (`pbeta harness-spec`)
 //
 // The detours are written against the v1 prototypes. They log arguments and results by value (never pointers,
 // which differ between runs), so traces of two builds can be compared line by line.
@@ -22,8 +24,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <bcrypt.h>
 #include <detours.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,6 +35,7 @@
 #include <vector>
 
 #pragma comment(linker, "/export:DetourFinishHelperProcess,@1,NONAME")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace {
 
@@ -295,6 +300,431 @@ std::string lower(std::string s) {
     return s;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Record mode (design §7.3): with PBETA_RECORD set, the DLL attaches the generic register-capturing thunk
+// (record_thunk.asm) instead of the logging detours, to every hook of the record spec (PBETA_SPEC, written by
+// `pbeta harness-spec`) bound to the running build. Per call it writes one JSON test case
+// (permanent_beta_model::TestCase) to PBETA_RECORD/cases/<hook>/, the memory behind pointer arguments before and
+// after the call to PBETA_RECORD/blobs/<sha256>, and copies the spec to PBETA_RECORD/spec.toml. Identical calls are
+// recorded once, and at most `max_cases` per hook. Recordings can contain customer data: they stay local.
+
+const char kRecorder[] = "permanent-beta-hookdll 0.1";
+constexpr int kThunks = 16;
+constexpr int kMaxArgs = 16;
+
+// Must match record_thunk.asm.
+struct RecordFrame {
+    unsigned long long gpr[4];      // rcx, rdx, r8, r9
+    unsigned char xmm[4][16];       // xmm0-xmm3
+    unsigned long long slot;        // which thunk
+    unsigned long long entry_rsp;   // [entry_rsp] is the return address
+    unsigned long long rax;         // returned
+    unsigned char xmm0[16];         // returned
+    void* call;                     // the pending call (RecordCall), or null when not recording it
+};
+static_assert(offsetof(RecordFrame, xmm) == 0x20, "record_thunk.asm F_XMM");
+static_assert(offsetof(RecordFrame, slot) == 0x60, "record_thunk.asm F_SLOT");
+static_assert(offsetof(RecordFrame, entry_rsp) == 0x68, "record_thunk.asm F_RSP");
+static_assert(offsetof(RecordFrame, rax) == 0x70, "record_thunk.asm F_RAX");
+static_assert(offsetof(RecordFrame, xmm0) == 0x78, "record_thunk.asm F_XMM0");
+static_assert(offsetof(RecordFrame, call) == 0x88, "record_thunk.asm F_CALL");
+static_assert(sizeof(RecordFrame) == 0x90, "record_thunk.asm FRAME_BYTES");
+
+// One argument of the spec (`[[hook.arg]]`).
+struct RecArg {
+    int index = -1;
+    std::string slot, capture, layout, len_slot;
+    unsigned long long size = 0, max = 0;
+};
+
+struct RecHook {
+    std::string name, rva;
+    unsigned stack_args = 0;
+    std::vector<RecArg> args;
+};
+
+struct RecSpec {
+    std::string build;
+    unsigned max_cases = 32;
+    std::vector<RecHook> hooks;
+};
+
+// The TOML subset `pbeta harness-spec` writes: top-level keys, [[hook]], [[hook.arg]]; other tables are skipped.
+bool parse_spec(const char* path, RecSpec& spec) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    std::string section = "top";
+    char buf[4096];
+    while (std::fgets(buf, sizeof buf, f)) {
+        std::string line = trim(buf);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (line == "[[hook]]") {
+            spec.hooks.emplace_back();
+            section = "hook";
+            continue;
+        }
+        if (line == "[[hook.arg]]") {
+            if (!spec.hooks.empty()) {
+                spec.hooks.back().args.emplace_back();
+                section = "arg";
+            }
+            continue;
+        }
+        if (line[0] == '[') {
+            section = "other";
+            continue;
+        }
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        std::string key = trim(line.substr(0, eq));
+        std::string value = toml_value(line.substr(eq + 1));
+        unsigned long long n = std::strtoull(value.c_str(), nullptr, 0);
+        if (section == "top") {
+            if (key == "build") {
+                spec.build = value;
+            } else if (key == "max_cases") {
+                spec.max_cases = static_cast<unsigned>(n);
+            }
+        } else if (section == "hook") {
+            RecHook& h = spec.hooks.back();
+            if (key == "name") {
+                h.name = value;
+            } else if (key == "rva") {
+                h.rva = value;
+            } else if (key == "stack_args") {
+                h.stack_args = static_cast<unsigned>(n);
+            }
+        } else if (section == "arg") {
+            RecArg& a = spec.hooks.back().args.back();
+            if (key == "index") {
+                a.index = static_cast<int>(n);
+            } else if (key == "slot") {
+                a.slot = value;
+            } else if (key == "capture") {
+                a.capture = value;
+            } else if (key == "size") {
+                a.size = n;
+            } else if (key == "layout") {
+                a.layout = value;
+            } else if (key == "len_slot") {
+                a.len_slot = value;
+            } else if (key == "max") {
+                a.max = n;
+            }
+        }
+    }
+    std::fclose(f);
+    return true;
+}
+
+extern "C" {
+void pbeta_record_thunk0();
+void pbeta_record_thunk1();
+void pbeta_record_thunk2();
+void pbeta_record_thunk3();
+void pbeta_record_thunk4();
+void pbeta_record_thunk5();
+void pbeta_record_thunk6();
+void pbeta_record_thunk7();
+void pbeta_record_thunk8();
+void pbeta_record_thunk9();
+void pbeta_record_thunk10();
+void pbeta_record_thunk11();
+void pbeta_record_thunk12();
+void pbeta_record_thunk13();
+void pbeta_record_thunk14();
+void pbeta_record_thunk15();
+}
+
+void (*const g_thunks[kThunks])() = {
+    pbeta_record_thunk0,  pbeta_record_thunk1,  pbeta_record_thunk2,  pbeta_record_thunk3,
+    pbeta_record_thunk4,  pbeta_record_thunk5,  pbeta_record_thunk6,  pbeta_record_thunk7,
+    pbeta_record_thunk8,  pbeta_record_thunk9,  pbeta_record_thunk10, pbeta_record_thunk11,
+    pbeta_record_thunk12, pbeta_record_thunk13, pbeta_record_thunk14, pbeta_record_thunk15,
+};
+
+struct RecSite {
+    RecHook hook;
+    unsigned long long rva = 0;
+    PVOID real = nullptr;  // the Detours trampoline
+    unsigned cases = 0;
+    std::vector<std::string> seen;  // keys of the cases written, to drop identical calls
+};
+
+RecSite g_rec_sites[kThunks];
+std::string g_rec_dir;
+std::string g_rec_build;
+unsigned g_rec_max = 32;
+unsigned long long g_image_base = 0;
+
+// Copies n bytes, or fails on memory that can't be read. No C++ objects here: __try needs none to unwind.
+bool safe_copy(void* dst, const void* src, size_t n) {
+    __try {
+        std::memcpy(dst, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Length of a NUL-terminated string, counting the NUL, at most max bytes; 0 if unreadable.
+size_t safe_strlen(const char* s, size_t max) {
+    __try {
+        for (size_t i = 0; i < max; i++) {
+            if (s[i] == '\0') {
+                return i + 1;
+            }
+        }
+        return max;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+std::string hex_bytes(const unsigned char* p, size_t n) {
+    static const char digits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(n * 2);
+    for (size_t i = 0; i < n; i++) {
+        out += digits[p[i] >> 4];
+        out += digits[p[i] & 15];
+    }
+    return out;
+}
+
+std::string sha256_hex(const std::vector<unsigned char>& data) {
+    unsigned char digest[32] = {};
+    BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, const_cast<PUCHAR>(data.data()),
+               static_cast<ULONG>(data.size()), digest, sizeof digest);
+    return hex_bytes(digest, sizeof digest);
+}
+
+// The 64-bit value of an argument slot at entry (`rcx`, `xmm1`, `stack+0x28`).
+bool slot_value(const RecordFrame* f, const std::string& slot, unsigned long long& out) {
+    static const char* const regs[] = {"rcx", "rdx", "r8", "r9"};
+    for (int i = 0; i < 4; i++) {
+        if (slot == regs[i]) {
+            out = f->gpr[i];
+            return true;
+        }
+    }
+    if (slot.size() == 4 && slot.compare(0, 3, "xmm") == 0 && slot[3] >= '0' && slot[3] <= '3') {
+        std::memcpy(&out, f->xmm[slot[3] - '0'], 8);
+        return true;
+    }
+    if (slot.compare(0, 6, "stack+") == 0) {
+        unsigned long long off = std::strtoull(slot.c_str() + 6, nullptr, 0);
+        return safe_copy(&out, reinterpret_cast<const void*>(f->entry_rsp + off), 8);
+    }
+    return false;
+}
+
+struct PendingRegion {
+    int arg = -1;
+    unsigned long long address = 0;
+    std::string kind, layout;
+    std::vector<unsigned char> before, after;
+};
+
+struct RecordCall {
+    RecSite* site = nullptr;
+    unsigned long long gpr[4] = {};
+    unsigned char xmm[4][16] = {};
+    std::vector<unsigned long long> stack;
+    std::vector<PendingRegion> regions;
+};
+
+std::string write_blob(const std::vector<unsigned char>& data) {
+    std::string digest = sha256_hex(data);
+    std::string path = g_rec_dir + "\\blobs\\" + digest;
+    if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            if (!data.empty()) {
+                std::fwrite(data.data(), 1, data.size(), f);
+            }
+            std::fclose(f);
+        }
+    }
+    return "sha256:" + digest;
+}
+
+std::string word(unsigned long long v) {
+    return quoted(hex(v));
+}
+
+void finish_case(RecordCall* call, const RecordFrame* f) {
+    RecSite& site = *call->site;
+    // Everything but the id, for spotting identical calls.
+    std::string body = "\"build\":" + quoted(g_rec_build) + ",\"rva\":" + word(site.rva) + ",\"recorder\":" +
+                       quoted(kRecorder) + ",\"abi\":\"win64\",\"image_base\":" + word(g_image_base) +
+                       ",\"entry\":{\"rcx\":" + word(call->gpr[0]) + ",\"rdx\":" + word(call->gpr[1]) +
+                       ",\"r8\":" + word(call->gpr[2]) + ",\"r9\":" + word(call->gpr[3]) + ",\"xmm\":[";
+    for (int i = 0; i < 4; i++) {
+        body += (i ? "," : "") + quoted(hex_bytes(call->xmm[i], 16));
+    }
+    body += "],\"stack\":[";
+    for (size_t i = 0; i < call->stack.size(); i++) {
+        body += (i ? "," : "") + word(call->stack[i]);
+    }
+    body += "]},\"regions\":[";
+    bool first = true;
+    for (PendingRegion& r : call->regions) {
+        r.after.resize(r.before.size());
+        if (!r.before.empty() &&
+            !safe_copy(r.after.data(), reinterpret_cast<const void*>(r.address), r.after.size())) {
+            return;  // freed during the call: the case can't say what was written
+        }
+        body += std::string(first ? "" : ",") + "{\"arg\":" + num(r.arg) + ",\"address\":" + word(r.address) +
+                ",\"size\":" + num(static_cast<long long>(r.before.size())) + ",\"kind\":" + quoted(r.kind) +
+                (r.layout.empty() ? "" : ",\"layout\":" + quoted(r.layout)) + ",\"before\":" +
+                quoted(write_blob(r.before)) + ",\"after\":" + quoted(write_blob(r.after)) + "}";
+        first = false;
+    }
+    body += "],\"observed\":{\"rax\":" + word(f->rax) + ",\"xmm0\":" + quoted(hex_bytes(f->xmm0, 16)) + "}";
+
+    EnterCriticalSection(&g_lock);
+    bool seen = false;
+    for (const std::string& k : site.seen) {
+        seen = seen || k == body;
+    }
+    if (!seen && site.cases < g_rec_max) {
+        site.seen.push_back(body);
+        site.cases++;
+        char id[32];
+        std::snprintf(id, sizeof id, "%04u", site.cases);
+        std::string test_id = site.hook.name + "-" + id;
+        std::string path = g_rec_dir + "\\cases\\" + site.hook.name + "\\" + test_id + ".json";
+        if (FILE* out = std::fopen(path.c_str(), "wb")) {
+            std::string json = "{\"test_id\":" + quoted(test_id) + ",\"hook\":" + quoted(site.hook.name) + "," +
+                               body + "}\n";
+            std::fputs(json.c_str(), out);
+            std::fclose(out);
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
+}  // namespace
+
+// Called by record_thunk.asm before the original: capture the entry state and the arguments' memory. Returns the
+// original function.
+extern "C" void* pbeta_record_before(RecordFrame* f) {
+    RecSite& site = g_rec_sites[f->slot % kThunks];
+    f->call = nullptr;
+    EnterCriticalSection(&g_lock);
+    bool full = site.cases >= g_rec_max;
+    LeaveCriticalSection(&g_lock);
+    if (full) {
+        return site.real;
+    }
+    auto* call = new RecordCall;
+    call->site = &site;
+    std::memcpy(call->gpr, f->gpr, sizeof call->gpr);
+    std::memcpy(call->xmm, f->xmm, sizeof call->xmm);
+    for (unsigned i = 0; i < site.hook.stack_args && i < 8; i++) {
+        unsigned long long v = 0;
+        safe_copy(&v, reinterpret_cast<const void*>(f->entry_rsp + 0x28 + 8 * i), 8);
+        call->stack.push_back(v);
+    }
+    for (const RecArg& a : site.hook.args) {
+        unsigned long long address = 0;
+        if (a.capture.empty() || a.capture == "none" || !slot_value(f, a.slot, address) || address == 0) {
+            continue;
+        }
+        size_t n = 0;
+        if (a.capture == "fixed") {
+            n = static_cast<size_t>(a.size);
+        } else if (a.capture == "cstring") {
+            n = safe_strlen(reinterpret_cast<const char*>(address), static_cast<size_t>(a.max ? a.max : 4096));
+        } else if (a.capture == "sized") {
+            unsigned long long len = 0;
+            if (slot_value(f, a.len_slot, len)) {
+                long long signed_len = static_cast<int>(len & 0xffffffffu);  // the length is an `int`-sized value
+                n = signed_len > 0 ? static_cast<size_t>(signed_len) : 0;
+                if (a.max && n > a.max) {
+                    n = static_cast<size_t>(a.max);
+                }
+            }
+        }
+        PendingRegion r;
+        r.arg = a.index;
+        r.address = address;
+        r.kind = a.capture;
+        r.layout = a.layout;
+        r.before.resize(n);
+        if (n && !safe_copy(r.before.data(), reinterpret_cast<const void*>(address), n)) {
+            continue;  // unreadable: not captured, so a replay that reads it is inconclusive
+        }
+        call->regions.push_back(std::move(r));
+    }
+    f->call = call;
+    return site.real;
+}
+
+// Called by record_thunk.asm after the original returned: the memory again, then the test case.
+extern "C" void pbeta_record_after(RecordFrame* f) {
+    auto* call = static_cast<RecordCall*>(f->call);
+    if (!call) {
+        return;
+    }
+    finish_case(call, f);
+    delete call;
+}
+
+namespace {
+
+void record_all(const std::string& build) {
+    emit("{\"event\":\"start\",\"build\":" + quoted(build) + "}");
+    RecSpec spec;
+    std::string path = env("PBETA_SPEC");
+    if (path.empty() || !parse_spec(path.c_str(), spec)) {
+        emit("{\"event\":\"error\",\"detail\":" + quoted("cannot read record spec " + path) + "}");
+        return;
+    }
+    if (lower(spec.build) != build) {
+        emit("{\"event\":\"error\",\"detail\":" + quoted("record spec is for build " + spec.build) + "}");
+        return;
+    }
+    g_rec_build = build;
+    g_rec_max = spec.max_cases;
+    g_image_base = reinterpret_cast<unsigned long long>(GetModuleHandleW(nullptr));
+    CreateDirectoryA(g_rec_dir.c_str(), nullptr);
+    CreateDirectoryA((g_rec_dir + "\\cases").c_str(), nullptr);
+    CreateDirectoryA((g_rec_dir + "\\blobs").c_str(), nullptr);
+    CopyFileA(path.c_str(), (g_rec_dir + "\\spec.toml").c_str(), FALSE);
+
+    int used = 0;
+    for (const RecHook& h : spec.hooks) {
+        if (used == kThunks) {
+            emit("{\"event\":\"skip\",\"hook\":" + quoted(h.name) + ",\"reason\":\"no_thunk_left\"}");
+            continue;
+        }
+        RecSite& site = g_rec_sites[used];
+        site.hook = h;
+        site.rva = std::strtoull(h.rva.c_str(), nullptr, 0);
+        site.real = reinterpret_cast<unsigned char*>(g_image_base) + site.rva;
+        CreateDirectoryA((g_rec_dir + "\\cases\\" + h.name).c_str(), nullptr);
+
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        LONG err = DetourAttach(&site.real, reinterpret_cast<PVOID>(g_thunks[used]));
+        if (err == NO_ERROR) {
+            err = DetourTransactionCommit();
+        } else {
+            DetourTransactionAbort();
+        }
+        emit("{\"event\":\"attach\",\"hook\":" + quoted(h.name) + ",\"rva\":\"" + hex(site.rva) + "\",\"status\":" +
+             quoted(err == NO_ERROR ? "ok" : "error " + num(err)) + "}");
+        used++;
+    }
+}
+
 void attach_all() {
     std::string build = lower(env("PBETA_BUILD"));
     emit("{\"event\":\"start\",\"build\":" + quoted(build) + "}");
@@ -361,7 +791,12 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         if (!path.empty()) {
             g_trace = std::fopen(path.c_str(), "wb");
         }
-        attach_all();
+        g_rec_dir = env("PBETA_RECORD");
+        if (g_rec_dir.empty()) {
+            attach_all();
+        } else {
+            record_all(lower(env("PBETA_BUILD")));
+        }
     } else if (reason == DLL_PROCESS_DETACH) {
         // Detours stay attached: the process is exiting, and its code is about to go away with them.
         emit("{\"event\":\"end\"}");

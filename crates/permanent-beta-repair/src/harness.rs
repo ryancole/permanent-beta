@@ -1,0 +1,434 @@
+//! Record spec for the recording hook DLL (design §7.3, `pbeta harness-spec`): from the hook manifest, each hook's
+//! prototype and the build's PDB struct layouts, what to capture per call.
+//!
+//! Per parameter: its Win64 slot, how the value travels (integer, float, pointer) and its width, and for a
+//! pointer what it points to:
+//! - a struct the PDB lays out, or a scalar: that many bytes (`fixed`);
+//! - `const char*` / `char*`: a NUL-terminated string (`cstring`);
+//! - a byte pointer (`char*`, `unsigned char*`, `void*`, …) directly followed by an integer whose name says it's
+//!   a length (`len`, `size`, `cap`, `n`, …): that many bytes (`sized`). **[Guess]**: the names are the only
+//!   evidence. A wrong guess captures too little (replay reads uncaptured memory: inconclusive), never too much:
+//!   the recorder reads at most `max` bytes and survives unreadable memory.
+//! - anything else (a struct without a layout, `T**`, an unknown typedef): nothing. A replay that reads it is
+//!   inconclusive.
+//!
+//! The spec is TOML, meant to be read and edited before recording.
+
+use crate::prototype::Prototype;
+use permanent_beta_model::{
+    AnalysisExport, ArgSlot, ArgSpec, CaptureKind, HarnessSpec, HookManifest, HookRecordSpec,
+    SkippedHook, ValueType,
+};
+
+/// Default cap on distinct cases per hook. **[Guess]**
+pub const DEFAULT_MAX_CASES: u32 = 32;
+/// Most bytes captured for a C string. **[Guess]**
+pub const CSTRING_MAX: u64 = 4096;
+/// Most bytes captured for a buffer sized by another argument. **[Guess]**
+pub const SIZED_MAX: u64 = 64 * 1024;
+
+/// The spec for every hook of `manifest` bound to `build`'s build. `build` should be analyzed with `--pdb`, or
+/// no struct gets a layout (its pointers capture nothing).
+pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> HarnessSpec {
+    let mut out = HarnessSpec {
+        build: build.build.id.clone(),
+        max_cases,
+        hooks: Vec::new(),
+        skipped: Vec::new(),
+        layouts: Vec::new(),
+    };
+    for hook in &manifest.hooks {
+        let skip = |reason: String| SkippedHook {
+            name: hook.name.clone(),
+            reason,
+        };
+        if hook.target.build != build.build.id {
+            out.skipped.push(skip(format!(
+                "bound to build {}, not this one",
+                hook.target.build
+            )));
+            continue;
+        }
+        let Some(rva) = hook.target.rva else {
+            out.skipped.push(skip("no RVA".into()));
+            continue;
+        };
+        let Some(text) = hook.prototype.as_deref() else {
+            out.skipped.push(skip("no prototype".into()));
+            continue;
+        };
+        let Some(proto) = Prototype::parse(text) else {
+            out.skipped
+                .push(skip(format!("can't parse the prototype {text:?}")));
+            continue;
+        };
+        let mut args = Vec::new();
+        for (i, p) in proto.params.iter().enumerate() {
+            let value = value_type(&p.ty);
+            let index = i as u32;
+            let slot = ArgSlot::for_param(index, value.in_vector_register());
+            let mut arg = ArgSpec {
+                index,
+                slot,
+                name: p.name.clone(),
+                ty: p.ty.clone(),
+                value,
+                capture: CaptureKind::None,
+                size: None,
+                layout: None,
+                len_slot: None,
+                max: None,
+            };
+            if value == ValueType::Pointer {
+                let next = proto.params.get(i + 1);
+                match pointee(&p.ty) {
+                    Pointee::Bytes { cstring } => {
+                        let len = next.filter(|n| {
+                            matches!(value_type(&n.ty), ValueType::Int(_))
+                                && n.name.as_deref().is_some_and(is_length_name)
+                        });
+                        if len.is_some() {
+                            arg.capture = CaptureKind::Sized;
+                            arg.len_slot = Some(ArgSlot::for_param(index + 1, false));
+                            arg.max = Some(SIZED_MAX);
+                        } else if cstring {
+                            arg.capture = CaptureKind::Cstring;
+                            arg.max = Some(CSTRING_MAX);
+                        }
+                    }
+                    Pointee::Scalar(size) => {
+                        arg.capture = CaptureKind::Fixed;
+                        arg.size = Some(size);
+                    }
+                    Pointee::Named(name) => {
+                        if let Some(layout) = build.type_layout(&name) {
+                            arg.capture = CaptureKind::Fixed;
+                            arg.size = Some(layout.size);
+                            arg.layout = Some(name.clone());
+                            if out.layout(&name).is_none() {
+                                out.layouts.push(layout.clone());
+                            }
+                        }
+                    }
+                    Pointee::Unknown => {}
+                }
+            }
+            args.push(arg);
+        }
+        out.hooks.push(HookRecordSpec {
+            name: hook.name.clone(),
+            rva,
+            prototype: text.to_owned(),
+            ret: return_type(&proto),
+            stack_args: proto.params.len().saturating_sub(4) as u32,
+            args,
+        });
+    }
+    out
+}
+
+fn return_type(proto: &Prototype) -> ValueType {
+    let ty: Vec<&str> = proto
+        .head
+        .split_whitespace()
+        .filter(|w| !w.starts_with("__") && *w != "static" && *w != "inline")
+        .collect();
+    value_type(&ty.join(" "))
+}
+
+/// Words that don't change how a value travels.
+fn significant_words(ty: &str) -> Vec<&str> {
+    ty.split(|c: char| c.is_whitespace())
+        .filter(|w| {
+            !w.is_empty()
+                && !matches!(
+                    *w,
+                    "const" | "volatile" | "struct" | "class" | "union" | "signed" | "__restrict"
+                )
+                && !w.starts_with("__") // calling conventions
+        })
+        .collect()
+}
+
+/// How a parameter of type `ty` travels in Win64, and how wide it is.
+pub fn value_type(ty: &str) -> ValueType {
+    if ty.contains('*') || ty.contains('&') || ty.contains('[') {
+        return ValueType::Pointer;
+    }
+    scalar(&significant_words(ty).join(" ")).unwrap_or(ValueType::Unknown)
+}
+
+/// Built-in and common fixed-width scalar types (LLP64: `long` is 4 bytes, MSVC's `long double` is 8).
+fn scalar(ty: &str) -> Option<ValueType> {
+    use ValueType::{Float, Int, Void};
+    Some(match ty {
+        "void" => Void,
+        "bool" | "char" | "unsigned char" | "int8_t" | "uint8_t" | "BYTE" | "BOOLEAN" => Int(1),
+        "short" | "unsigned short" | "short int" | "unsigned short int" | "int16_t"
+        | "uint16_t" | "wchar_t" | "WORD" => Int(2),
+        "int" | "unsigned" | "unsigned int" | "long" | "unsigned long" | "long int"
+        | "unsigned long int" | "int32_t" | "uint32_t" | "DWORD" | "BOOL" | "LONG" | "UINT" => {
+            Int(4)
+        }
+        "long long"
+        | "unsigned long long"
+        | "long long int"
+        | "unsigned long long int"
+        | "__int64"
+        | "int64_t"
+        | "uint64_t"
+        | "size_t"
+        | "ptrdiff_t"
+        | "intptr_t"
+        | "uintptr_t"
+        | "ssize_t"
+        | "SIZE_T"
+        | "DWORD64"
+        | "ULONG_PTR"
+        | "LONG_PTR" => Int(8),
+        "float" => Float(4),
+        "double" | "long double" => Float(8),
+        _ => return None,
+    })
+}
+
+enum Pointee {
+    /// A byte type (`char`, `unsigned char`, `void`, …); `cstring` for plain `char`.
+    Bytes {
+        cstring: bool,
+    },
+    Scalar(u64),
+    /// A struct, class or union name to look up in the PDB layouts.
+    Named(String),
+    Unknown,
+}
+
+fn pointee(ty: &str) -> Pointee {
+    if ty.contains('&') || ty.contains('[') || ty.matches('*').count() != 1 {
+        return Pointee::Unknown;
+    }
+    let base = ty.replace('*', " ");
+    let words = significant_words(&base);
+    let joined = words.join(" ");
+    match joined.as_str() {
+        "char" => return Pointee::Bytes { cstring: true },
+        "unsigned char" | "uint8_t" | "int8_t" | "void" | "BYTE" => {
+            return Pointee::Bytes { cstring: false };
+        }
+        _ => {}
+    }
+    if let Some(v) = scalar(&joined) {
+        return v
+            .width()
+            .map_or(Pointee::Unknown, |w| Pointee::Scalar(u64::from(w)));
+    }
+    match words.as_slice() {
+        [name]
+            if name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') =>
+        {
+            Pointee::Named((*name).to_owned())
+        }
+        _ => Pointee::Unknown,
+    }
+}
+
+/// Parameter names that say "the byte count of the previous parameter". **[Guess]**
+fn is_length_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "n" | "len" | "length" | "size" | "cap" | "capacity" | "count" | "bytes" | "nbytes" | "cb"
+    ) || ["len", "size", "_cap", "_bytes"]
+        .iter()
+        .any(|s| n.ends_with(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use permanent_beta_model::{
+        BuildId, Criticality, FieldLayout, HookSpec, Rva, TargetLocator, TypeLayout,
+    };
+
+    fn export(id: &str, types: Vec<TypeLayout>) -> AnalysisExport {
+        let mut e: AnalysisExport = serde_json::from_value(serde_json::json!({
+            "schema_version": permanent_beta_model::ANALYSIS_SCHEMA_VERSION,
+            "build": { "id": id, "file_name": "t.exe", "version": null, "machine": "x64", "pdb": null },
+            "producer": { "tool": "test", "version": "0" },
+            "functions": [],
+        }))
+        .unwrap();
+        e.types = types;
+        e
+    }
+
+    fn order() -> TypeLayout {
+        let f = |name: &str, offset, size, ty: &str| FieldLayout {
+            name: name.into(),
+            offset,
+            size,
+            ty: ty.into(),
+            bits: None,
+        };
+        TypeLayout {
+            name: "Order".into(),
+            size: 0x4c,
+            union: false,
+            fields: vec![
+                f("id", 0, 4, "int"),
+                f("count", 4, 4, "int"),
+                f("skus", 8, 32, "int[8]"),
+                f("qtys", 0x28, 32, "int[8]"),
+                f("total", 0x48, 4, "int"),
+            ],
+        }
+    }
+
+    fn manifest(hooks: &[(&str, Option<&str>, &str)]) -> HookManifest {
+        HookManifest {
+            hooks: hooks
+                .iter()
+                .enumerate()
+                .map(|(i, (name, proto, build))| HookSpec {
+                    name: (*name).into(),
+                    detour: None,
+                    criticality: Criticality::Normal,
+                    prototype: proto.map(str::to_owned),
+                    trial: false,
+                    target: TargetLocator {
+                        build: BuildId((*build).into()),
+                        rva: Some(Rva(0x1000 + 0x10 * i as u64)),
+                        symbol: None,
+                        pattern: None,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn the_hook_apps_spec() -> HarnessSpec {
+        let m = manifest(&[
+            ("price_lookup", Some("int price_lookup(int sku)"), "v1"),
+            (
+                "order_add",
+                Some("int order_add(Order* o, int sku, int qty)"),
+                "v1",
+            ),
+            (
+                "format_receipt",
+                Some(
+                    "int format_receipt(char* buf, int cap, const Order* o, const char* customer)",
+                ),
+                "v1",
+            ),
+            (
+                "checksum",
+                Some("unsigned checksum(const unsigned char* data, int len)"),
+                "v1",
+            ),
+            (
+                "log_event",
+                Some("void log_event(const char* msg, int code)"),
+                "v1",
+            ),
+            (
+                "scale",
+                Some("double scale(double x, float f, int* out, long long k, double y)"),
+                "v1",
+            ),
+        ]);
+        spec(&m, &export("v1", vec![order()]), DEFAULT_MAX_CASES)
+    }
+
+    #[test]
+    fn scalars_travel_in_their_registers() {
+        let s = the_hook_apps_spec();
+        let h = s.hook("price_lookup").unwrap();
+        assert_eq!(h.ret, ValueType::Int(4));
+        assert_eq!(h.args[0].slot, ArgSlot::Int(0));
+        assert_eq!(h.args[0].capture, CaptureKind::None);
+        let h = s.hook("scale").unwrap();
+        assert_eq!(h.ret, ValueType::Float(8));
+        let slots: Vec<String> = h.args.iter().map(|a| a.slot.to_string()).collect();
+        assert_eq!(slots, ["xmm0", "xmm1", "r8", "r9", "stack+0x28"]);
+        assert_eq!(h.stack_args, 1);
+        // `int* out`: a scalar pointee, 4 bytes.
+        assert_eq!(
+            (h.args[2].capture, h.args[2].size),
+            (CaptureKind::Fixed, Some(4))
+        );
+        assert_eq!(s.hook("log_event").unwrap().ret, ValueType::Void);
+    }
+
+    #[test]
+    fn struct_pointers_capture_the_pdb_layout() {
+        let s = the_hook_apps_spec();
+        let a = &s.hook("order_add").unwrap().args[0];
+        assert_eq!(
+            (a.capture, a.size, a.layout.as_deref()),
+            (CaptureKind::Fixed, Some(0x4c), Some("Order"))
+        );
+        assert_eq!(s.layouts, vec![order()], "each layout once");
+    }
+
+    #[test]
+    fn strings_and_sized_buffers() {
+        let s = the_hook_apps_spec();
+        let fr = s.hook("format_receipt").unwrap();
+        assert_eq!(fr.args[0].capture, CaptureKind::Sized, "char* buf, int cap");
+        assert_eq!(fr.args[0].len_slot, Some(ArgSlot::Int(1)));
+        assert_eq!(fr.args[3].capture, CaptureKind::Cstring);
+        let c = s.hook("checksum").unwrap();
+        assert_eq!(c.args[0].capture, CaptureKind::Sized);
+        assert_eq!(c.args[0].max, Some(SIZED_MAX));
+        // `const char* msg, int code`: `code` isn't a length, so it's a string.
+        assert_eq!(
+            s.hook("log_event").unwrap().args[0].capture,
+            CaptureKind::Cstring
+        );
+    }
+
+    #[test]
+    fn unknown_pointees_capture_nothing() {
+        // Negative: no PDB layout for Order, a pointer to a pointer, an unknown typedef, a byte buffer with no
+        // length after it.
+        let m = manifest(&[
+            ("a", Some("int a(Order* o)"), "v1"),
+            ("b", Some("int b(char** argv)"), "v1"),
+            ("c", Some("int c(HANDLE_T* h)"), "v1"),
+            ("d", Some("int d(unsigned char* p, int flags)"), "v1"),
+        ]);
+        let s = spec(&m, &export("v1", vec![]), 8);
+        for h in &s.hooks {
+            assert_eq!(h.args[0].capture, CaptureKind::None, "{}", h.name);
+        }
+        assert!(s.layouts.is_empty());
+        // A struct by value has no single-register value type.
+        assert_eq!(value_type("Order"), ValueType::Unknown);
+    }
+
+    #[test]
+    fn hooks_that_cant_be_recorded_are_listed() {
+        // Negative: another build's hook, no prototype, an unparsable prototype.
+        let m = manifest(&[
+            ("other", Some("int f(int)"), "v0"),
+            ("none", None, "v1"),
+            ("bad", Some("int (*f)(int)"), "v1"),
+        ]);
+        let s = spec(&m, &export("v1", vec![]), 8);
+        assert!(s.hooks.is_empty());
+        let names: Vec<&str> = s.skipped.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["other", "none", "bad"]);
+    }
+
+    #[test]
+    fn the_spec_round_trips_through_toml() {
+        let s = the_hook_apps_spec();
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(text.contains("[[hook.arg]]"), "{text}");
+        assert!(text.contains("slot = \"rcx\""), "{text}");
+        assert_eq!(toml::from_str::<HarnessSpec>(&text).unwrap(), s);
+    }
+}

@@ -239,6 +239,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Write the record spec for the recording hook DLL (design §7.3): per hook, its argument slots, how each
+    /// value travels, and what each pointer points to (from the prototype and the build's PDB struct layouts).
+    HarnessSpec {
+        /// Hook manifest bound to the build to record.
+        #[arg(long)]
+        hooks: PathBuf,
+        /// Analysis of that build, from `pbeta analyze --pdb` (struct layouts; without them struct pointers
+        /// capture nothing).
+        #[arg(long)]
+        analysis: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Distinct cases recorded per hook at most.
+        #[arg(long, default_value_t = permanent_beta_engine::permanent_beta_repair::harness::DEFAULT_MAX_CASES)]
+        max_cases: u32,
+    },
     /// Inspect and decide the review queue.
     Review {
         #[command(subcommand)]
@@ -378,6 +394,12 @@ fn run(cli: Cli) -> Result<u8> {
             })
         }
         Command::Header { hooks, out } => cmd_header(&hooks, &out),
+        Command::HarnessSpec {
+            hooks,
+            analysis,
+            out,
+            max_cases,
+        } => cmd_harness_spec(&hooks, &analysis, &out, max_cases),
         Command::TraceDiff {
             old,
             new,
@@ -417,6 +439,58 @@ fn run(cli: Cli) -> Result<u8> {
             } => cmd_review_decide(&store, &id, &reviewer, Choice::Reject, note),
         },
     }
+}
+
+fn cmd_harness_spec(hooks: &Path, analysis: &Path, out: &Path, max_cases: u32) -> Result<u8> {
+    use permanent_beta_model::CaptureKind;
+    let manifest = load_manifest(hooks)?;
+    let build = export::load(analysis)?;
+    let spec =
+        permanent_beta_engine::permanent_beta_repair::harness::spec(&manifest, &build, max_cases);
+    let text = format!(
+        "# Record spec for the recording hook DLL (pbeta harness-spec; design §7.3). Edit `capture` to change what\n\
+         # is recorded. Recordings can contain customer data: keep them local.\n{}",
+        toml::to_string_pretty(&spec)?
+    );
+    std::fs::write(out, text).with_context(|| format!("writing {}", out.display()))?;
+    for h in &spec.hooks {
+        let captured: Vec<String> = h
+            .args
+            .iter()
+            .filter(|a| a.capture != CaptureKind::None)
+            .map(|a| {
+                let what = match (a.capture, a.layout.as_deref(), a.size) {
+                    (CaptureKind::Fixed, Some(l), Some(n)) => format!("{l} ({n} bytes)"),
+                    (CaptureKind::Fixed, None, Some(n)) => format!("{n} bytes"),
+                    (CaptureKind::Cstring, ..) => "string".into(),
+                    (CaptureKind::Sized, ..) => {
+                        format!(
+                            "bytes sized by {}",
+                            a.len_slot.map_or("?".into(), |s| s.to_string())
+                        )
+                    }
+                    _ => "?".into(),
+                };
+                format!("{} -> {what}", a.slot)
+            })
+            .collect();
+        println!(
+            "{:<18} {} args, returns {}; memory: {}",
+            h.name,
+            h.args.len(),
+            h.ret,
+            if captured.is_empty() {
+                "none".to_owned()
+            } else {
+                captured.join(", ")
+            }
+        );
+    }
+    for s in &spec.skipped {
+        println!("{:<18} skipped: {}", s.name, s.reason);
+    }
+    println!("spec written to {}", out.display());
+    Ok(EXIT_OK)
 }
 
 fn cmd_match(old: &Path, new: &Path, json: bool) -> Result<u8> {

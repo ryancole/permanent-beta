@@ -3,6 +3,7 @@
 //! Keep logic out of here: types, serialization, and trivial helpers only.
 
 pub mod analysis;
+pub mod case;
 pub mod hook;
 pub mod ids;
 pub mod mapping;
@@ -10,6 +11,7 @@ pub mod review;
 pub mod trace;
 
 pub use analysis::*;
+pub use case::*;
 pub use hook::*;
 pub use ids::*;
 pub use mapping::*;

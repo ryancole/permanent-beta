@@ -5,6 +5,7 @@
 //! analyzer generates them (`permanent_beta_analysis::native::pattern`). Struct-layout proposals are not built.
 //! The detour body is never rewritten automatically.
 
+pub mod harness;
 pub mod header;
 pub mod layout;
 pub mod prototype;
