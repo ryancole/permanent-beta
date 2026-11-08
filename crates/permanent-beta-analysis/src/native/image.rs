@@ -50,6 +50,9 @@ pub(crate) struct Image {
     /// `DIR64` base relocation whose slot is in data and whose value points into executable code. Function
     /// tables, vtables, callbacks in initialized structs. Pointers stored in code are left out.
     pub code_pointers: Vec<u32>,
+    /// The same pointers by where they're stored: (slot RVA, target RVA), sorted by slot. Consecutive slots are
+    /// tables (vtables, function tables).
+    pub code_pointer_slots: Vec<(u32, u32)>,
 }
 
 impl Image {
@@ -127,7 +130,9 @@ impl Image {
             image.iat = image.parse_imports(rva);
         }
         if let Some((rva, size)) = reloc_dir {
-            image.code_pointers = image.parse_code_pointers(rva, size);
+            image.code_pointer_slots = image.parse_code_pointers(rva, size);
+            let targets: BTreeSet<u32> = image.code_pointer_slots.iter().map(|&(_, t)| t).collect();
+            image.code_pointers = targets.into_iter().collect();
         }
         Ok(image)
     }
@@ -278,8 +283,8 @@ impl Image {
     }
 
     /// Walk the base relocation table (blocks of: page RVA, block size, then 16-bit entries of type << 12 |
-    /// page offset) and keep the targets of `DIR64` slots in data that point into executable code.
-    fn parse_code_pointers(&self, rva: u32, size: u32) -> Vec<u32> {
+    /// page offset) and keep the `DIR64` slots in data that point into executable code, as (slot, target).
+    fn parse_code_pointers(&self, rva: u32, size: u32) -> Vec<(u32, u32)> {
         let mut out = BTreeSet::new();
         let mut at = rva;
         let end = rva.saturating_add(size);
@@ -305,7 +310,7 @@ impl Image {
                 if let Some(target) = self.u64_at(slot).and_then(|v| self.va_to_rva(v))
                     && self.is_executable(target)
                 {
-                    out.insert(target);
+                    out.insert((slot, target));
                 }
             }
             at += block;
@@ -482,7 +487,10 @@ pub(crate) mod tests {
             None,
         );
         let block = 8 + 2 * 4;
-        assert_eq!(img.parse_code_pointers(0x2800, block), vec![0x1020, 0x1040]);
+        assert_eq!(
+            img.parse_code_pointers(0x2800, block),
+            vec![(0x2010, 0x1040), (0x2018, 0x1020), (0x2020, 0x1040)]
+        );
     }
 
     #[test]

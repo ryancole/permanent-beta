@@ -233,6 +233,7 @@ mod tests {
                 version: "1".into(),
             },
             functions,
+            code_tables: Vec::new(),
         }
     }
 

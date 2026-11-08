@@ -28,8 +28,8 @@ pwsh corpus/build-projects.ps1 -Score
 |---|---|---|---|
 | zlib | v1.2.13, v1.3, v1.3.1 | `minigzip` with zlib compiled in | 0 wrong; /O2 69 of 69 correct, /Od 160–161 of 163 |
 | lua | v5.4.6, v5.4.7, v5.4.8 | `lua` interpreter with the libraries compiled in | 0 wrong; /O2 726–732 of ~735, /Od 1087–1093 of ~1095 |
-| zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 671–679 of ~729, /Od 1705–1744 of ~1879 |
-| tinyxml2 | 9.0.0, 10.0.0, 10.1.0 | `xmltest` (C++) with the library compiled in | 0 wrong; /O2 194–196 of ~267, /Od 392–395 of ~474 |
+| zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 680–688 of ~729, /Od 1739–1778 of ~1879 |
+| tinyxml2 | 9.0.0, 10.0.0, 10.1.0 | `xmltest` (C++) with the library compiled in | 0 wrong; /O2 233–247 of ~267, /Od 433–436 of ~474 |
 
 The scorecard also reports each pass's precision (correct share of its own candidates) and recall (its correct
 matches over the functions present in both builds).

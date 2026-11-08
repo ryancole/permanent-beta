@@ -28,10 +28,12 @@
 # table's functions are found instead of absorbed: /O2 671 and 679, /O2+ICF 657 and 665, /Od unchanged, 0 wrong.
 # 2026-11-07, function starts after int3 padding (design §4.4): unreferenced /Od functions are found instead of
 # absorbed: /Od 1705 and 1744 (accepted 2 fewer per variant, now in review), /O2 unchanged, 0 wrong.
+# 2026-11-07, table-slot pass (design §5.1 pass 5b): slots in zstd's C function-pointer tables resolve identical
+# copies. /O2 680 and 688, /O2+ICF 666 and 674, /Od 1739 and 1778, 0 wrong.
 [gate.min_correct]
-"o2__v1.5.5__v1.5.6" = 671
-"o2__v1.5.6__v1.5.7" = 679
-"o2-icf__v1.5.5__v1.5.6" = 657
-"o2-icf__v1.5.6__v1.5.7" = 665
-"od__v1.5.5__v1.5.6" = 1705
-"od__v1.5.6__v1.5.7" = 1744
+"o2__v1.5.5__v1.5.6" = 680
+"o2__v1.5.6__v1.5.7" = 688
+"o2-icf__v1.5.5__v1.5.6" = 666
+"o2-icf__v1.5.6__v1.5.7" = 674
+"od__v1.5.5__v1.5.6" = 1739
+"od__v1.5.6__v1.5.7" = 1778

@@ -405,6 +405,7 @@ mod tests {
                 version: "0".into(),
             },
             functions,
+            code_tables: Vec::new(),
         }
     }
 

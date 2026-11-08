@@ -34,6 +34,9 @@ pub mod evidence_kind {
     pub const CALL_SEQUENCE: &str = "call_sequence";
     /// Calls the same already-matched functions, in the same order (paired with identical normalized code).
     pub const CALLEES: &str = "callees";
+    /// Same slot in corresponding code-pointer tables (vtables), paired with identical normalized code. Implies no
+    /// check: none measures table position.
+    pub const TABLE_SLOT: &str = "table_slot";
     /// Similar code, shape and neighbourhood, clearly closer than any alternative (an edited function).
     pub const SIMILARITY: &str = "similarity";
     /// One of several equally plausible competitors (review evidence only, never accepted).

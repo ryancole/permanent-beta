@@ -16,6 +16,21 @@ pub struct AnalysisExport {
     pub build: BuildInfo,
     pub producer: Producer,
     pub functions: Vec<FunctionFeatures>,
+    /// Tables of code pointers stored in data: vtables and function tables. Optional, so adding it didn't
+    /// change the schema version; an export without it just gives table-based matching nothing to use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_tables: Vec<CodeTable>,
+}
+
+/// A run of at least two consecutive 64-bit pointers in a non-executable section, each a relocated pointer to a
+/// function start: a vtable (MSVC puts the RTTI locator pointer, which points into data, right before each
+/// vtable, so neighbouring vtables stay apart) or a C function table. Found from base relocations, no symbols.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeTable {
+    /// Address of the first slot.
+    pub rva: Rva,
+    /// The function each slot points to, in slot order. The same function can fill several slots.
+    pub slots: Vec<Rva>,
 }
 
 impl AnalysisExport {

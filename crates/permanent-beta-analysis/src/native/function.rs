@@ -24,7 +24,7 @@ use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
     OpKind, Register,
 };
-use permanent_beta_model::{ArgClass, EntryInfo, FunctionFeatures, Rva};
+use permanent_beta_model::{ArgClass, CodeTable, EntryInfo, FunctionFeatures, Rva};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -301,6 +301,41 @@ fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
 }
 
 /// Constants worth keeping as matching evidence: not small integers and not small negatives.
+/// Shortest run of consecutive code pointers kept as a table. One pointer alone is a callback, not a table, and
+/// gives table-slot matching nothing to anchor on.
+const MIN_TABLE_SLOTS: usize = 2;
+
+/// Tables of code pointers in data (vtables, function tables): runs of consecutive 8-byte slots, each a
+/// relocated pointer to the start of a function in `ranges`. A slot pointing anywhere else (RTTI locator, a
+/// string, the middle of a function) ends the run.
+pub(crate) fn code_tables(image: &Image, ranges: &[FunctionRange]) -> Vec<CodeTable> {
+    let starts: BTreeSet<u32> = ranges.iter().map(|r| r.start).collect();
+    let mut tables = Vec::new();
+    let mut run: Vec<(u32, u32)> = Vec::new();
+    let mut flush = |run: &mut Vec<(u32, u32)>| {
+        if run.len() >= MIN_TABLE_SLOTS {
+            tables.push(CodeTable {
+                rva: Rva(u64::from(run[0].0)),
+                slots: run.iter().map(|&(_, t)| Rva(u64::from(t))).collect(),
+            });
+        }
+        run.clear();
+    };
+    for &(slot, target) in &image.code_pointer_slots {
+        let follows = run.last().is_some_and(|&(prev, _)| prev + 8 == slot);
+        if !follows {
+            flush(&mut run);
+        }
+        if starts.contains(&target) {
+            run.push((slot, target));
+        } else {
+            flush(&mut run);
+        }
+    }
+    flush(&mut run);
+    tables
+}
+
 fn is_interesting_constant(v: u64) -> bool {
     let s = v as i64;
     !(-0x100 < s && s < 0x100)
@@ -1022,5 +1057,41 @@ mod tests {
         // jmp rel32
         let e = analyze(&[0xe9, 0x10, 0x00, 0x00, 0x00]).entry.unwrap();
         assert!(e.jump_thunk);
+    }
+
+    #[test]
+    fn consecutive_code_pointers_to_function_starts_are_tables() {
+        let mut img = image(&[0xc3; 0x30], &[]);
+        img.code_pointer_slots = vec![
+            // A table of two.
+            (0x2000, 0x1000),
+            (0x2008, 0x1010),
+            // A pointer into the middle of a function ends the run (and isn't part of any table).
+            (0x2010, 0x1005),
+            (0x2018, 0x1020),
+            (0x2020, 0x1000),
+            // A gap ends the run: a lone pointer is a callback, not a table.
+            (0x2030, 0x1010),
+            (0x2040, 0x1020),
+        ];
+        let ranges = vec![
+            range(0x1000, 0x1010),
+            range(0x1010, 0x1020),
+            range(0x1020, 0x1030),
+        ];
+        let rva = |x: u64| Rva(x);
+        assert_eq!(
+            code_tables(&img, &ranges),
+            vec![
+                CodeTable {
+                    rva: rva(0x2000),
+                    slots: vec![rva(0x1000), rva(0x1010)]
+                },
+                CodeTable {
+                    rva: rva(0x2018),
+                    slots: vec![rva(0x1020), rva(0x1000)]
+                },
+            ]
+        );
     }
 }

@@ -80,6 +80,7 @@ pub fn default_matchers() -> Vec<Box<dyn Matcher>> {
         Box::new(MnemonicHashMatcher),
         Box::new(MatchedCalleesMatcher),
         Box::new(CallSequenceMatcher),
+        Box::new(TableSlotMatcher),
         Box::new(SimilarityMatcher::default()),
     ]
 }
@@ -924,6 +925,165 @@ impl Matcher for CallSequenceMatcher {
     }
 }
 
+/// Pass 5b: same slot in corresponding code-pointer tables (design §5.1 pass 5b), for C++ virtual functions.
+///
+/// Small virtual overrides are often byte-identical across classes (TinyXML-2's `ToElement`, `ToText`, ...
+/// returning null), so the hash pass finds them ambiguous, and nothing calls them directly. Their vtable says
+/// which is which: slot `i` of a class's vtable is the same virtual in both builds.
+///
+/// - Two tables **correspond** when they have the same length, at least [`TABLE_MIN_ANCHORS`] slots hold
+///   functions already matched to each other, no slot contradicts (an old function matched elsewhere, or a new
+///   one already claimed while the old one isn't), and the correspondence is unique on both sides.
+/// - The functions at the same unmatched slot of corresponding tables are a **candidate** only if their
+///   normalized code is identical. A slot whose code differs is a review suggestion: a virtual replaced by a new
+///   one at the same position (same table length) must not be matched.
+/// - A function paired with different partners by different tables gets no candidate (an ambiguity).
+/// - Rechecked against the final matches: if the tables no longer correspond, the pair is vetoed.
+pub struct TableSlotMatcher;
+
+/// Matched slots that must agree before two tables are taken to correspond. [Guess]: uniqueness and the
+/// identical-code requirement carry most of the weight.
+pub const TABLE_MIN_ANCHORS: usize = 1;
+
+impl TableSlotMatcher {
+    /// Corresponding (old table, new table) index pairs under the matches in `map`. Slots holding `ignore` (a
+    /// candidate being rechecked) count as neither anchor nor conflict.
+    fn correspondences(
+        ctx: &MatchContext<'_>,
+        map: &HashMap<Rva, Rva>,
+        ignore: Option<Rva>,
+    ) -> Vec<(usize, usize)> {
+        let compatible = |t: &[Rva], u: &[Rva]| -> bool {
+            if t.len() != u.len() {
+                return false;
+            }
+            let mut anchors = 0;
+            for (&o, &n) in t.iter().zip(u) {
+                if Some(o) == ignore {
+                    continue;
+                }
+                match map.get(&o) {
+                    Some(&m) if m == n => anchors += 1,
+                    Some(_) => return false,
+                    None if ctx.matched_new.contains(&n) => return false,
+                    None => {}
+                }
+            }
+            anchors >= TABLE_MIN_ANCHORS
+        };
+        let (olds, news) = (&ctx.old.code_tables, &ctx.new.code_tables);
+        let mut by_old: Vec<Vec<usize>> = vec![Vec::new(); olds.len()];
+        let mut by_new: Vec<Vec<usize>> = vec![Vec::new(); news.len()];
+        for (i, t) in olds.iter().enumerate() {
+            for (j, u) in news.iter().enumerate() {
+                if compatible(&t.slots, &u.slots) {
+                    by_old[i].push(j);
+                    by_new[j].push(i);
+                }
+            }
+        }
+        by_old
+            .iter()
+            .enumerate()
+            .filter_map(|(i, js)| match js.as_slice() {
+                [j] if by_new[*j].len() == 1 => Some((i, *j)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl Matcher for TableSlotMatcher {
+    fn name(&self) -> &'static str {
+        "table-slot"
+    }
+
+    fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
+        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|c| (c.old, c.new)).collect();
+        // Every pairing a corresponding table suggests, and the old slots that suggest it.
+        let mut partners: BTreeMap<Rva, BTreeSet<Rva>> = BTreeMap::new();
+        let mut rev: BTreeMap<Rva, BTreeSet<Rva>> = BTreeMap::new();
+        let mut slots_of: BTreeMap<(Rva, Rva), BTreeSet<Rva>> = BTreeMap::new();
+        for (i, j) in Self::correspondences(ctx, &map, None) {
+            let (t, u) = (&ctx.old.code_tables[i], &ctx.new.code_tables[j]);
+            for (k, (&o, &n)) in t.slots.iter().zip(&u.slots).enumerate() {
+                if ctx.matched_old.contains(&o) || ctx.matched_new.contains(&n) {
+                    continue;
+                }
+                partners.entry(o).or_default().insert(n);
+                rev.entry(n).or_default().insert(o);
+                slots_of
+                    .entry((o, n))
+                    .or_default()
+                    .insert(Rva(t.rva.0 + 8 * k as u64));
+            }
+        }
+        let hash =
+            |e: &AnalysisExport, r: Rva| e.function(r).and_then(|f| f.normalized_hash.clone());
+        let mut out = Proposals::default();
+        for (&o, ns) in &partners {
+            let single = ns.len() == 1 && ns.iter().all(|n| rev[n].len() == 1);
+            if !single {
+                let mut old: Vec<Rva> = ns.iter().flat_map(|n| rev[n].iter().copied()).collect();
+                old.sort();
+                old.dedup();
+                out.ambiguities.push(Ambiguity {
+                    matcher: self.name().to_owned(),
+                    old,
+                    new: ns.iter().copied().collect(),
+                    detail: "corresponding code-pointer tables pair these functions differently"
+                        .into(),
+                });
+                continue;
+            }
+            let n = *ns.iter().next().expect("one partner");
+            let slots: Vec<String> = slots_of[&(o, n)].iter().map(|s| s.to_string()).collect();
+            let at = format!("slot (old {})", slots.join(", "));
+            match (hash(ctx.old, o), hash(ctx.new, n)) {
+                (Some(a), Some(b)) if a == b => {
+                    let mut c = candidate(
+                        self.name(),
+                        o,
+                        n,
+                        0.85,
+                        evidence_kind::TABLE_SLOT,
+                        format!("same {at} in corresponding code-pointer tables"),
+                    );
+                    c.evidence.push(Evidence {
+                        kind: evidence_kind::NORMALIZED_HASH.to_owned(),
+                        detail: "identical normalized code".into(),
+                    });
+                    out.candidates.push(c);
+                }
+                _ => out.ambiguities.push(Ambiguity {
+                    matcher: self.name().to_owned(),
+                    old: vec![o],
+                    new: vec![n],
+                    detail: format!(
+                        "suggestion only: same {at} in corresponding code-pointer tables, but the code differs"
+                    ),
+                }),
+            }
+        }
+        out
+    }
+
+    fn contradiction(&self, ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
+        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|p| (p.old, p.new)).collect();
+        let still = Self::correspondences(ctx, &map, Some(c.old))
+            .into_iter()
+            .any(|(i, j)| {
+                let (t, u) = (&ctx.old.code_tables[i], &ctx.new.code_tables[j]);
+                t.slots
+                    .iter()
+                    .zip(&u.slots)
+                    .any(|(&o, &n)| o == c.old && n == c.new)
+            });
+        (!still)
+            .then(|| "its code-pointer tables no longer correspond under the final matches".into())
+    }
+}
+
 /// Pass 6: structural similarity, for edited functions (design §5.1 pass 6). Weak: it runs only once every
 /// stronger pass has stopped.
 ///
@@ -1305,7 +1465,9 @@ impl Matcher for SimilarityMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use permanent_beta_model::{ANALYSIS_SCHEMA_VERSION, BuildId, BuildInfo, Machine, Producer};
+    use permanent_beta_model::{
+        ANALYSIS_SCHEMA_VERSION, BuildId, BuildInfo, CodeTable, Machine, Producer,
+    };
 
     fn func(rva: u64, name: Option<&str>, hash: Option<&str>) -> FunctionFeatures {
         FunctionFeatures {
@@ -1345,6 +1507,7 @@ mod tests {
                 version: "0".into(),
             },
             functions,
+            code_tables: Vec::new(),
         }
     }
 
@@ -2207,5 +2370,201 @@ mod tests {
         new_fns.push(helper_new);
         let got = pairs(&export("a", old_fns), &export("b", new_fns));
         assert!(!got.iter().any(|&(o, _)| o == 0x20), "{got:?}");
+    }
+
+    fn table(rva: u64, slots: &[u64]) -> CodeTable {
+        CodeTable {
+            rva: Rva(rva),
+            slots: slots.iter().map(|&s| Rva(s)).collect(),
+        }
+    }
+
+    fn with_tables(mut e: AnalysisExport, tables: Vec<CodeTable>) -> AnalysisExport {
+        e.code_tables = tables;
+        e
+    }
+
+    fn pairs_by(got: &MatchOutcome, matcher: &str) -> Vec<(u64, u64)> {
+        got.candidates
+            .iter()
+            .filter(|c| matches!(&c.source, CandidateSource::Deterministic { matcher: m } if m == matcher))
+            .map(|c| (c.old.0, c.new.0))
+            .collect()
+    }
+
+    /// Two classes' vtables: [Accept, ToText]. Each Accept is unique code; both ToText are `return null`
+    /// (hash `ret0`), so the hash pass can't tell them apart.
+    fn two_vtables(new_second_to_text: &str) -> (AnalysisExport, AnalysisExport) {
+        let old = with_tables(
+            export(
+                "a",
+                vec![
+                    func(0x10, None, Some("acceptA")),
+                    func(0x20, None, Some("ret0")),
+                    func(0x30, None, Some("acceptB")),
+                    func(0x40, None, Some("ret0")),
+                ],
+            ),
+            vec![table(0x5000, &[0x10, 0x20]), table(0x5100, &[0x30, 0x40])],
+        );
+        let new = with_tables(
+            export(
+                "b",
+                vec![
+                    func(0x110, None, Some("acceptA")),
+                    func(0x120, None, Some("ret0")),
+                    func(0x130, None, Some("acceptB")),
+                    func(0x140, None, Some(new_second_to_text)),
+                ],
+            ),
+            vec![
+                table(0x6000, &[0x110, 0x120]),
+                table(0x6100, &[0x130, 0x140]),
+            ],
+        );
+        (old, new)
+    }
+
+    #[test]
+    fn identical_virtuals_are_told_apart_by_their_vtable_slot() {
+        let (old, new) = two_vtables("ret0");
+        let got = run_passes(&old, &new, &default_matchers());
+        assert_eq!(
+            pairs_by(&got, "table-slot"),
+            vec![(0x20, 0x120), (0x40, 0x140)]
+        );
+        let c = got.candidates.iter().find(|c| c.old == Rva(0x20)).unwrap();
+        assert_eq!(c.evidence[0].kind, evidence_kind::TABLE_SLOT);
+        assert_eq!(c.evidence[1].kind, evidence_kind::NORMALIZED_HASH);
+    }
+
+    #[test]
+    fn a_virtual_replaced_in_the_same_slot_is_only_a_suggestion() {
+        // Negative: the second class's ToText became other code. Same table length, same slot, but it must not
+        // be matched. (The first ToText still has an identical copy in the old build, so its slot resolves it.)
+        let (old, new) = two_vtables("other");
+        let got = run_passes(&old, &new, &default_matchers());
+        assert_eq!(pairs_by(&got, "table-slot"), vec![(0x20, 0x120)]);
+        assert!(!got.candidates.iter().any(|c| c.old == Rva(0x40)));
+        let a = got
+            .ambiguities
+            .iter()
+            .find(|a| a.matcher == "table-slot")
+            .expect("a review suggestion");
+        assert_eq!(
+            (a.old.clone(), a.new.clone()),
+            (vec![Rva(0x40)], vec![Rva(0x140)])
+        );
+        assert!(a.detail.contains("code differs"), "{}", a.detail);
+    }
+
+    #[test]
+    fn a_table_that_could_be_either_of_two_gives_no_candidate() {
+        // Negative: two old tables share their only anchor (an inherited Accept) and could both be the one new
+        // table, so neither corresponds.
+        let old = with_tables(
+            export(
+                "a",
+                vec![
+                    func(0x10, None, Some("accept")),
+                    func(0x20, None, Some("ret0")),
+                    func(0x40, None, Some("ret0")),
+                ],
+            ),
+            vec![table(0x5000, &[0x10, 0x20]), table(0x5100, &[0x10, 0x40])],
+        );
+        let new = with_tables(
+            export(
+                "b",
+                vec![
+                    func(0x110, None, Some("accept")),
+                    func(0x120, None, Some("ret0")),
+                    func(0x150, None, Some("ret0")),
+                ],
+            ),
+            vec![table(0x6000, &[0x110, 0x120])],
+        );
+        let got = run_passes(&old, &new, &default_matchers());
+        assert_eq!(pairs_by(&got, "normalized-hash"), vec![(0x10, 0x110)]);
+        assert!(pairs_by(&got, "table-slot").is_empty());
+    }
+
+    #[test]
+    fn a_contradicting_slot_means_the_tables_do_not_correspond() {
+        // Negative: slot 1 holds functions matched to other partners (by name), so slot 2's pairing is not
+        // trusted even though slot 0 agrees.
+        let old = with_tables(
+            export(
+                "a",
+                vec![
+                    func(0x10, None, Some("accept")),
+                    func(0x50, Some("g"), None),
+                    func(0x20, None, Some("ret0")),
+                    func(0x40, None, Some("ret0")),
+                ],
+            ),
+            vec![table(0x5000, &[0x10, 0x50, 0x20])],
+        );
+        let new = with_tables(
+            export(
+                "b",
+                vec![
+                    func(0x110, None, Some("accept")),
+                    func(0x160, Some("h"), None),
+                    func(0x170, Some("g"), None),
+                    func(0x120, None, Some("ret0")),
+                    func(0x140, None, Some("ret0")),
+                ],
+            ),
+            vec![table(0x6000, &[0x110, 0x160, 0x120])],
+        );
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            got.candidates
+                .iter()
+                .any(|c| (c.old.0, c.new.0) == (0x50, 0x170))
+        );
+        assert!(pairs_by(&got, "table-slot").is_empty());
+    }
+
+    #[test]
+    fn tables_of_different_lengths_do_not_correspond() {
+        // Negative: a virtual added to the class shifts or extends its vtable.
+        let (old, mut new) = two_vtables("ret0");
+        new.code_tables[1].slots.push(Rva(0x130));
+        let got = run_passes(&old, &new, &default_matchers());
+        assert_eq!(pairs_by(&got, "table-slot"), vec![(0x20, 0x120)]);
+    }
+
+    #[test]
+    fn a_table_slot_pair_is_vetoed_when_its_tables_stop_corresponding() {
+        let old = with_tables(
+            export("a", vec![]),
+            vec![table(0x5000, &[0x10, 0x50, 0x20])],
+        );
+        let new = with_tables(
+            export("b", vec![]),
+            vec![table(0x6000, &[0x110, 0x160, 0x120])],
+        );
+        let pair = |o: u64, n: u64| candidate("test", Rva(o), Rva(n), 1.0, "test", String::new());
+        let slot_pair = pair(0x20, 0x120);
+        let recheck = |pairs: &[Candidate]| {
+            let matched_old: HashSet<Rva> = pairs.iter().map(|c| c.old).collect();
+            let matched_new: HashSet<Rva> = pairs.iter().map(|c| c.new).collect();
+            let ctx = MatchContext {
+                old: &old,
+                new: &new,
+                matched_old: &matched_old,
+                matched_new: &matched_new,
+                pairs,
+            };
+            TableSlotMatcher.contradiction(&ctx, &slot_pair)
+        };
+        // Slot 0 agrees, slot 1 unmatched: the tables still correspond.
+        assert_eq!(recheck(&[pair(0x10, 0x110), slot_pair.clone()]), None);
+        // A later match puts slot 1's old function elsewhere: no longer corresponding, so vetoed.
+        assert!(recheck(&[pair(0x10, 0x110), pair(0x50, 0x170), slot_pair.clone()]).is_some());
+        // The pair itself is no anchor: without slot 0 there is nothing left to support it.
+        assert!(recheck(std::slice::from_ref(&slot_pair)).is_some());
     }
 }

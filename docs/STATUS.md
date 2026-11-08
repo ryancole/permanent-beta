@@ -4,7 +4,15 @@
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **the first C++ project, TinyXML-2** (9.0.0 → 10.0.0 → 10.1.0, its `xmltest` driver with the
+Latest work: **table-slot matching** (design §5.1 pass 5b). The analyzer records code-pointer tables (runs of
+≥ 2 relocated pointers to function starts in data: vtables and C function tables), and a new pass pairs the
+functions at the same slot of corresponding tables when their code is identical. On TinyXML-2 that tells apart
+the byte-identical tiny virtuals: /O2 +39 to +51 correct, /Od +38 to +44, /O2+ICF +5 to +9; zstd +9 at /O2 and
++34 at /Od from its function tables. 0 wrong everywhere; zlib, Lua, the fixtures and the hook loop unchanged.
+Most of the new C++ matches go to review: table position implies no verification check, and a `return null`
+body has nothing else to check.
+
+Before that: **the first C++ project, TinyXML-2** (9.0.0 → 10.0.0 → 10.1.0, its `xmltest` driver with the
 library compiled in). 0 wrong on all six variants: /O2 194–196 of ~267, /O2+ICF 199–203 of ~228, /Od 392–395 of
 ~474. Code reachable only through vtables is found (base relocations): only 5–15 functions per variant are
 unmatched. Most misses are ambiguous and go to review: tiny virtual overrides that are byte-identical across
@@ -104,8 +112,9 @@ What's new:
 - **`pbeta repair --trial-out / --earlier / --new-binary`, `pbeta pattern`, `pbeta header`** (M4): trial
   manifests, repair from a hook's own build, AOB patterns, the offsets header, and prototype proposals in review
   items (see above, and design §7.2).
-- **`pbeta match` / `repair` / `review list|accept|reject`**: six matching passes (name, normalized hash, strings, matched
-  callees, call graph, and a weak similarity pass for edited functions); string matches are vetoed when argument counts or matched callers contradict them,
+- **`pbeta match` / `repair` / `review list|accept|reject`**: eight matching passes (name, normalized hash, strings,
+  mnemonic hash, matched callees, call graph, vtable/function-table slots, and a weak similarity pass for edited
+  functions); string matches are vetoed when argument counts or matched callers contradict them,
   rechecked against the final matches. Verification on parameters, strings, size, callers, callees, constants,
   imports and inferred arguments, counting only evidence independent of the match; repair with review reasons
   (unmatched, ambiguous, verification failed, insufficient evidence, signature changed, not hookable, stale
@@ -116,8 +125,8 @@ What's new:
   - Purpose-built fixture `basic` (`corpus/fixtures`): 3 flag sets.
   - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 160–161 of 163.
   - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 726–732 of ~735, /Od 1087–1093 of ~1095.
-  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 671–679 of ~729 (/O2+ICF 657–665), /Od 1705–1744 of ~1879.
-  - TinyXML-2 9.0.0 → 10.0.0 → 10.1.0 (C++): /O2 194–196 of ~267 (/O2+ICF 199–203 of ~228), /Od 392–395 of ~474.
+  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 680–688 of ~729 (/O2+ICF 666–674), /Od 1739–1778 of ~1879.
+  - TinyXML-2 9.0.0 → 10.0.0 → 10.1.0 (C++): /O2 233–247 of ~267 (/O2+ICF 204–212 of ~228), /Od 433–436 of ~474.
   - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations,
     with trial runs, patterns, the header and proposed shims checked.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score`, `pwsh corpus/build-projects.ps1 -Score` and
@@ -144,9 +153,9 @@ What's new:
 1. **Decide whether `pbeta propose` runs as part of `repair`** for unmatched hook targets (proposals into the
    hook's review item, never applied). Optionally describe unmatched callees in the prompt, the lever for zstd's
    `*_noDict_*` family; instruction text wouldn't separate it (design §8).
-2. **Vtable-slot evidence:** C++ misses are mostly identical tiny virtuals. Pairing them by their slot in
-   vtables that are already matched (same class, same slot) would resolve them with structural evidence instead of
-   a guess. Needs vtables recognized in `.rdata` (runs of relocated code pointers).
+2. **Acceptance for table-slot matches:** they're correct on the corpus but mostly held for review. Decide
+   whether a corresponding table counts as an independent structural check (it is independent of the code hash),
+   measured on the corpus before changing policy.
 3. **Corpus breadth:** a C++ project heavy on exceptions and the STL (yaml-cpp), `/LTCG` and PGO flag sets.
 4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
    proposals; both lean on PDB or Ghidra types.
@@ -168,6 +177,9 @@ What's new:
   `pb_body_edited`, which is misleading but not a wrong match.
 - `.exe` hashes change on every rebuild even with `/Brepro` (PE timestamp, PDB signature), so a build ID is
   per build.
+- Table correspondence needs same-length tables: a virtual added to a class changes its vtable's length, so that
+  class's identical virtuals stay ambiguous (review). Tables are only split at pointers that aren't function
+  starts; without RTTI, adjacent vtables would merge into one run.
 - The matcher pairs exception-handling funclets (`main$dtor$N`) too; the answer key can't judge those pairs (they're
   out of its scope); on the first TinyXML-2 run some paired funclets of different numbers. A hook never targets
   one, but nothing stops it either.

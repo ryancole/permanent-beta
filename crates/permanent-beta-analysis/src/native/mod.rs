@@ -107,6 +107,7 @@ pub(crate) fn analyze_ranges(
     producer: Producer,
 ) -> AnalysisExport {
     let build_id = build_id(bytes).0;
+    let code_tables = function::code_tables(image, &ranges);
 
     let functions = ranges
         .into_iter()
@@ -131,6 +132,7 @@ pub(crate) fn analyze_ranges(
         },
         producer,
         functions,
+        code_tables,
     }
 }
 
