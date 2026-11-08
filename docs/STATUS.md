@@ -4,7 +4,21 @@
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **winning back held-back matches**. Of the correct pairs the yaml-cpp rules sent to review, 71
+Latest work: **/LTCG and PGO flag sets** (`o2-ltcg`: /GL + /LTCG; `o2-pgo`: built instrumented, run on each
+recipe's `Train` workload, relinked with the profile). 0 wrong on every new variant scored: zlib, Lua, TinyXML-2,
+yaml-cpp and the `basic` fixture (/LTCG only; it has no training workload). /LTCG inlines across objects, so
+fewer functions survive (zlib 51 vs 69 at /O2); PGO splits hot and cold code. New in similarity: a pair is held
+for review when an unmatched caller of the old function scores within 0.1 [Guess] of it (inlined into its
+caller: TinyXML-2's `TestUtil::Push` under /LTCG). **zstd is skipped for both** (`SkipFlags` in its recipe): in
+3 cases the compiler kept a different one of two related functions out of line in each build (old
+`ZSTD_entropyCompressSeqStore` inlined into the new `…_wExtLitBuffer`, which was itself inlined in the old
+build), and similarity pairs the survivors. Structurally they look like real matches; only the names disagree.
+PGO builds are reproducible: two builds give identical layouts for every project. Lua needed two things
+fixed for it (`PgoCl` forces in `corpus/projects/lua/pgo_seed.h`): its string-hash seed (clock and ASLR'd
+addresses) and `table.sort`'s pivot (clock and time), or each training run took different paths (838 correct on
+one build, 834 on the next).
+
+Before that: **winning back held-back matches**. Of the correct pairs the yaml-cpp rules sent to review, 71
 were the wrapper rule firing on functions whose matched callers still call them directly (Lua's
 `lua_tolstring`: 34 of 34). The rule is now overruled when ≥ 2 [Guess] matched callers call the function
 directly and none calls the would-be wrapper; 1 wasn't enough (zstd's `BIT_reloadDStreamFast` came back as a
@@ -153,6 +167,7 @@ What's new:
   pass's precision and recall.
   - Purpose-built fixture `basic` (`corpus/fixtures`): 3 flag sets.
   - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 160–161 of 163.
+  - Every project also builds /LTCG and PGO except zstd (skipped, see above).
   - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 726–732 of ~735, /Od 1087–1092 of ~1095.
   - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 680–690 of ~729 (/O2+ICF 666–676), /Od 1737–1773 of ~1879.
   - TinyXML-2 9.0.0 → 10.0.0 → 10.1.0 (C++): /O2 231–247 of ~267 (/O2+ICF 201–212 of ~228), /Od 425–435 of ~474.
@@ -183,7 +198,10 @@ What's new:
 1. **Decide whether `pbeta propose` runs as part of `repair`** for unmatched hook targets (proposals into the
    hook's review item, never applied). Optionally describe unmatched callees in the prompt, the lever for zstd's
    `*_noDict_*` family; instruction text wouldn't separate it (design §8).
-2. **Corpus breadth:** `/LTCG` and PGO flag sets (cross-module inlining and code layout change the most).
+2. **Swapped inlining (zstd under /LTCG and PGO):** when the compiler keeps a different one of two related
+   functions out of line in each build, decide what the right answer even is (the survivor does the old one's
+   work) and how to detect it: e.g. the new function's callees include the old function's callees *and* its
+   old caller's, or a size jump matching an inlined callee. Then unskip zstd's two flag sets.
 3. **Calibrate the C++ guesses:** the table-slot anchor count, the code-tables fail threshold and the wrapper
    callers threshold are single-project guesses; recheck them with `pbeta-corpus sweep`-style grids once a third
    C++ project exists.

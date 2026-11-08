@@ -18,4 +18,9 @@
     )
     Defines  = @('_CRT_SECURE_NO_DEPRECATE', '_CRT_NONSTDC_NO_DEPRECATE')
     Cl       = @('/W3')
+    # PGO training (flag set o2-pgo): compress and decompress zlib's own deflate.c.
+    Train    = @(
+        @{ Args = @('-c', '{src}\deflate.c'); Stdout = '{out}/train.gz' }
+        @{ Args = @('-d', '-c', '{out}/train.gz'); Stdout = '{out}/train.txt' }
+    )
 }

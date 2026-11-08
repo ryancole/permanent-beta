@@ -23,6 +23,8 @@
 # 2026-11-07, lowered: three matching rules added for yaml-cpp's wrong matches (design §5.1) turn a few correct
 # candidates into review suggestions, never into wrong matches: the hash pass's caller veto, pairing copies by
 # elimination only with an agreeing neighbour, and the broader wrapper rule in similarity. /O2 247 and 231, /O2+ICF 212 and 201, /Od 435 and 425 (was 247/233, 212/204, 436/433).
+# 2026-11-07, new flag sets /LTCG (o2-ltcg: /GL + /LTCG) and PGO (o2-pgo: trained on the recipe's Train
+# workload), first run: o2-ltcg__10.0.0__10.1.0 237, o2-ltcg__9.0.0__10.0.0 259, o2-pgo__10.0.0__10.1.0 298, o2-pgo__9.0.0__10.0.0 317, 0 wrong.
 [gate.min_correct]
 "o2__9.0.0__10.0.0" = 247
 "o2__10.0.0__10.1.0" = 231
@@ -30,3 +32,7 @@
 "o2-icf__10.0.0__10.1.0" = 201
 "od__9.0.0__10.0.0" = 435
 "od__10.0.0__10.1.0" = 425
+"o2-ltcg__10.0.0__10.1.0" = 237
+"o2-ltcg__9.0.0__10.0.0" = 259
+"o2-pgo__10.0.0__10.1.0" = 298
+"o2-pgo__9.0.0__10.0.0" = 317

@@ -19,6 +19,8 @@
 
 # 2026-11-07, function starts after int3 padding (design §4.4): the unreferenced /Od functions above are found;
 # /Od 161 and 160, /O2 unchanged, 0 wrong.
+# 2026-11-07, new flag sets /LTCG (o2-ltcg: /GL + /LTCG) and PGO (o2-pgo: trained on the recipe's Train
+# workload), first run: o2-ltcg__v1.2.13__v1.3 51, o2-ltcg__v1.3__v1.3.1 51, o2-pgo__v1.2.13__v1.3 73, o2-pgo__v1.3__v1.3.1 74, 0 wrong.
 [gate.min_correct]
 "o2__v1.2.13__v1.3" = 69
 "o2__v1.3__v1.3.1" = 69
@@ -26,3 +28,7 @@
 "o2-icf__v1.3__v1.3.1" = 69
 "od__v1.2.13__v1.3" = 161
 "od__v1.3__v1.3.1" = 160
+"o2-ltcg__v1.2.13__v1.3" = 51
+"o2-ltcg__v1.3__v1.3.1" = 51
+"o2-pgo__v1.2.13__v1.3" = 73
+"o2-pgo__v1.3__v1.3.1" = 74

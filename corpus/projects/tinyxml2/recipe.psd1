@@ -17,4 +17,6 @@
     Sources  = @('tinyxml2.cpp', 'xmltest.cpp')
     Defines  = @('_CRT_SECURE_NO_WARNINGS')
     Cl       = @('/W3', '/EHsc')
+    # PGO training (flag set o2-pgo): xmltest's own test suite, run from the source tree (it reads resources/).
+    Train    = @(@{ Args = @(); Cwd = '{src}' })
 }

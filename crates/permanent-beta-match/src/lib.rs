@@ -1200,6 +1200,9 @@ pub const SIM_MAX_BUCKET: usize = 32;
 /// Matched callers that must call a candidate directly (and none its would-be wrapper) before the wrapper rule
 /// is overruled. [Guess]: 1 let zstd 1.5.6's BIT_reloadDStreamFast through as a wrong match.
 pub const WRAPPER_MIN_DIRECT_CALLERS: usize = 2;
+/// How close an unmatched caller's score must be to the best before the old function may have been inlined into
+/// it. [Guess]: any score at all cost up to 31 correct per zstd variant; TinyXML-2's case is 0.07 behind.
+pub const INLINED_CALLER_MARGIN: f32 = 0.1;
 
 /// Component weights. [Guess]
 const SIM_WEIGHTS: [(&str, f32); 8] = [
@@ -1489,13 +1492,40 @@ impl Matcher for SimilarityMatcher {
             let wrapper = wrapper.filter(|&w| {
                 callers_calling(n) < WRAPPER_MIN_DIRECT_CALLERS || callers_calling(w) > 0
             });
+            // Inlined into its caller (/LTCG: TinyXML-2's TestUtil::Push, now inside VisitEnter): an unmatched
+            // caller of the old function scores nearly as well for the new one, so either may be its counterpart.
+            let absorbers: Vec<Rva> = old_callers
+                .get(&o)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|p| {
+                    !ctx.matched_old.contains(p)
+                        && theirs
+                            .iter()
+                            .any(|(s, c)| c == p && *s >= best - INLINED_CALLER_MARGIN)
+                })
+                .collect();
             if let Some(w) = wrapper {
                 proposals.ambiguities.push(Ambiguity {
                     matcher: self.name().to_owned(),
                     old: vec![o],
                     new: vec![w, n],
                     detail: format!(
-                        "similar code (best {best:.2}), but a smaller unmatched new function calls it: the old                          code may have moved behind a new wrapper"
+                        "similar code (best {best:.2}), but a smaller unmatched new function calls it: the old code \
+                         may have moved behind a new wrapper"
+                    ),
+                });
+            } else if !absorbers.is_empty() {
+                let mut old = vec![o];
+                old.extend(&absorbers);
+                proposals.ambiguities.push(Ambiguity {
+                    matcher: self.name().to_owned(),
+                    old,
+                    new: vec![n],
+                    detail: format!(
+                        "similar code (best {best:.2}), but an unmatched caller of the old function scores nearly as \
+                         well: the old code may have been inlined into it"
                     ),
                 });
             } else if mutual
@@ -2829,6 +2859,41 @@ mod tests {
             got.ambiguities
                 .iter()
                 .any(|a| a.old == vec![Rva(0x10)] && a.new == vec![Rva(0x130), Rva(0x110)]),
+            "{:?}",
+            got.ambiguities
+        );
+    }
+
+    #[test]
+    fn a_function_inlined_into_its_caller_is_an_ambiguity() {
+        // Negative (TinyXML-2 /LTCG: TestUtil::Push inlined into VisitEnter): the old callee f and its old caller
+        // g both look like the new g, which now holds f's code. Neither is a candidate.
+        // g is a virtual (no direct callers). f is the closest to the new g; the old g is close behind.
+        let old = export(
+            "a",
+            vec![
+                named_calling(0x50, "x", &[]),
+                body(0x20, "hg", 4, &[0x10, 0x50], 76),
+                body(0x10, "h1", 6, &[0x50], 66),
+            ],
+        );
+        let new = export(
+            "b",
+            vec![
+                named_calling(0x150, "x", &[]),
+                body(0x120, "h2", 6, &[0x150], 68),
+            ],
+        );
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.new == Rva(0x120)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(
+            got.ambiguities
+                .iter()
+                .any(|a| a.new == vec![Rva(0x120)] && a.detail.contains("inlined")),
             "{:?}",
             got.ambiguities
         );

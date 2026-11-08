@@ -26,6 +26,9 @@
 # elimination only with an agreeing neighbour, and the broader wrapper rule in similarity. /O2 724 and 731, /Od 1086 and 1092 (was 726/732, 1087/1093).
 # 2026-11-07, raised: the wrapper rule is overruled when >= 2 matched callers still call the function directly
 # and none calls the would-be wrapper (design §5.1 pass 6). o2-icf__v5.4.6__v5.4.7 724 -> 726, o2-icf__v5.4.7__v5.4.8 731 -> 732, o2__v5.4.6__v5.4.7 724 -> 726, o2__v5.4.7__v5.4.8 731 -> 732, od__v5.4.6__v5.4.7 1086 -> 1087.
+# 2026-11-07, new flag sets /LTCG (o2-ltcg: /GL + /LTCG) and PGO (o2-pgo: trained on the recipe's Train
+# workload), first run: o2-ltcg__v5.4.6__v5.4.7 522, o2-ltcg__v5.4.7__v5.4.8 513, o2-pgo__v5.4.6__v5.4.7 839, o2-pgo__v5.4.7__v5.4.8 839, 0 wrong, with pgo_seed.h
+# fixing the string-hash seed and table.sort's pivot so that training, and the PGO build, are reproducible.
 [gate.min_correct]
 "o2__v5.4.6__v5.4.7" = 726
 "o2__v5.4.7__v5.4.8" = 732
@@ -33,3 +36,7 @@
 "o2-icf__v5.4.7__v5.4.8" = 732
 "od__v5.4.6__v5.4.7" = 1087
 "od__v5.4.7__v5.4.8" = 1092
+"o2-ltcg__v5.4.6__v5.4.7" = 522
+"o2-ltcg__v5.4.7__v5.4.8" = 513
+"o2-pgo__v5.4.6__v5.4.7" = 839
+"o2-pgo__v5.4.7__v5.4.8" = 839

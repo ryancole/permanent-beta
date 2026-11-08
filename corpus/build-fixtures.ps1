@@ -32,7 +32,8 @@ $fixtureCl = @('/EHsc', '/permissive-', '/W4')
 Import-VsDevEnvironment
 
 $fixtureNames = if ($Fixture) { $Fixture } else { Get-ChildItem $fixturesDir -Directory | ForEach-Object Name }
-$flagNames = if ($Flags) { $Flags } else { $MsvcFlagSets.Keys }
+# PGO needs a training workload, which the fixtures don't have.
+$flagNames = if ($Flags) { $Flags } else { Get-PlainMsvcFlagSetNames }
 
 foreach ($name in $fixtureNames) {
     foreach ($flagName in $flagNames) {

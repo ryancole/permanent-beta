@@ -6,6 +6,11 @@
 #                    the PE timestamp and PDB signature (linker-generated), so its SHA-256 changes per build.
 #   /DEBUG:FULL      a self-contained PDB
 #   /MAP             linker map file, the source of the answer key
+#
+# Flag sets: /O2 with and without identical-COMDAT folding, /Od, /O2 with whole-program optimization (/GL + /LTCG:
+# cross-object inlining and layout), and /O2 with profile-guided optimization (`Pgo`: built instrumented, run on
+# the recipe's `Train` workload, then relinked with the profile; hot/cold splitting and profile-driven inlining).
+# PGO needs a training workload, so only the real-world projects build it (build-projects.ps1).
 
 $MsvcCommon = @{
     cl   = @('/nologo', '/MD', '/Z7', '/Brepro')
@@ -16,7 +21,12 @@ $MsvcFlagSets = [ordered]@{
     'o2'     = @{ cl = @('/O2'); link = @('/OPT:NOICF') }
     'o2-icf' = @{ cl = @('/O2'); link = @('/OPT:ICF') }
     'od'     = @{ cl = @('/Od'); link = @('/OPT:NOICF') }
+    'o2-ltcg' = @{ cl = @('/O2', '/GL'); link = @('/LTCG', '/OPT:NOICF') }
+    'o2-pgo'  = @{ cl = @('/O2', '/GL'); link = @('/LTCG', '/OPT:NOICF'); Pgo = $true }
 }
+
+# Flag sets that build without a training workload.
+function Get-PlainMsvcFlagSetNames { @($MsvcFlagSets.Keys | Where-Object { -not $MsvcFlagSets[$_].Pgo }) }
 
 function Get-MsvcFlagSet([string] $name) {
     if (-not $MsvcFlagSets.Contains($name)) {

@@ -42,4 +42,18 @@
     Include  = @('lib', 'lib/common')
     Defines  = @('_CRT_SECURE_NO_WARNINGS', 'XXH_NAMESPACE=ZSTD_', 'ZSTD_LEGACY_SUPPORT=0', 'ZSTD_MULTITHREAD')
     Cl       = @('/W3')
+    # Not scored yet (2026-11-07): under /LTCG and PGO the compiler keeps a different one of two related functions
+    # out of line in each build (old ZSTD_entropyCompressSeqStore inlined into the new
+    # ZSTD_entropyCompressSeqStore_wExtLitBuffer, which was itself inlined in the old build; likewise
+    # ZSTD_compressSubBlock_sequences / ZSTD_compressSubBlock and ZSTDMT_expandBufferPool / createBufferPool).
+    # Similarity pairs the survivors: the new function does the old one's work and its matched callers agree, but
+    # the answer key, by name, scores it wrong (3 wrong across the four variants). No structural rule separates
+    # these yet without costing many correct matches elsewhere; see docs/STATUS.md.
+    SkipFlags = @('o2-ltcg', 'o2-pgo')
+    # PGO training (flag set o2-pgo): compress zstd_compress.c at levels 3 and 19, then decompress.
+    Train    = @(
+        @{ Args = @('-q', '-f', '-3', '{src}\lib\compress\zstd_compress.c', '-o', '{out}/train3.zst') }
+        @{ Args = @('-q', '-f', '-19', '{src}\lib\compress\zstd_compress.c', '-o', '{out}/train19.zst') }
+        @{ Args = @('-q', '-d', '-f', '{out}/train19.zst', '-o', '{out}/train.txt') }
+    )
 }

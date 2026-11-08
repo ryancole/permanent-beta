@@ -68,13 +68,53 @@ function Build-Version($recipe, [string] $tag, [string] $flagName) {
     # /Fo names each object after its source file in one directory, so base names must be unique.
     $dupes = @($sources | Group-Object { [IO.Path]::GetFileNameWithoutExtension($_) } | Where-Object Count -gt 1)
     if ($dupes) { throw "$($recipe.Name) ${tag}: duplicate source base names: $($dupes.Name -join ', ')" }
+    # `PgoCl`: extra compiler options for PGO builds only, e.g. to make the training run deterministic (`{recipe}`
+    # expands to the recipe's directory).
+    $pgoCl = @()
+    if ($set.Pgo -and $recipe.PgoCl) {
+        $recipeDir = Join-Path $projectsDir $recipe.Name
+        $pgoCl = @($recipe.PgoCl | ForEach-Object { $_.Replace('{recipe}', $recipeDir) })
+    }
     # Trailing backslash: /Fo names each object after its source file inside that directory.
-    Invoke-Native 'cl.exe' (@($MsvcCommon.cl) + @($recipe.Cl) + @($set.cl) + $defines + $includes + @('/c') +
-        $sources + @("/Fo$out\"))
+    Invoke-Native 'cl.exe' (@($MsvcCommon.cl) + @($recipe.Cl) + @($set.cl) + $pgoCl + $defines + $includes +
+        @('/c') + $sources + @("/Fo$out\"))
     $objs = @($sources | ForEach-Object { Join-Path $out ([IO.Path]::GetFileNameWithoutExtension($_) + '.obj') })
     $exe = $recipe.Exe
-    Invoke-Native 'link.exe' (@($MsvcCommon.link) + @($set.link) + $objs + @(
-            "/OUT:$out\$exe.exe", "/PDB:$out\$exe.pdb", "/MAP:$out\$exe.map"))
+    $link = @($MsvcCommon.link) + @($set.link) + $objs + @("/OUT:$out\$exe.exe", "/PDB:$out\$exe.pdb", "/MAP:$out\$exe.map")
+    if (-not $set.Pgo) {
+        Invoke-Native 'link.exe' $link
+        return
+    }
+    # Profile-guided: link instrumented, train, relink with the profile (the linker merges the .pgc files the
+    # training run left next to the .pgd).
+    $pgd = "$out\$exe.pgd"
+    Remove-Item "$out\$exe*.pgc", $pgd -ErrorAction SilentlyContinue
+    Invoke-Native 'link.exe' ($link + @("/GENPROFILE:PGD=$pgd"))
+    Invoke-Training $recipe $src $out
+    if (-not (Get-ChildItem "$out\$exe!*.pgc" -ErrorAction SilentlyContinue)) {
+        throw "$($recipe.Name) ${tag}: the training run left no profile (.pgc)"
+    }
+    Invoke-Native 'link.exe' ($link + @("/USEPROFILE:PGD=$pgd"))
+}
+
+# Run the recipe's `Train` workload against the instrumented build in $out. Each step: `Args` for the program
+# (`{src}`, `{out}` and `{recipe}` expand to the source, build and recipe directories; no spaces, since arguments
+# are passed unquoted), optional `Cwd` and `Stdout` (a file to write standard output to). Exit codes are ignored: a test driver may report failures, and the profile is still valid.
+function Invoke-Training($recipe, [string] $src, [string] $out) {
+    if (-not $recipe.Train) { throw "$($recipe.Name): the o2-pgo flag set needs a Train workload in recipe.psd1" }
+    $recipeDir = Join-Path $projectsDir $recipe.Name
+    $expand = { param($s) $s.Replace('{src}', $src).Replace('{out}', $out).Replace('{recipe}', $recipeDir) }
+    foreach ($step in $recipe.Train) {
+        $arguments = @($step.Args | ForEach-Object { & $expand $_ })
+        $cwd = if ($step.Cwd) { & $expand $step.Cwd } else { $out }
+        $options = @{
+            FilePath = "$out\$($recipe.Exe).exe"; WorkingDirectory = $cwd; NoNewWindow = $true; Wait = $true
+            RedirectStandardError = "$out\train.err"
+        }
+        $options.RedirectStandardOutput = if ($step.Stdout) { & $expand $step.Stdout } else { "$out\train.out" }
+        if ($arguments.Count) { $options.ArgumentList = $arguments }
+        Start-Process @options
+    }
 }
 
 Import-VsDevEnvironment
@@ -88,6 +128,11 @@ foreach ($name in $projectNames) {
     $exe = $recipe.Exe
 
     foreach ($flagName in $flagNames) {
+        # `SkipFlags` in a recipe: flag sets not scored for that project yet (each with its reason in the recipe).
+        if ($recipe.SkipFlags -and $recipe.SkipFlags -contains $flagName) {
+            Write-Host "skipping $name [$flagName]: listed in the recipe's SkipFlags"
+            continue
+        }
         foreach ($tag in $recipe.Versions) { Build-Version $recipe $tag $flagName }
 
         for ($i = 0; $i -lt $recipe.Versions.Count - 1; $i++) {

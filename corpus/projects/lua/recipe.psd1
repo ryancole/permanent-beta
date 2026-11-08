@@ -34,4 +34,8 @@
     }
     Defines  = @('_CRT_SECURE_NO_WARNINGS')
     Cl       = @('/W3')
+    # PGO builds get a fixed string-hash seed (pgo_seed.h), so training, and the build, are reproducible.
+    PgoCl    = @('/FI{recipe}/pgo_seed.h')
+    # PGO training (flag set o2-pgo): corpus/projects/lua/train.lua.
+    Train    = @(@{ Args = @('{recipe}/train.lua') })
 }

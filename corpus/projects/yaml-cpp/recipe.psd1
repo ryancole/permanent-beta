@@ -19,4 +19,6 @@
     Include  = @('include', 'src')
     Defines  = @('_CRT_SECURE_NO_WARNINGS', 'YAML_CPP_STATIC_DEFINE')
     Cl       = @('/W3', '/EHsc', '/std:c++17')
+    # PGO training (flag set o2-pgo): parse the repository's .clang-format (YAML, present in every scored tag).
+    Train    = @(@{ Args = @('{src}\.clang-format') })
 }

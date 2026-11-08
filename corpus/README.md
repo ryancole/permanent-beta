@@ -50,6 +50,13 @@ they are once the parent function changes. Lambdas are named `<lambda_HASH>` wit
 within their object file with the hash ignored, and those still ambiguous (two `(char)` lambdas in one file) are
 out of scope too.
 
+**Flag sets.** /O2 (with and without `/OPT:ICF`), /Od, /O2 with whole-program optimization (`o2-ltcg`) and with
+profile-guided optimization (`o2-pgo`). PGO builds instrumented, runs the recipe's `Train` workload (each step's
+`Args`, optional `Cwd` and `Stdout`; `{src}`, `{out}` and `{recipe}` expand to the source, build and recipe
+directories), then relinks with the profile. Training must be deterministic, or the profile and the build change from run to run:
+`PgoCl` adds compiler options for PGO builds only (Lua forces in a fixed string-hash seed and `table.sort` pivot). A recipe can opt out of flag sets with `SkipFlags`, giving its
+reason: zstd skips /LTCG and PGO for now. The fixtures build every set except PGO.
+
 Needs git and network access the first time. Only recipes and expected outcomes live here; sources and builds
 stay in `target/` and keep their own licenses. Planned: `/LTCG` and PGO flag sets. The
 extended proprietary corpus lives in a separate repository.
