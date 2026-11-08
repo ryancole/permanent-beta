@@ -26,9 +26,10 @@ pwsh corpus/build-projects.ps1 -Score
 
 | Project | Tags | Program | Gate (`expected.toml`) |
 |---|---|---|---|
-| zlib | v1.2.13, v1.3, v1.3.1 | `minigzip` with zlib compiled in | 0 wrong; /O2 69 of 69 correct, /Od 159 of 163 |
-| lua | v5.4.6, v5.4.7, v5.4.8 | `lua` interpreter with the libraries compiled in | 0 wrong; /O2 706–714 of ~735, /Od 1077–1085 of ~1095 |
-| zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 623–669 of ~729, /Od 1674–1731 of ~1879 |
+| zlib | v1.2.13, v1.3, v1.3.1 | `minigzip` with zlib compiled in | 0 wrong; /O2 69 of 69 correct, /Od 160–161 of 163 |
+| lua | v5.4.6, v5.4.7, v5.4.8 | `lua` interpreter with the libraries compiled in | 0 wrong; /O2 726–732 of ~735, /Od 1087–1093 of ~1095 |
+| zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 671–679 of ~729, /Od 1705–1744 of ~1879 |
+| tinyxml2 | 9.0.0, 10.0.0, 10.1.0 | `xmltest` (C++) with the library compiled in | 0 wrong; /O2 194–196 of ~267, /Od 392–395 of ~474 |
 
 The scorecard also reports each pass's precision (correct share of its own candidates) and recall (its correct
 matches over the functions present in both builds).
@@ -39,8 +40,16 @@ tag: the answer key joins by name, so without the declaration a correct match on
 as wrong. Check each rename against the sources before declaring it; a declaration whose old name still exists
 in the new build is an error.
 
+**C++ names.** The answer key joins functions by their decorated (mangled) name first. A decorated name changes
+when the signature does (`int` → `size_t`) or when a class local to a function gets another scope number, so
+leftovers are then joined by their undecorated name, with the signature and then without it, only where that name
+is unique on both sides. Template arguments are part of the name: `MemPoolT<80>` and `MemPoolT<88>` never join.
+Exception-handling funclets (`main$dtor$73`) are out of scope, because their numbers say nothing about which code
+they are once the parent function changes.
+
 Needs git and network access the first time. Only recipes and expected outcomes live here; sources and builds
-stay in `target/` and keep their own licenses. Planned: `/LTCG` and PGO flag sets, and a C++ project. The
+stay in `target/` and keep their own licenses. Planned: `/LTCG` and PGO flag sets, and a C++ project that uses
+exceptions and the STL heavily (yaml-cpp). The
 extended proprietary corpus lives in a separate repository.
 
 To see what wasn't matched:

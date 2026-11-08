@@ -11,10 +11,20 @@
 //! 2. leftovers by name alone, when the name is unique among the leftovers on both sides. This catches a
 //!    function whose linkage changed (zlib 1.3.1 made minigzip's helpers `static`) or that moved to another
 //!    object file. Without it, both look like deleted + added, and correct matches get scored as wrong.
-//! 3. declared renames (old name → new name), checked by hand against the sources and listed in the project's
+//! 3. C++ leftovers by their undecorated name with local-scope numbers removed ([`cxx_identity`]), first with
+//!    the signature (overloads stay apart), then without it, each when the name is unique among the leftovers
+//!    on both sides. A decorated (mangled) name encodes the parameter and return types and, for a class local to a function, a scope number that moves when
+//!    that function's body changes: TinyXML-2 10.0.0 → 10.1.0 changed `int` sizes to `size_t`, and its
+//!    `xmltest` `main`'s local class went from scope 204 to 225. Template arguments stay in the name, so
+//!    `MemPoolT<80>` and `MemPoolT<88>` never join.
+//! 4. declared renames (old name → new name), checked by hand against the sources and listed in the project's
 //!    recipe. Lua 5.4.7 renamed `luaK_exp2RK` to a static `exp2RK`: without the declaration, matching the two
 //!    is scored as wrong. A declaration whose old name still exists in the new build is an error, so the list
 //!    can't go stale.
+//!
+//! Exception-handling funclets (`main$dtor$73`, `?dtor$0@?0??f@…`) are out of scope: the compiler numbers them
+//! per parent function, so once the parent changes the same name says nothing about which code it is. Matching
+//! an in-scope function onto a funclet is still scored as wrong.
 
 use crate::map::{MapFile, MapSymbol};
 use permanent_beta_model::Rva;
@@ -39,6 +49,7 @@ pub enum Scope {
 impl Scope {
     fn includes(&self, s: &MapSymbol) -> bool {
         s.is_function
+            && !is_funclet(&s.name)
             && match self {
                 Scope::Object(o) => &s.object == o,
                 Scope::ProjectObjects => s.object.ends_with(".obj") && !s.object.contains(':'),
@@ -148,7 +159,42 @@ impl GroundTruth {
             }
         }
 
-        // Stage 3: declared renames, per unjoined old function. A partner in the same object file wins (header
+        // Stage 3: C++ leftovers by undecorated name, first with the signature, then without it, each only
+        // where the key is unique among the remaining leftovers on both sides.
+        for with_signature in [true, false] {
+            let key = |s: &MapSymbol| cxx_identity(&s.name, with_signature);
+            let old_keys: Vec<Option<String>> = old_unjoined.iter().map(|s| key(s)).collect();
+            let new_keys: Vec<Option<String>> = new_left
+                .iter()
+                .zip(&new_left_used)
+                .map(|(s, used)| if *used { None } else { key(s) })
+                .collect();
+            let count = |keys: &[Option<String>]| -> HashMap<String, usize> {
+                let mut c: HashMap<String, usize> = HashMap::new();
+                for k in keys.iter().flatten() {
+                    *c.entry(k.clone()).or_default() += 1;
+                }
+                c
+            };
+            let (old_count, new_count) = (count(&old_keys), count(&new_keys));
+            let mut still_unjoined = Vec::new();
+            for (o, k) in old_unjoined.into_iter().zip(&old_keys) {
+                let partner = k
+                    .as_ref()
+                    .filter(|k| old_count[*k] == 1 && new_count.get(*k) == Some(&1))
+                    .and_then(|k| (0..new_left.len()).find(|&i| new_keys[i].as_ref() == Some(k)));
+                match partner {
+                    Some(i) => {
+                        new_left_used[i] = true;
+                        joined.push((Some(o), Some(new_left[i])));
+                    }
+                    None => still_unjoined.push(o),
+                }
+            }
+            old_unjoined = still_unjoined;
+        }
+
+        // Stage 4: declared renames, per unjoined old function. A partner in the same object file wins (header
         // statics exist once per object); otherwise the new name must be unique. Skipped where the new build has
         // no such function (an optimized build can inline a new static away). Errors: a stale declaration (the
         // old name still exists and every old copy was already joined by name), or more than one candidate.
@@ -243,6 +289,49 @@ impl GroundTruth {
             .iter()
             .find(|e| e.names.iter().any(|n| n == name))
     }
+}
+
+/// A C++ function's identity across builds: its undecorated, scope-qualified name with local-scope numbers
+/// (`` `204' ``) removed, e.g. `` `main'::`'::TestUtil::Visit ``, with or without its parameter and return types.
+/// Template arguments are kept. `None` for an undecorated (C) name or one that doesn't demangle.
+pub fn cxx_identity(name: &str, with_signature: bool) -> Option<String> {
+    if !name.starts_with('?') {
+        return None;
+    }
+    let flags = if with_signature {
+        msvc_demangler::DemangleFlags::COMPLETE
+    } else {
+        msvc_demangler::DemangleFlags::NAME_ONLY
+    };
+    let undecorated = msvc_demangler::demangle(name, flags).ok()?;
+    // Drop the digits of every `` `N' `` scope number.
+    let mut out = String::with_capacity(undecorated.len());
+    let mut rest = undecorated.as_str();
+    while let Some(tick) = rest.find('`') {
+        out.push_str(&rest[..=tick]);
+        rest = &rest[tick + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with('\'') {
+            rest = &rest[digits..];
+        }
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// An exception-handling funclet: `f$dtor$3`, `f$catch$0` (C names) or `?dtor$0@?0??f@…`, `?catch$1@…`
+/// (C++ names); also `fin` and `filt`.
+pub fn is_funclet(name: &str) -> bool {
+    const KINDS: [&str; 4] = ["dtor$", "catch$", "fin$", "filt$"];
+    let numbered = |rest: &str| rest.starts_with(|c: char| c.is_ascii_digit());
+    KINDS.iter().any(|kind| {
+        name.strip_prefix('?')
+            .and_then(|n| n.strip_prefix(kind))
+            .is_some_and(numbered)
+            || name
+                .match_indices(&format!("${kind}"))
+                .any(|(i, m)| i > 0 && numbered(&name[i + m.len()..]))
+    })
 }
 
 #[cfg(test)]
@@ -441,5 +530,187 @@ mod tests {
             GroundTruth::from_maps_with_renames(&old, &new, &Scope::ProjectObjects, &r).unwrap();
         let e = t.entry("luaE_freeCI").unwrap();
         assert_eq!((e.old, e.new), (Some(Rva(0x10)), None));
+    }
+
+    // TinyXML-2 10.0.0 → 10.1.0 and 9.0.0 → 10.0.0, decorated names from the MSVC map files.
+    const ITEM_SIZE_INT: &str = "?ItemSize@?$MemPoolT@$0FA@@tinyxml2@@UEBAHXZ";
+    const ITEM_SIZE_SIZE_T: &str = "?ItemSize@?$MemPoolT@$0FA@@tinyxml2@@UEBA_KXZ";
+
+    fn pair_of(t: &GroundTruth, name: &str) -> (Option<Rva>, Option<Rva>) {
+        let e = t.entry(name).unwrap();
+        (e.old, e.new)
+    }
+
+    #[test]
+    fn cxx_identity_drops_the_signature_and_local_scope_numbers() {
+        assert_eq!(
+            cxx_identity(ITEM_SIZE_INT, false).as_deref(),
+            Some("tinyxml2::MemPoolT<80>::ItemSize")
+        );
+        assert_eq!(
+            cxx_identity(ITEM_SIZE_INT, false),
+            cxx_identity(ITEM_SIZE_SIZE_T, false)
+        );
+        assert_ne!(
+            cxx_identity(ITEM_SIZE_INT, true),
+            cxx_identity(ITEM_SIZE_SIZE_T, true)
+        );
+        assert_eq!(
+            cxx_identity(
+                "?Visit@TestUtil@?MM@??main@@YAHHPEAPEBD@Z@EEAA_NAEBVXMLText@tinyxml2@@@Z",
+                false
+            )
+            .as_deref(),
+            Some("`main'::`'::TestUtil::Visit")
+        );
+        assert_eq!(cxx_identity("deflate", true), None);
+    }
+
+    #[test]
+    fn a_changed_cxx_signature_still_joins() {
+        let old = map(vec![sym(ITEM_SIZE_INT, 0x10, "tinyxml2.obj", false)]);
+        let new = map(vec![sym(ITEM_SIZE_SIZE_T, 0x90, "tinyxml2.obj", false)]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert_eq!(
+            pair_of(&t, ITEM_SIZE_INT),
+            (Some(Rva(0x10)), Some(Rva(0x90)))
+        );
+        assert_eq!(
+            t.entry(ITEM_SIZE_INT).unwrap().renamed_to.as_deref(),
+            Some(ITEM_SIZE_SIZE_T)
+        );
+    }
+
+    #[test]
+    fn a_moved_local_class_scope_still_joins() {
+        let old = map(vec![sym(
+            "??1TestUtil@?MM@??main@@YAHHPEAPEBD@Z@UEAA@XZ",
+            0x10,
+            "xmltest.obj",
+            false,
+        )]);
+        let new = map(vec![sym(
+            "??1TestUtil@?OB@??main@@YAHHPEAPEBD@Z@UEAA@XZ",
+            0x90,
+            "xmltest.obj",
+            false,
+        )]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert_eq!(
+            pair_of(&t, "??1TestUtil@?MM@??main@@YAHHPEAPEBD@Z@UEAA@XZ"),
+            (Some(Rva(0x10)), Some(Rva(0x90)))
+        );
+    }
+
+    #[test]
+    fn overloads_in_a_moved_local_class_join_by_signature() {
+        // 9.0.0 → 10.0.0: TestUtil's Visit overloads, scope 204 → 225, signatures unchanged.
+        let text = |scope: &str| {
+            format!("?Visit@TestUtil@?{scope}@??main@@YAHHPEAPEBD@Z@EEAA_NAEBVXMLText@tinyxml2@@@Z")
+        };
+        let comment = |scope: &str| {
+            format!(
+                "?Visit@TestUtil@?{scope}@??main@@YAHHPEAPEBD@Z@EEAA_NAEBVXMLComment@tinyxml2@@@Z"
+            )
+        };
+        let old = map(vec![
+            sym(&text("MM"), 0x10, "xmltest.obj", false),
+            sym(&comment("MM"), 0x20, "xmltest.obj", false),
+        ]);
+        let new = map(vec![
+            sym(&comment("OB"), 0x90, "xmltest.obj", false),
+            sym(&text("OB"), 0xa0, "xmltest.obj", false),
+        ]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert_eq!(pair_of(&t, &text("MM")), (Some(Rva(0x10)), Some(Rva(0xa0))));
+        assert_eq!(
+            pair_of(&t, &comment("MM")),
+            (Some(Rva(0x20)), Some(Rva(0x90)))
+        );
+    }
+
+    #[test]
+    fn changed_template_arguments_do_not_join() {
+        // MemPoolT<80> → MemPoolT<88>: another instantiation, deleted + added.
+        let old = map(vec![sym(ITEM_SIZE_INT, 0x10, "tinyxml2.obj", false)]);
+        let new = map(vec![sym(
+            "?ItemSize@?$MemPoolT@$0FI@@tinyxml2@@UEBAHXZ",
+            0x90,
+            "tinyxml2.obj",
+            false,
+        )]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert_eq!(pair_of(&t, ITEM_SIZE_INT), (Some(Rva(0x10)), None));
+    }
+
+    #[test]
+    fn overloads_whose_signatures_both_changed_do_not_join() {
+        // f(int) and f(char) become f(__int64) and f(short): the undecorated name `f` is not unique.
+        let old = map(vec![
+            sym("?f@@YAXH@Z", 0x10, "a.obj", false),
+            sym("?f@@YAXD@Z", 0x20, "a.obj", false),
+        ]);
+        let new = map(vec![
+            sym("?f@@YAX_J@Z", 0x90, "a.obj", false),
+            sym("?f@@YAXF@Z", 0xa0, "a.obj", false),
+        ]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert_eq!(pair_of(&t, "?f@@YAXH@Z"), (Some(Rva(0x10)), None));
+        assert_eq!(pair_of(&t, "?f@@YAXD@Z"), (Some(Rva(0x20)), None));
+    }
+
+    #[test]
+    fn an_overload_left_over_alone_joins() {
+        // f(char) unchanged (joined by name), f(int) → f(__int64): the only `f` left on each side.
+        let old = map(vec![
+            sym("?f@@YAXH@Z", 0x10, "a.obj", false),
+            sym("?f@@YAXD@Z", 0x20, "a.obj", false),
+        ]);
+        let new = map(vec![
+            sym("?f@@YAX_J@Z", 0x90, "a.obj", false),
+            sym("?f@@YAXD@Z", 0xa0, "a.obj", false),
+        ]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert_eq!(
+            pair_of(&t, "?f@@YAXH@Z"),
+            (Some(Rva(0x10)), Some(Rva(0x90)))
+        );
+        assert_eq!(
+            pair_of(&t, "?f@@YAXD@Z"),
+            (Some(Rva(0x20)), Some(Rva(0xa0)))
+        );
+    }
+
+    #[test]
+    fn funclets_are_out_of_scope() {
+        for name in [
+            "main$dtor$73",
+            "main$catch$0",
+            "f$fin$1",
+            "?dtor$0@?0??TestParseError@TestUtil@?MM@??main@@YAHHPEAPEBD@Z@QEAAXPEBD1W4XMLError@tinyxml2@@H@Z@4HA",
+            "?catch$1@?0??f@@YAXXZ@4HA",
+        ] {
+            assert!(is_funclet(name), "{name}");
+        }
+        for name in [
+            "catch_error",
+            "dtor$",
+            "?finish@@YAXXZ",
+            "$dtor$1",
+            "deflate",
+        ] {
+            assert!(!is_funclet(name), "{name}");
+        }
+        let old = map(vec![
+            sym("main$dtor$73", 0x10, "xmltest.obj", false),
+            sym("main", 0x20, "xmltest.obj", false),
+        ]);
+        let new = map(vec![
+            sym("main$dtor$73", 0x90, "xmltest.obj", false),
+            sym("main", 0xa0, "xmltest.obj", false),
+        ]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert!(t.entry("main$dtor$73").is_none());
+        assert_eq!(pair_of(&t, "main"), (Some(Rva(0x20)), Some(Rva(0xa0))));
     }
 }

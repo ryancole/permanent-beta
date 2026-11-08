@@ -1,0 +1,26 @@
+# Gate for the TinyXML-2 corpus (the first C++ project). Scored by
+# `pwsh corpus/build-projects.ps1 -Project tinyxml2 -Score` (add `--misses` to `pbeta-corpus score` to list what
+# wasn't matched).
+#
+#   - zero wrong matches, always (not configurable);
+#   - at least `min_correct` correct matches per variant (<flags>__<old>__<new>), counting every function from
+#     the project's own object files (STL instantiations included) except exception-handling funclets.
+#
+# Baseline 2026-11-07 (first run): /O2 196 of 268 and 194 of 266, /O2+ICF 203 of 229 and 199 of 227, /Od 392 of
+# 473 and 395 of 475, 0 wrong. Functions reachable only through vtables are found (base relocations): only 5-15
+# per variant are unmatched. Most misses are ambiguous, sent to review: the tiny virtual overrides that are
+# byte-identical across classes (XMLNode's ToElement, ToText, ... returning null; MemPoolT's Free and SetTracked
+# per instantiation).
+#
+# The first run reported 5-18 wrong per variant, all in the answer key, not the engine: decorated names encode
+# signatures (10.1.0 changed int sizes to size_t; XMLDocument::Identify gained a bool parameter) and the scope
+# number of main's local class TestUtil, so the same function had a new name; and `main$dtor$N` funclets are
+# renumbered when main changes. The answer key now joins C++ names by their undecorated name and leaves
+# funclets out (crates/permanent-beta-corpus/src/truth.rs).
+[gate.min_correct]
+"o2__9.0.0__10.0.0" = 196
+"o2__10.0.0__10.1.0" = 194
+"o2-icf__9.0.0__10.0.0" = 203
+"o2-icf__10.0.0__10.1.0" = 199
+"od__9.0.0__10.0.0" = 392
+"od__10.0.0__10.1.0" = 395

@@ -4,7 +4,17 @@
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **dead code found from layout** (design §4.2, §4.4). Code on a 16-byte boundary right after
+Latest work: **the first C++ project, TinyXML-2** (9.0.0 → 10.0.0 → 10.1.0, its `xmltest` driver with the
+library compiled in). 0 wrong on all six variants: /O2 194–196 of ~267, /O2+ICF 199–203 of ~228, /Od 392–395 of
+~474. Code reachable only through vtables is found (base relocations): only 5–15 functions per variant are
+unmatched. Most misses are ambiguous and go to review: tiny virtual overrides that are byte-identical across
+classes (`XMLNode`'s `ToElement`, `ToText`, … returning null). The first run's 5–18 "wrong" per variant were all
+in the answer key: decorated names change with the signature (`int` → `size_t`) and with a function-local class's
+scope number, and `main$dtor$N` funclets are renumbered. The answer key now joins C++ leftovers by undecorated name
+(with, then without, the signature; unique on both sides; template arguments kept) and leaves funclets out. The
+other projects' scores are unchanged.
+
+Before that: **dead code found from layout** (design §4.2, §4.4). Code on a 16-byte boundary right after
 `int3` padding is a function start once nothing else is found (not where its own function branches to it, never
 inside a `.pdata` function). Every build now finds every function its PDB lists, with no new false start; /Od +1
 to +6 correct per variant, 0 wrong, baselines raised; /O2 and the hook loop unchanged.
@@ -107,6 +117,7 @@ What's new:
   - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 160–161 of 163.
   - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 726–732 of ~735, /Od 1087–1093 of ~1095.
   - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 671–679 of ~729 (/O2+ICF 657–665), /Od 1705–1744 of ~1879.
+  - TinyXML-2 9.0.0 → 10.0.0 → 10.1.0 (C++): /O2 194–196 of ~267 (/O2+ICF 199–203 of ~228), /Od 392–395 of ~474.
   - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations,
     with trial runs, patterns, the header and proposed shims checked.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score`, `pwsh corpus/build-projects.ps1 -Score` and
@@ -133,11 +144,13 @@ What's new:
 1. **Decide whether `pbeta propose` runs as part of `repair`** for unmatched hook targets (proposals into the
    hook's review item, never applied). Optionally describe unmatched callees in the prompt, the lever for zstd's
    `*_noDict_*` family; instruction text wouldn't separate it (design §8).
-2. **Corpus breadth:** a C++ project (vtables should be found through base relocations, untested), `/LTCG` and
-   PGO flag sets.
-3. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
+2. **Vtable-slot evidence:** C++ misses are mostly identical tiny virtuals. Pairing them by their slot in
+   vtables that are already matched (same class, same slot) would resolve them with structural evidence instead of
+   a guess. Needs vtables recognized in `.rdata` (runs of relocated code pointers).
+3. **Corpus breadth:** a C++ project heavy on exceptions and the STL (yaml-cpp), `/LTCG` and PGO flag sets.
+4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
    proposals; both lean on PDB or Ghidra types.
-4. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
+5. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 
 ## Known rough edges
 
@@ -155,6 +168,9 @@ What's new:
   `pb_body_edited`, which is misleading but not a wrong match.
 - `.exe` hashes change on every rebuild even with `/Brepro` (PE timestamp, PDB signature), so a build ID is
   per build.
+- The matcher pairs exception-handling funclets (`main$dtor$N`) too; the answer key can't judge those pairs (they're
+  out of its scope); on the first TinyXML-2 run some paired funclets of different numbers. A hook never targets
+  one, but nothing stops it either.
 - Renames in the answer key are declared by hand. zstd lists only the renames the engine matched; an
   undeclared rename shows up as a "wrong" match and must be checked against the sources before declaring it.
 - Dead code is found only when it follows `int3` padding on a 16-byte boundary (all of it on the corpus, MSVC's

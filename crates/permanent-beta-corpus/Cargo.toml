@@ -23,3 +23,5 @@ toml.workspace = true
 permanent-beta-analysis.workspace = true
 permanent-beta-engine.workspace = true
 permanent-beta-ai.workspace = true
+# Answer keys only: C++ names joined by their undecorated name when the signature changed.
+msvc-demangler.workspace = true
