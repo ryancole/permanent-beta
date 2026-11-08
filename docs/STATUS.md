@@ -204,14 +204,14 @@ What's new:
 | Goal | State |
 |---|---|
 | 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2 and yaml-cpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
-| 2. Verify it's the same function | Done for symbol-less binaries; with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
+| 2. Verify it's the same function | Done for symbol-less binaries, including C++ vtable slots (code-tables check); with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
 | 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim) and for changed struct layouts (PDB types: changes, new definition, offsets) |
 | 4. Behavioral tests from the old version | Scenario trace diff and trial runs done (M4); recorded per-call test cases and replay not started |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
 | Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; UI extension (M6) not started |
 | Hosted service, IDA plugin | Not started (designed) |
-| AI fallback | Built and measured (M5): 54 of 56 proposals correct on Lua and zstd, /O2 and /Od; `none` on deleted functions apart from near misses; no wrong proposal passes verification (design §8) |
+| AI fallback | Built and measured (M5), in `propose` and `repair --propose`: 75 of 77 proposals correct on Lua and zstd, /O2 and /Od (remeasured 2026-11-07); `none` on 11 of 12 deleted functions; no wrong proposal passes verification (design §8) |
 | License choice, market validation | Open |
 
 ## Suggested next steps
