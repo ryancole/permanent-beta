@@ -21,10 +21,13 @@
 # through function tables (arith_*, str_find, ...) are found instead of absorbed: /O2 and /O2+ICF 726 and 732,
 # /Od unchanged, 0 wrong.
 # 2026-11-07, function starts after int3 padding (design §4.4): /Od 1087 and 1093, /O2 unchanged, 0 wrong.
+# 2026-11-07, lowered: three matching rules added for yaml-cpp's wrong matches (design §5.1) turn a few correct
+# candidates into review suggestions, never into wrong matches: the hash pass's caller veto, pairing copies by
+# elimination only with an agreeing neighbour, and the broader wrapper rule in similarity. /O2 724 and 731, /Od 1086 and 1092 (was 726/732, 1087/1093).
 [gate.min_correct]
-"o2__v5.4.6__v5.4.7" = 726
-"o2__v5.4.7__v5.4.8" = 732
-"o2-icf__v5.4.6__v5.4.7" = 726
-"o2-icf__v5.4.7__v5.4.8" = 732
-"od__v5.4.6__v5.4.7" = 1087
-"od__v5.4.7__v5.4.8" = 1093
+"o2__v5.4.6__v5.4.7" = 724
+"o2__v5.4.7__v5.4.8" = 731
+"o2-icf__v5.4.6__v5.4.7" = 724
+"o2-icf__v5.4.7__v5.4.8" = 731
+"od__v5.4.6__v5.4.7" = 1086
+"od__v5.4.7__v5.4.8" = 1092

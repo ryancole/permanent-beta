@@ -1,0 +1,29 @@
+# Gate for the yaml-cpp corpus (the second C++ project: exceptions, STL, templates, lambdas). Scored by
+# `pwsh corpus/build-projects.ps1 -Project yaml-cpp -Score` (add `--misses` to `pbeta-corpus score` to list what
+# wasn't matched).
+#
+#   - zero wrong matches, always (not configurable);
+#   - at least `min_correct` correct matches per variant (<flags>__<old>__<new>), counting every function from
+#     the project's own object files (STL instantiations included) except exception-handling funclets and
+#     lambdas the answer key can't tell apart.
+#
+# Baseline 2026-11-07 (first run): /O2 269 of 330 and 256 of 320, /O2+ICF 246 of 292 and 236 of 282, /Od 2952
+# of 3169 and 2913 of 3146, 0 wrong. /Od is ~10x /O2: STL and lambda helpers are only inlined when optimizing.
+#
+# The first run reported 12 and 14 wrong at /Od. Most were the answer key: MSVC names lambdas `<lambda_HASH>`
+# with a per-build hash, so the same lambda had a new name (the key now joins lambdas within their object file,
+# and leaves out those it can't tell apart). Four were real, all in 0.8.0 -> 0.9.0, and are fixed in matching:
+#   - Emitter::Write(const std::string&) matched by similarity to the new Write(const char*, size_t) that took
+#     over its body (the old one became a wrapper calling data(), size() and the new one): the wrapper rule now
+#     allows other, already-matched callees;
+#   - two std::string iterator helpers, gone in 0.9.0, matched by hash to new std::array<char, 20> helpers with
+#     identical code: the hash pass is now vetoed when the old function's matched callers don't call the new one;
+#   - an 11-byte helper with 66 copies per build, paired by elimination as the last copy left on each side: such
+#     pairs now need an agreeing matched neighbour.
+[gate.min_correct]
+"o2__yaml-cpp-0.7.0__0.8.0" = 269
+"o2__0.8.0__yaml-cpp-0.9.0" = 256
+"o2-icf__yaml-cpp-0.7.0__0.8.0" = 246
+"o2-icf__0.8.0__yaml-cpp-0.9.0" = 236
+"od__yaml-cpp-0.7.0__0.8.0" = 2952
+"od__0.8.0__yaml-cpp-0.9.0" = 2913

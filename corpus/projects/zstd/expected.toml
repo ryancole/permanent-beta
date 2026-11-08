@@ -30,10 +30,13 @@
 # absorbed: /Od 1705 and 1744 (accepted 2 fewer per variant, now in review), /O2 unchanged, 0 wrong.
 # 2026-11-07, table-slot pass (design §5.1 pass 5b): slots in zstd's C function-pointer tables resolve identical
 # copies. /O2 680 and 688, /O2+ICF 666 and 674, /Od 1739 and 1778, 0 wrong.
+# 2026-11-07, lowered: three matching rules added for yaml-cpp's wrong matches (design §5.1) turn a few correct
+# candidates into review suggestions, never into wrong matches: the hash pass's caller veto, pairing copies by
+# elimination only with an agreeing neighbour, and the broader wrapper rule in similarity. /O2 678 and 688, /O2+ICF 664 and 674, /Od 1732 and 1771 (was 680/688, 666/674, 1739/1778).
 [gate.min_correct]
-"o2__v1.5.5__v1.5.6" = 680
+"o2__v1.5.5__v1.5.6" = 678
 "o2__v1.5.6__v1.5.7" = 688
-"o2-icf__v1.5.5__v1.5.6" = 666
+"o2-icf__v1.5.5__v1.5.6" = 664
 "o2-icf__v1.5.6__v1.5.7" = 674
-"od__v1.5.5__v1.5.6" = 1739
-"od__v1.5.6__v1.5.7" = 1778
+"od__v1.5.5__v1.5.6" = 1732
+"od__v1.5.6__v1.5.7" = 1771

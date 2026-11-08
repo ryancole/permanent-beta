@@ -4,7 +4,21 @@
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **a code-tables verification check** (design §6.1). A candidate passes it when the old and new
+Latest work: **yaml-cpp, the second C++ project** (0.7.0 → 0.8.0 → 0.9.0, `util/read` with the library compiled
+in: exceptions, STL, templates, lambdas). 0 wrong on all six variants: /O2 256–269 of ~325, /O2+ICF 236–246,
+/Od 2913–2952 of ~3158. The first run had 12–14 "wrong" per /Od variant. Most were the answer key (lambdas'
+per-build `<lambda_HASH>` names; now joined within their object file, and left out where ambiguous). Four were
+real, all fixed in matching:
+- similarity matched a body that moved behind a new wrapper; the wrapper rule now allows the wrapper's other
+  callees when they're already matched (at /Od a wrapper calls `data()`, `size()`);
+- the hash pass matched deleted `std::string` iterator helpers to new, byte-identical `std::array` ones; it's
+  now vetoed when the old function's matched callers don't call the new one (as strings and mnemonic were);
+- the hash pass paired the last two of 66 identical copies by elimination; such pairs now need an agreeing
+  matched neighbour.
+These cost 1–8 correct per variant on Lua, TinyXML-2 and zstd (now review suggestions, none was wrong), so those
+baselines were lowered, each with a note in its `expected.toml`.
+
+Before that: **a code-tables verification check** (design §6.1). A candidate passes it when the old and new
 function fill the same slot of corresponding vtables or function tables. It's independent of the code hash, so
 hash-matched virtuals with no callers are now accepted: +7 to +28 accepted per TinyXML-2 and zstd variant, the
 same correct counts, 0 wrong; it never failed on the corpus. **Decided 2026-11-07:** table-slot candidates don't count it,
@@ -131,9 +145,10 @@ What's new:
   pass's precision and recall.
   - Purpose-built fixture `basic` (`corpus/fixtures`): 3 flag sets.
   - zlib v1.2.13 → v1.3 → v1.3.1: /O2 69 of 69, /Od 160–161 of 163.
-  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 726–732 of ~735, /Od 1087–1093 of ~1095.
-  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 680–688 of ~729 (/O2+ICF 666–674), /Od 1739–1778 of ~1879.
-  - TinyXML-2 9.0.0 → 10.0.0 → 10.1.0 (C++): /O2 233–247 of ~267 (/O2+ICF 204–212 of ~228), /Od 433–436 of ~474.
+  - Lua v5.4.6 → v5.4.7 → v5.4.8: /O2 724–731 of ~735, /Od 1086–1092 of ~1095.
+  - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 678–688 of ~729 (/O2+ICF 664–674), /Od 1732–1771 of ~1879.
+  - TinyXML-2 9.0.0 → 10.0.0 → 10.1.0 (C++): /O2 231–247 of ~267 (/O2+ICF 201–212 of ~228), /Od 425–435 of ~474.
+  - yaml-cpp 0.7.0 → 0.8.0 → 0.9.0 (C++): /O2 256–269 of ~325 (/O2+ICF 236–246), /Od 2913–2952 of ~3158.
   - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations,
     with trial runs, patterns, the header and proposed shims checked.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score`, `pwsh corpus/build-projects.ps1 -Score` and
@@ -160,8 +175,9 @@ What's new:
 1. **Decide whether `pbeta propose` runs as part of `repair`** for unmatched hook targets (proposals into the
    hook's review item, never applied). Optionally describe unmatched callees in the prompt, the lever for zstd's
    `*_noDict_*` family; instruction text wouldn't separate it (design §8).
-2. **Corpus breadth for C++:** a project heavy on exceptions and the STL (yaml-cpp), so table-slot matching and
-   the code-tables check are measured beyond one codebase before anything leans on them further.
+2. **Recover what the new rules hold back:** the lost correct matches are review suggestions with a reason. A
+   pass that resolves identical copies by a stronger neighbourhood (both callers *and* callees matched) could
+   win some back without pairing by elimination.
 3. **Corpus breadth:** `/LTCG` and PGO flag sets.
 4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
    proposals; both lean on PDB or Ghidra types.
@@ -194,5 +210,6 @@ What's new:
 - Dead code is found only when it follows `int3` padding on a 16-byte boundary (all of it on the corpus, MSVC's
   default). Unpadded dead code would be absorbed into the function before it, as before.
 - Lua /O2 has three 1-byte native-only starts just past a function's end (design §4.4), not yet explained.
-- Once one copy in a group of identical code is resolved, the hash pass can pair the remaining copies by
-  elimination, even if their callees differ. No wrong match from it on the corpus so far.
+- Identical copies are no longer paired by elimination without an agreeing neighbour (yaml-cpp found the first
+  wrong match from it). Pairs the gate can't judge: lambdas the answer key can't tell apart are out of scope,
+  like funclets.

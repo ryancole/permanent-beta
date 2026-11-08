@@ -391,6 +391,16 @@ impl Matcher for SymbolNameMatcher {
 }
 
 /// Pass 2: identical normalized instruction hash, unique on both sides.
+///
+/// **Vetoed** like the strings pass when the old function has matched callers and none of their counterparts
+/// calls the new function (rechecked against the final matches). Unique code isn't unique identity: yaml-cpp
+/// 0.9.0 dropped `std::string` iterator helpers and gained `std::array<char, 20>` ones with byte-identical
+/// code, each the only copy in its build. The old helpers' matched caller no longer calls anything like them.
+///
+/// **Pairing by elimination needs an anchor.** When the code has several copies in either build, a group can
+/// become unique only because other copies were matched first. Then the last copies left are paired only if a
+/// matched neighbour agrees (as in the mnemonic pass); otherwise it's a review suggestion. In yaml-cpp 0.9.0 an
+/// 11-byte helper with 66 copies per build was the last one left on each side, but a different function.
 pub struct NormalizedHashMatcher;
 
 impl Matcher for NormalizedHashMatcher {
@@ -399,14 +409,60 @@ impl Matcher for NormalizedHashMatcher {
     }
 
     fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
-        propose_by_key(
+        let mut proposals = propose_by_key(
             ctx,
             self.name(),
             0.95,
             evidence_kind::NORMALIZED_HASH,
             &|f: &FunctionFeatures| f.normalized_hash.clone(),
             &|f: &FunctionFeatures| format!("hash {}", f.normalized_hash.as_deref().unwrap_or("")),
-        )
+        );
+        fn copies(e: &AnalysisExport) -> HashMap<&str, usize> {
+            let mut c: HashMap<&str, usize> = HashMap::new();
+            for h in e
+                .functions
+                .iter()
+                .filter_map(|f| f.normalized_hash.as_deref())
+            {
+                *c.entry(h).or_default() += 1;
+            }
+            c
+        }
+        let (old_copies, new_copies) = (copies(ctx.old), copies(ctx.new));
+        let hash = |e: &'_ AnalysisExport, r: Rva| {
+            e.function(r)
+                .and_then(|f| f.normalized_hash.clone())
+                .unwrap_or_default()
+        };
+        let mut kept = Vec::new();
+        for mut c in proposals.candidates {
+            let h = hash(ctx.old, c.old);
+            let (o, n) = (
+                old_copies.get(h.as_str()).copied().unwrap_or(0),
+                new_copies.get(h.as_str()).copied().unwrap_or(0),
+            );
+            if o <= 1 && n <= 1 {
+                kept.push(c);
+            } else if let Some(anchor) = MnemonicHashMatcher::anchor(ctx, c.old, c.new) {
+                c.evidence.push(anchor);
+                kept.push(c);
+            } else {
+                proposals.ambiguities.push(Ambiguity {
+                    matcher: self.name().to_owned(),
+                    old: vec![c.old],
+                    new: vec![c.new],
+                    detail: format!(
+                        "suggestion only: identical code with {o} and {n} copies, the last unmatched                          on each side, but no matched neighbour agrees"
+                    ),
+                });
+            }
+        }
+        proposals.candidates = kept;
+        proposals
+    }
+
+    fn contradiction(&self, ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
+        callers_disagree(ctx, c).map(|r| format!("same code, but {r}"))
     }
 }
 
@@ -1389,8 +1445,11 @@ impl Matcher for SimilarityMatcher {
             let old_margin = best - runner_up(ranked);
             let new_margin = best - runner_up(theirs);
             // Body moved behind a new wrapper (zstd 1.5.6's ZSTD_findFrameCompressedSize, now a wrapper around
-            // a new _advanced): the new function is the only callee of an unmatched new function, so the old
-            // one may correspond to either.
+            // a new _advanced): an unmatched new function, smaller than this one, that calls it and otherwise
+            // only already-matched functions, so the old one may correspond to either. At /Od a wrapper also
+            // calls accessors (yaml-cpp 0.9.0's `Write(const std::string&)` calls `data()` and `size()`, then
+            // the new `Write(const char*, size_t)` that took over its body).
+            let n_size = ctx.new.function(n).map_or(0, |f| f.size);
             let wrapper = new_callers
                 .get(&n)
                 .into_iter()
@@ -1398,10 +1457,13 @@ impl Matcher for SimilarityMatcher {
                 .copied()
                 .find(|&w| {
                     !ctx.matched_new.contains(&w)
-                        && ctx
-                            .new
-                            .function(w)
-                            .is_some_and(|f| f.callees.as_slice() == [n])
+                        && ctx.new.function(w).is_some_and(|f| {
+                            f.size < n_size
+                                && f.callees.contains(&n)
+                                && f.callees
+                                    .iter()
+                                    .all(|c| *c == n || ctx.matched_new.contains(c))
+                        })
                 });
             if let Some(w) = wrapper {
                 proposals.ambiguities.push(Ambiguity {
@@ -2566,5 +2628,131 @@ mod tests {
         assert!(recheck(&[pair(0x10, 0x110), pair(0x50, 0x170), slot_pair.clone()]).is_some());
         // The pair itself is no anchor: without slot 0 there is nothing left to support it.
         assert!(recheck(std::slice::from_ref(&slot_pair)).is_some());
+    }
+
+    #[test]
+    fn a_wrapper_that_also_calls_matched_accessors_is_still_a_wrapper() {
+        // yaml-cpp 0.9.0 at /Od: the new Write(const std::string&) calls data() and size() (matched) and then the
+        // new Write(const char*, size_t) that took over the body. The old body must not be matched to either.
+        let old = export(
+            "a",
+            vec![
+                named_calling(1, "main", &[0x10]),
+                named_calling(0x50, "x", &[]),
+                named_calling(0x60, "data", &[]),
+                body(0x10, "h1", 5, &[0x50], 64),
+            ],
+        );
+        let new = export(
+            "b",
+            vec![
+                named_calling(2, "main", &[0x130]),
+                named_calling(0x150, "x", &[]),
+                named_calling(0x160, "data", &[]),
+                body(0x130, "hw", 0, &[0x160, 0x110], 12),
+                body(0x110, "h2", 6, &[0x150], 66),
+            ],
+        );
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x10)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(
+            got.ambiguities
+                .iter()
+                .any(|a| a.old == vec![Rva(0x10)] && a.new == vec![Rva(0x130), Rva(0x110)]),
+            "{:?}",
+            got.ambiguities
+        );
+    }
+
+    /// old: c → helper 0x20 (code `it`). new: helper 0x120 with the same code, called by `d`; `c` calls the
+    /// helper only if `still_called`.
+    fn moved_helper(still_called: bool) -> (AnalysisExport, AnalysisExport) {
+        let old = export(
+            "a",
+            vec![
+                named_calling(0x10, "c", &[0x20]),
+                func(0x20, None, Some("it")),
+            ],
+        );
+        let c_callees: &[u64] = if still_called { &[0x120] } else { &[] };
+        let new = export(
+            "b",
+            vec![
+                named_calling(0x110, "c", c_callees),
+                named_calling(0x130, "d", &[0x120]),
+                func(0x120, None, Some("it")),
+            ],
+        );
+        (old, new)
+    }
+
+    #[test]
+    fn identical_code_its_matched_caller_no_longer_calls_is_not_matched() {
+        // Negative (yaml-cpp 0.9.0): a std::string iterator helper is gone; a std::array one with the same code
+        // appeared elsewhere. Each is the only copy in its build, but the old helper's matched caller doesn't
+        // call the new one.
+        let (old, new) = moved_helper(false);
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x20)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(
+            got.ambiguities
+                .iter()
+                .any(|a| a.matcher == "normalized-hash" && a.detail.contains("matched caller")),
+            "{:?}",
+            got.ambiguities
+        );
+        // Control: still called by its matched caller, so matched.
+        let (old, new) = moved_helper(true);
+        assert!(pairs(&old, &new).contains(&(0x20, 0x120)));
+    }
+
+    /// Two copies of the same code on each side; the first pair is matched by name. The second copies call `x`
+    /// only if `anchored`.
+    fn copies(anchored: bool) -> (AnalysisExport, AnalysisExport) {
+        let callees: &[u64] = if anchored { &[0x50] } else { &[] };
+        let new_callees: &[u64] = if anchored { &[0x150] } else { &[] };
+        let mut a = func(0x20, Some("a"), Some("dup"));
+        a.callees = callees.iter().map(|&r| Rva(r)).collect();
+        let mut b = func(0x30, None, Some("dup"));
+        b.callees = callees.iter().map(|&r| Rva(r)).collect();
+        let old = export("a", vec![named_calling(0x50, "x", &[]), a, b]);
+        let mut a2 = func(0x120, Some("a"), Some("dup"));
+        a2.callees = new_callees.iter().map(|&r| Rva(r)).collect();
+        let mut b2 = func(0x130, None, Some("dup"));
+        b2.callees = new_callees.iter().map(|&r| Rva(r)).collect();
+        let new = export("b", vec![named_calling(0x150, "x", &[]), a2, b2]);
+        (old, new)
+    }
+
+    #[test]
+    fn the_last_copies_left_are_not_paired_by_elimination_alone() {
+        // Negative (yaml-cpp 0.9.0, an 11-byte helper with 66 copies per build): once the other copies are
+        // matched, the last two left are unique only among the unmatched. Without a matched neighbour that
+        // agrees, that's a review suggestion.
+        let (old, new) = copies(false);
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x30)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(
+            got.ambiguities
+                .iter()
+                .any(|a| a.old == vec![Rva(0x30)] && a.detail.contains("copies")),
+            "{:?}",
+            got.ambiguities
+        );
+        // Control: both call matched x, so the pair is anchored.
+        let (old, new) = copies(true);
+        assert!(pairs(&old, &new).contains(&(0x30, 0x130)));
     }
 }

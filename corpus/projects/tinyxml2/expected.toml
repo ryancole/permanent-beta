@@ -20,10 +20,13 @@
 # 2026-11-07, table-slot pass (design §5.1 pass 5b): identical virtuals told apart by their vtable slot. /O2 247
 # and 233 (+51, +39), /O2+ICF 212 and 204, /Od 436 and 433 (+44, +38), 0 wrong. Most of the new ones go to review:
 # table position implies no verification check, and a tiny `return null` has nothing else to check.
+# 2026-11-07, lowered: three matching rules added for yaml-cpp's wrong matches (design §5.1) turn a few correct
+# candidates into review suggestions, never into wrong matches: the hash pass's caller veto, pairing copies by
+# elimination only with an agreeing neighbour, and the broader wrapper rule in similarity. /O2 247 and 231, /O2+ICF 212 and 201, /Od 435 and 425 (was 247/233, 212/204, 436/433).
 [gate.min_correct]
 "o2__9.0.0__10.0.0" = 247
-"o2__10.0.0__10.1.0" = 233
+"o2__10.0.0__10.1.0" = 231
 "o2-icf__9.0.0__10.0.0" = 212
-"o2-icf__10.0.0__10.1.0" = 204
-"od__9.0.0__10.0.0" = 436
-"od__10.0.0__10.1.0" = 433
+"o2-icf__10.0.0__10.1.0" = 201
+"od__9.0.0__10.0.0" = 435
+"od__10.0.0__10.1.0" = 425

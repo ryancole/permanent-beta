@@ -27,9 +27,10 @@ pwsh corpus/build-projects.ps1 -Score
 | Project | Tags | Program | Gate (`expected.toml`) |
 |---|---|---|---|
 | zlib | v1.2.13, v1.3, v1.3.1 | `minigzip` with zlib compiled in | 0 wrong; /O2 69 of 69 correct, /Od 160–161 of 163 |
-| lua | v5.4.6, v5.4.7, v5.4.8 | `lua` interpreter with the libraries compiled in | 0 wrong; /O2 726–732 of ~735, /Od 1087–1093 of ~1095 |
-| zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 680–688 of ~729, /Od 1739–1778 of ~1879 |
-| tinyxml2 | 9.0.0, 10.0.0, 10.1.0 | `xmltest` (C++) with the library compiled in | 0 wrong; /O2 233–247 of ~267, /Od 433–436 of ~474 |
+| lua | v5.4.6, v5.4.7, v5.4.8 | `lua` interpreter with the libraries compiled in | 0 wrong; /O2 724–731 of ~735, /Od 1086–1092 of ~1095 |
+| zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 678–688 of ~729, /Od 1732–1771 of ~1879 |
+| tinyxml2 | 9.0.0, 10.0.0, 10.1.0 | `xmltest` (C++) with the library compiled in | 0 wrong; /O2 231–247 of ~267, /Od 425–435 of ~474 |
+| yaml-cpp | 0.7.0, 0.8.0, 0.9.0 | `read` (C++: exceptions, STL, lambdas) with the library compiled in | 0 wrong; /O2 256–269 of ~325, /Od 2913–2952 of ~3158 |
 
 The scorecard also reports each pass's precision (correct share of its own candidates) and recall (its correct
 matches over the functions present in both builds).
@@ -45,11 +46,12 @@ when the signature does (`int` → `size_t`) or when a class local to a function
 leftovers are then joined by their undecorated name, with the signature and then without it, only where that name
 is unique on both sides. Template arguments are part of the name: `MemPoolT<80>` and `MemPoolT<88>` never join.
 Exception-handling funclets (`main$dtor$73`) are out of scope, because their numbers say nothing about which code
-they are once the parent function changes.
+they are once the parent function changes. Lambdas are named `<lambda_HASH>` with a per-build hash: they join
+within their object file with the hash ignored, and those still ambiguous (two `(char)` lambdas in one file) are
+out of scope too.
 
 Needs git and network access the first time. Only recipes and expected outcomes live here; sources and builds
-stay in `target/` and keep their own licenses. Planned: `/LTCG` and PGO flag sets, and a C++ project that uses
-exceptions and the STL heavily (yaml-cpp). The
+stay in `target/` and keep their own licenses. Planned: `/LTCG` and PGO flag sets. The
 extended proprietary corpus lives in a separate repository.
 
 To see what wasn't matched:

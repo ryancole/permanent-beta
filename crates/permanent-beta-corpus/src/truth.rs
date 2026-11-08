@@ -22,6 +22,9 @@
 //!    is scored as wrong. A declaration whose old name still exists in the new build is an error, so the list
 //!    can't go stale.
 //!
+//! Leftovers named after a lambda (`<lambda_HASH>`, a per-build hash) join only within their object file, and
+//! those still unjoined are out of scope: two `(char)` lambdas in one file can't be told apart by name.
+//!
 //! Exception-handling funclets (`main$dtor$73`, `?dtor$0@?0??f@…`) are out of scope: the compiler numbers them
 //! per parent function, so once the parent changes the same name says nothing about which code it is. Matching
 //! an in-scope function onto a funclet is still scored as wrong.
@@ -162,7 +165,16 @@ impl GroundTruth {
         // Stage 3: C++ leftovers by undecorated name, first with the signature, then without it, each only
         // where the key is unique among the remaining leftovers on both sides.
         for with_signature in [true, false] {
-            let key = |s: &MapSymbol| cxx_identity(&s.name, with_signature);
+            // A lambda's type name holds a per-build hash, so its key is only meaningful within its object file.
+            let key = |s: &MapSymbol| {
+                cxx_identity(&s.name, with_signature).map(|k| {
+                    if k.contains("<lambda>") {
+                        format!("{}: {k}", s.object)
+                    } else {
+                        k
+                    }
+                })
+            };
             let old_keys: Vec<Option<String>> = old_unjoined.iter().map(|s| key(s)).collect();
             let new_keys: Vec<Option<String>> = new_left
                 .iter()
@@ -238,13 +250,15 @@ impl GroundTruth {
                 }
             }
         }
+        // Left over and named after a lambda (its call operator, or a template instantiated on it): the answer key
+        // can't tell which lambda it is, so it's neither deleted nor added but out of scope.
         for (o, used) in old_unjoined.iter().zip(&old_used) {
-            if !used {
+            if !used && !is_lambda_named(&o.name) {
                 joined.push((Some(o), None));
             }
         }
         for (n, used) in new_left.iter().zip(&new_left_used) {
-            if !used {
+            if !used && !is_lambda_named(&n.name) {
                 joined.push((None, Some(n)));
             }
         }
@@ -316,7 +330,33 @@ pub fn cxx_identity(name: &str, with_signature: bool) -> Option<String> {
         }
     }
     out.push_str(rest);
-    Some(out)
+    Some(normalize_lambdas(&out))
+}
+
+/// MSVC names a lambda's closure type `<lambda_` + 32 hex digits + `>`, a hash that changes between builds
+/// (yaml-cpp 0.8.0 → 0.9.0: `<lambda_941fd7b9…>` → `<lambda_a8d71613…>` for the same lambda).
+fn normalize_lambdas(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(i) = rest.find("<lambda_") {
+        let after = &rest[i + "<lambda_".len()..];
+        let hex = after.bytes().take_while(u8::is_ascii_hexdigit).count();
+        out.push_str(&rest[..i]);
+        if hex > 0 && after[hex..].starts_with('>') {
+            out.push_str("<lambda>");
+            rest = &after[hex + 1..];
+        } else {
+            out.push_str("<lambda_");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A symbol named after a lambda's closure type.
+pub fn is_lambda_named(name: &str) -> bool {
+    normalize_lambdas(name).contains("<lambda>")
 }
 
 /// An exception-handling funclet: `f$dtor$3`, `f$catch$0` (C names) or `?dtor$0@?0??f@…`, `?catch$1@…`
@@ -712,5 +752,72 @@ mod tests {
         let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
         assert!(t.entry("main$dtor$73").is_none());
         assert_eq!(pair_of(&t, "main"), (Some(Rva(0x20)), Some(Rva(0xa0))));
+    }
+
+    // yaml-cpp 0.8.0 → 0.9.0, from the map files: the same lambdas under new closure-type hashes.
+    const LAMBDA_A_OLD: &str = "??R<lambda_941fd7b97b6be8c70b7927491b015f09>@@QEBA@D@Z";
+    const LAMBDA_A_NEW: &str = "??R<lambda_a8d716137e123ff94adec8d3082cc9a1>@@QEBA@D@Z";
+    const LAMBDA_B_OLD: &str = "??R<lambda_c86a95e158b1a7fca84f14a352913359>@@QEBA@D@Z";
+    const LAMBDA_B_NEW: &str = "??R<lambda_e414d856a138ecba07b5a535ee517306>@@QEBA@D@Z";
+    const LAMBDA_C_OLD: &str = "??R<lambda_8cf3b55acb51a04b3ee281edb105368a>@@QEBA@D@Z";
+    const LAMBDA_C_NEW: &str = "??R<lambda_a4cd96d18033020525448eae0f50268e>@@QEBA@D@Z";
+
+    #[test]
+    fn lambda_hashes_are_normalized() {
+        assert_eq!(
+            cxx_identity(LAMBDA_A_OLD, true),
+            cxx_identity(LAMBDA_A_NEW, true)
+        );
+        assert!(
+            cxx_identity(LAMBDA_A_OLD, false)
+                .unwrap()
+                .contains("<lambda>")
+        );
+        assert!(is_lambda_named(LAMBDA_A_OLD));
+        assert!(!is_lambda_named("?Write@Emitter@YAML@@QEAAAEAV12@PEBD_K@Z"));
+        assert!(!is_lambda_named("<lambda_xyz>"), "not a closure-type hash");
+    }
+
+    #[test]
+    fn a_renamed_lambda_joins_within_its_object_file() {
+        // The same `(char)` lambda signature in two files: each joins with its own file's lambda.
+        let old = map(vec![
+            sym(LAMBDA_A_OLD, 0x10, "convert.obj", false),
+            sym(LAMBDA_B_OLD, 0x20, "emitterutils.obj", false),
+        ]);
+        let new = map(vec![
+            sym(LAMBDA_B_NEW, 0x90, "emitterutils.obj", false),
+            sym(LAMBDA_A_NEW, 0xa0, "convert.obj", false),
+        ]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert_eq!(
+            pair_of(&t, LAMBDA_A_OLD),
+            (Some(Rva(0x10)), Some(Rva(0xa0)))
+        );
+        assert_eq!(
+            pair_of(&t, LAMBDA_B_OLD),
+            (Some(Rva(0x20)), Some(Rva(0x90)))
+        );
+    }
+
+    #[test]
+    fn lambdas_that_cannot_be_told_apart_are_out_of_scope() {
+        // Negative: two `(char)` lambdas in one file, both renamed. Neither is joined, and neither counts as
+        // deleted or added (the key would score a correct pairing as wrong half the time).
+        let old = map(vec![
+            sym(LAMBDA_B_OLD, 0x10, "emitterutils.obj", false),
+            sym(LAMBDA_C_OLD, 0x20, "emitterutils.obj", false),
+            sym("?gone@@YAXXZ", 0x30, "emitterutils.obj", false),
+        ]);
+        let new = map(vec![
+            sym(LAMBDA_B_NEW, 0x90, "emitterutils.obj", false),
+            sym(LAMBDA_C_NEW, 0xa0, "emitterutils.obj", false),
+        ]);
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        for name in [LAMBDA_B_OLD, LAMBDA_C_OLD, LAMBDA_B_NEW, LAMBDA_C_NEW] {
+            assert!(t.entry(name).is_none(), "{name}");
+        }
+        // An ordinary function is still deleted.
+        assert_eq!(pair_of(&t, "?gone@@YAXXZ"), (Some(Rva(0x30)), None));
     }
 }
