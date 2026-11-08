@@ -29,7 +29,16 @@ Latest work: **the recording harness: per-call test cases, replayed by emulation
   (`corpus/lib/emulator.ps1`), and a patched copy of `unicorn-engine-sys` 2.1.5 in `third_party/` (a hard link
   instead of a symlink, so it builds without Windows Developer Mode).
 - Gates before and after: identical scorecards, 0 wrong everywhere (fixtures, zlib, Lua, zstd, TinyXML-2, yaml-cpp, the
-  hook loop). Lua `o2-pgo` 5.4.7 → 5.4.8 scored 838 before (an interrupted rebuild) and its 839 baseline after.
+  hook loop).
+
+Then (2026-11-08): **CI's red Lua PGO gate, fixed.** Every push since the /LTCG + PGO commit had failed on Lua
+`o2-pgo` 5.4.7 → 5.4.8 (838 against a baseline of 839, 0 wrong). The cause was the checkout's path: training ran
+`train.lua` by absolute path, and Lua puts the executable's directory into `package.path` (`setprogdir`), so a
+different path length gave a different profile. Building locally from a CI-length path (a junction) reproduced
+838. Training now runs from the recipe directory with `package.path`/`cpath` fixed (new `Env` per training step).
+The PGO build's code layout is identical from both paths over 10 builds, and both variants now score 842 (baselines
+raised). One earlier CI-path build after the change still differed; that hasn't happened again. zlib, yaml-cpp and
+zstd training still pass absolute paths; their CI scores meet their baselines.
 
 Before that: **unmatched callees in the AI prompt, measured and not adopted** (design §8). Sketching
 each function's unmatched callees (size, top mnemonics, strings, constants) gained 5 correct answers over 182

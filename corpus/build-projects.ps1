@@ -107,7 +107,10 @@ function Build-Version($recipe, [string] $tag, [string] $flagName) {
 
 # Run the recipe's `Train` workload against the instrumented build in $out. Each step: `Args` for the program
 # (`{src}`, `{out}` and `{recipe}` expand to the source, build and recipe directories; no spaces, since arguments
-# are passed unquoted), optional `Cwd` and `Stdout` (a file to write standard output to). Exit codes are ignored: a test driver may report failures, and the profile is still valid.
+# are passed unquoted), optional `Cwd`, `Stdout` (a file to write standard output to) and `Env` (environment
+# variables for the run, not expanded). Exit codes are ignored: a test driver may report failures, and the profile
+# is still valid. Keep the checkout's path out of what the workload sees (use `Cwd` and relative arguments): the
+# profile, and so the PGO build, follows the paths the program takes, and those can depend on a path's length.
 function Invoke-Training($recipe, [string] $src, [string] $out) {
     if (-not $recipe.Train) { throw "$($recipe.Name): the o2-pgo flag set needs a Train workload in recipe.psd1" }
     $recipeDir = Join-Path $projectsDir $recipe.Name
@@ -121,6 +124,7 @@ function Invoke-Training($recipe, [string] $src, [string] $out) {
         }
         $options.RedirectStandardOutput = if ($step.Stdout) { & $expand $step.Stdout } else { "$out\train.out" }
         if ($arguments.Count) { $options.ArgumentList = $arguments }
+        if ($step.Env) { $options.Environment = $step.Env }
         Start-Process @options
     }
 }

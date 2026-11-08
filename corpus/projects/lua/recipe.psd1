@@ -36,6 +36,13 @@
     Cl       = @('/W3')
     # PGO builds get a fixed string-hash seed (pgo_seed.h), so training, and the build, are reproducible.
     PgoCl    = @('/FI{recipe}/pgo_seed.h')
-    # PGO training (flag set o2-pgo): corpus/projects/lua/train.lua.
-    Train    = @(@{ Args = @('{recipe}/train.lua') })
+    # PGO training (flag set o2-pgo): corpus/projects/lua/train.lua, run from the recipe directory so the chunk
+    # name is `train.lua` wherever the checkout is, with package.path and cpath fixed: by default Lua puts the
+    # executable's directory into them (`!`, loadlib.c's setprogdir). With the absolute paths, CI's checkout
+    # (D:\a\permanent-beta\...) gave a different profile than a longer local one: Lua 5.4.8's collectargs went to
+    # review there, 838 correct instead of 839.
+    Train    = @(@{
+            Args = @('train.lua'); Cwd = '{recipe}'
+            Env  = @{ LUA_PATH_5_4 = '.\?.lua'; LUA_CPATH_5_4 = '.\?.dll' }
+        })
 }
