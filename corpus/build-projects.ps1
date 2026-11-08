@@ -111,6 +111,8 @@ function Build-Version($recipe, [string] $tag, [string] $flagName) {
 # variables for the run, not expanded). Exit codes are ignored: a test driver may report failures, and the profile
 # is still valid. Keep the checkout's path out of what the workload sees (use `Cwd` and relative arguments): the
 # profile, and so the PGO build, follows the paths the program takes, and those can depend on a path's length.
+# For the same reason the program is started by name (cmd /c, with $out first on PATH), so its argv[0] is
+# `<Exe>.exe` and not the build directory's full path.
 function Invoke-Training($recipe, [string] $src, [string] $out) {
     if (-not $recipe.Train) { throw "$($recipe.Name): the o2-pgo flag set needs a Train workload in recipe.psd1" }
     $recipeDir = Join-Path $projectsDir $recipe.Name
@@ -118,13 +120,17 @@ function Invoke-Training($recipe, [string] $src, [string] $out) {
     foreach ($step in $recipe.Train) {
         $arguments = @($step.Args | ForEach-Object { & $expand $_ })
         $cwd = if ($step.Cwd) { & $expand $step.Cwd } else { $out }
+        if ($cwd -ne $out -and (Test-Path (Join-Path $cwd "$($recipe.Exe).exe"))) {
+            throw "$($recipe.Name): training Cwd $cwd has its own $($recipe.Exe).exe, which cmd would run instead"
+        }
+        $environment = @{ PATH = "$out;$env:PATH" }
+        if ($step.Env) { foreach ($key in $step.Env.Keys) { $environment[$key] = $step.Env[$key] } }
         $options = @{
-            FilePath = "$out\$($recipe.Exe).exe"; WorkingDirectory = $cwd; NoNewWindow = $true; Wait = $true
+            FilePath = $env:ComSpec; WorkingDirectory = $cwd; NoNewWindow = $true; Wait = $true
+            ArgumentList = @('/d', '/c', "$($recipe.Exe).exe") + $arguments; Environment = $environment
             RedirectStandardError = "$out\train.err"
         }
         $options.RedirectStandardOutput = if ($step.Stdout) { & $expand $step.Stdout } else { "$out\train.out" }
-        if ($arguments.Count) { $options.ArgumentList = $arguments }
-        if ($step.Env) { $options.Environment = $step.Env }
         Start-Process @options
     }
 }

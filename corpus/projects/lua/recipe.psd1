@@ -38,7 +38,8 @@
     PgoCl    = @('/FI{recipe}/pgo_seed.h')
     # PGO training (flag set o2-pgo): corpus/projects/lua/train.lua, run from the recipe directory so the chunk
     # name is `train.lua` wherever the checkout is, with package.path and cpath fixed: by default Lua puts the
-    # executable's directory into them (`!`, loadlib.c's setprogdir). With the absolute paths, CI's checkout
+    # executable's directory into them (`!`, loadlib.c's setprogdir). build-projects.ps1 also keeps the path out of
+    # argv[0] (arg[-1]); its length alone still changed the profile. With the absolute paths, CI's checkout
     # (D:\a\permanent-beta\...) gave a different profile than a longer local one: Lua 5.4.8's collectargs went to
     # review there, 838 correct instead of 839.
     Train    = @(@{

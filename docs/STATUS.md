@@ -35,10 +35,14 @@ Then (2026-11-08): **CI's red Lua PGO gate, fixed.** Every push since the /LTCG 
 `o2-pgo` 5.4.7 → 5.4.8 (838 against a baseline of 839, 0 wrong). The cause was the checkout's path: training ran
 `train.lua` by absolute path, and Lua puts the executable's directory into `package.path` (`setprogdir`), so a
 different path length gave a different profile. Building locally from a CI-length path (a junction) reproduced
-838. Training now runs from the recipe directory with `package.path`/`cpath` fixed (new `Env` per training step).
-The PGO build's code layout is identical from both paths over 10 builds, and both variants now score 842 (baselines
-raised). One earlier CI-path build after the change still differed; that hasn't happened again. zlib, yaml-cpp and
-zstd training still pass absolute paths; their CI scores meet their baselines.
+838. Training now runs from the recipe directory with `package.path`/`cpath` fixed (new `Env` per training step),
+and every recipe's training program is started by name (`cmd /c`, build directory on PATH), so its `argv[0]` holds
+no path: Lua keeps `argv[0]` in `arg[-1]`, and with only the first two fixes CI scored 841/838 (most likely
+through the GC, which paces itself by bytes allocated; not traced further). The PGO code layout is now identical from three checkout paths, and both variants score 842
+(baselines raised). zlib, TinyXML-2 and yaml-cpp PGO score their baselines with the new launcher. Their other
+training arguments are still absolute paths. A first fix (199de64) claimed path independence from tests run in
+Git Bash, which resolves the junction to the real path; the tests above ran from PowerShell, which keeps it. While
+Lua's gate failed, CI never reached the projects after it, so this push is their first PGO score on CI.
 
 Before that: **unmatched callees in the AI prompt, measured and not adopted** (design §8). Sketching
 each function's unmatched callees (size, top mnemonics, strings, constants) gained 5 correct answers over 182

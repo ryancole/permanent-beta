@@ -30,9 +30,10 @@
 # workload), first run: o2-ltcg__v5.4.6__v5.4.7 522, o2-ltcg__v5.4.7__v5.4.8 513, o2-pgo__v5.4.6__v5.4.7 839, o2-pgo__v5.4.7__v5.4.8 839, 0 wrong, with pgo_seed.h
 # fixing the string-hash seed and table.sort's pivot so that training, and the PGO build, are reproducible.
 # 2026-11-08, o2-pgo raised 839 -> 842 on both variants: training no longer depends on where the checkout is
-# (recipe.psd1: run from the recipe directory, package.path and cpath fixed). With absolute paths, CI's checkout
-# got a different profile and scored o2-pgo__v5.4.7__v5.4.8 838 (collectargs held for review). The PGO build's code
-# layout is now identical from both paths. The change is in the build, not matching; 0 wrong before and after.
+# (recipe.psd1: run from the recipe directory, package.path and cpath fixed; build-projects.ps1: started by name,
+# so argv[0] holds no path). With absolute paths, CI's checkout got a different profile and scored
+# o2-pgo__v5.4.7__v5.4.8 838 (collectargs held for review). The PGO code layout is now identical from three
+# checkout paths. The change is in the build, not matching; 0 wrong before and after.
 [gate.min_correct]
 "o2__v5.4.6__v5.4.7" = 726
 "o2__v5.4.7__v5.4.8" = 732
