@@ -6,8 +6,8 @@
 //! is wide enough that a pass says little, but a wildly different size is still a strong reason to fail.
 
 use permanent_beta_model::{
-    AnalysisExport, BuildId, Candidate, CheckOutcome, CheckResult, Criticality, FunctionFeatures,
-    Rva, Verdict, VerificationReport, evidence_kind,
+    AnalysisExport, BuildId, Candidate, CheckOutcome, CheckResult, CodeTable, Criticality,
+    FunctionFeatures, Rva, Verdict, VerificationReport, evidence_kind,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +26,8 @@ pub struct VerifyContext {
     mapping: HashMap<Rva, Rva>,
     old_callers: HashMap<Rva, Vec<Rva>>,
     new_callers: HashMap<Rva, Vec<Rva>>,
+    old_tables: Vec<CodeTable>,
+    new_tables: Vec<CodeTable>,
 }
 
 impl VerifyContext {
@@ -36,6 +38,8 @@ impl VerifyContext {
             mapping: candidates.iter().map(|c| (c.old, c.new)).collect(),
             old_callers: callers_index(old),
             new_callers: callers_index(new),
+            old_tables: old.code_tables.clone(),
+            new_tables: new.code_tables.clone(),
         }
     }
 
@@ -107,6 +111,8 @@ pub fn implied_checks(kind: &str) -> &'static [&'static str] {
         evidence_kind::CALL_SEQUENCE => &["callers"],
         // Paired because both call the same matched functions.
         evidence_kind::CALLEES => &["callees"],
+        // Paired because they fill the same slot of corresponding code-pointer tables.
+        evidence_kind::TABLE_SLOT => &["code-tables"],
         // The similarity score already weighed strings, size, neighbours, constants and imports.
         evidence_kind::SIMILARITY => &[
             "string-refs",
@@ -171,6 +177,7 @@ impl Verifier {
                 Box::new(SizeRatioCheck),
                 Box::new(CalleeCheck),
                 Box::new(CallerCheck),
+                Box::new(CodeTableCheck),
                 Box::new(ConstantsCheck),
                 Box::new(ImportsCheck),
                 Box::new(InferredArgsCheck),
@@ -520,6 +527,86 @@ impl StructuralCheck for CallerCheck {
             VerifyContext::callers(&ctx.old_callers, old.rva),
             VerifyContext::callers(&ctx.new_callers, new.rva),
         )
+    }
+}
+
+/// Table consistency: the old function's slot in a code-pointer table (vtable, function table) should hold the
+/// new function in the corresponding new table. Tables correspond here as in matching: same length, and every
+/// other slot whose old function has a candidate lands on the new table's function at that slot.
+///
+/// - **Pass:** some old table and a new table correspond with at least one agreeing slot besides this one, and
+///   hold the old and new function at the same slot.
+/// - **Fail:** a new table corresponds to one of the old function's tables with at least two agreeing slots
+///   (one could itself be a wrong candidate), but holds a different function at this slot, and no table pair
+///   supports the candidate.
+/// - Inconclusive otherwise (not in any table, or nothing matched around it).
+pub struct CodeTableCheck;
+
+/// Agreeing and disagreeing slots between `t` and `u`, ignoring the slots holding `old_self`.
+fn table_agreement(ctx: &VerifyContext, t: &[Rva], u: &[Rva], old_self: Rva) -> (usize, usize) {
+    let (mut agree, mut disagree) = (0, 0);
+    for (o, n) in t.iter().zip(u) {
+        if *o == old_self {
+            continue;
+        }
+        match ctx.mapping.get(o) {
+            Some(m) if m == n => agree += 1,
+            Some(_) => disagree += 1,
+            None => {}
+        }
+    }
+    (agree, disagree)
+}
+
+impl StructuralCheck for CodeTableCheck {
+    fn name(&self) -> &'static str {
+        "code-tables"
+    }
+
+    fn check(
+        &self,
+        ctx: &VerifyContext,
+        old: &FunctionFeatures,
+        new: &FunctionFeatures,
+    ) -> CheckResult {
+        let (mut support, mut against) = (0usize, 0usize);
+        for t in ctx.old_tables.iter().filter(|t| t.slots.contains(&old.rva)) {
+            for u in ctx
+                .new_tables
+                .iter()
+                .filter(|u| u.slots.len() == t.slots.len())
+            {
+                let (agree, disagree) = table_agreement(ctx, &t.slots, &u.slots, old.rva);
+                if disagree > 0 || agree == 0 {
+                    continue;
+                }
+                let same_slot = t
+                    .slots
+                    .iter()
+                    .zip(&u.slots)
+                    .any(|(o, n)| *o == old.rva && *n == new.rva);
+                if same_slot {
+                    support += 1;
+                } else if agree >= 2 {
+                    against += 1;
+                }
+            }
+        }
+        let (outcome, detail) = match (support, against) {
+            (s, _) if s > 0 => (
+                CheckOutcome::Pass,
+                format!("same slot in {s} corresponding table pair(s)"),
+            ),
+            (0, a) if a > 0 => (
+                CheckOutcome::Fail,
+                format!("{a} corresponding table(s) hold another function at this slot"),
+            ),
+            _ => (
+                CheckOutcome::Inconclusive,
+                "no corresponding code-pointer tables".to_owned(),
+            ),
+        };
+        CheckResult::new(self.name(), outcome, detail)
     }
 }
 
@@ -1030,5 +1117,93 @@ mod tests {
             Verdict::NeedsReview,
             "sanity-only: a pass doesn't count"
         );
+    }
+
+    /// Old vtable [0x10, 0x20, 0x30, 0x40], new [0x110, 0x120, 0x130, 0x140]; `candidates` is the run's mapping.
+    fn table_report(candidate: &Candidate, candidates: &[Candidate]) -> VerificationReport {
+        let with = |slots: &[u64], base: u64| {
+            let mut e = export(slots.iter().map(|&r| func(r, 64, &[], None)).collect());
+            e.code_tables = vec![CodeTable {
+                rva: Rva(base),
+                slots: slots.iter().map(|&r| Rva(r)).collect(),
+            }];
+            e
+        };
+        let old = with(&[0x10, 0x20, 0x30, 0x40], 0x5000);
+        let new = with(&[0x110, 0x120, 0x130, 0x140], 0x6000);
+        let ctx = VerifyContext::new(&old, &new, candidates);
+        let (o, n) = (
+            old.function(candidate.old).unwrap(),
+            new.function(candidate.new).unwrap(),
+        );
+        Verifier::with_defaults().verify(
+            &ctx,
+            candidate,
+            o,
+            n,
+            Policy::for_criticality(Criticality::Normal),
+        )
+    }
+
+    fn table_check(r: &VerificationReport) -> &CheckResult {
+        r.checks.iter().find(|c| c.check == "code-tables").unwrap()
+    }
+
+    #[test]
+    fn a_hash_match_in_the_same_vtable_slot_is_accepted() {
+        // A virtual with no callers and no strings: only its vtable confirms it, independently of the hash.
+        let c = cand(0x20, 0x120, evidence_kind::NORMALIZED_HASH);
+        let r = table_report(&c, &[cand(0x10, 0x110, evidence_kind::NAME), c.clone()]);
+        assert_eq!(table_check(&r).outcome, CheckOutcome::Pass);
+        assert!(table_check(&r).counted);
+        assert_eq!(r.verdict, Verdict::Accepted);
+    }
+
+    #[test]
+    fn a_candidate_at_another_slot_of_a_corresponding_table_fails() {
+        // Negative: slots 0 and 3 agree, so the tables correspond, and slot 1's partner is 0x120, not 0x130.
+        let c = cand(0x20, 0x130, evidence_kind::NORMALIZED_HASH);
+        let others = [
+            cand(0x10, 0x110, evidence_kind::NAME),
+            cand(0x40, 0x140, evidence_kind::NAME),
+        ];
+        let r = table_report(&c, &[others[0].clone(), others[1].clone(), c.clone()]);
+        assert_eq!(table_check(&r).outcome, CheckOutcome::Fail);
+        assert_ne!(r.verdict, Verdict::Accepted);
+        // With only one agreeing slot, that slot could itself be wrong: not enough to fail.
+        let r = table_report(&c, &[others[0].clone(), c.clone()]);
+        assert_eq!(table_check(&r).outcome, CheckOutcome::Inconclusive);
+    }
+
+    #[test]
+    fn a_disagreeing_slot_means_the_tables_do_not_correspond() {
+        // Negative: slot 2 is mapped elsewhere, so this table pair supports nothing.
+        let c = cand(0x20, 0x120, evidence_kind::NORMALIZED_HASH);
+        let r = table_report(
+            &c,
+            &[
+                cand(0x10, 0x110, evidence_kind::NAME),
+                cand(0x30, 0x140, evidence_kind::NAME),
+                c.clone(),
+            ],
+        );
+        assert_eq!(table_check(&r).outcome, CheckOutcome::Inconclusive);
+    }
+
+    #[test]
+    fn a_table_slot_pair_does_not_count_its_own_table() {
+        // Negative: table-slot evidence is exactly this check, so its pass is not independent.
+        let c = cand(0x20, 0x120, evidence_kind::TABLE_SLOT);
+        let r = table_report(&c, &[cand(0x10, 0x110, evidence_kind::NAME), c.clone()]);
+        assert_eq!(table_check(&r).outcome, CheckOutcome::Pass);
+        assert!(!table_check(&r).counted);
+        assert_eq!(r.verdict, Verdict::NeedsReview);
+    }
+
+    #[test]
+    fn nothing_matched_around_a_slot_is_inconclusive() {
+        let c = cand(0x20, 0x120, evidence_kind::NORMALIZED_HASH);
+        let r = table_report(&c, std::slice::from_ref(&c));
+        assert_eq!(table_check(&r).outcome, CheckOutcome::Inconclusive);
     }
 }

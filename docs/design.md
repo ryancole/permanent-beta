@@ -383,6 +383,7 @@ Implemented as small `StructuralCheck`s returning `pass | fail | inconclusive` w
 | String references | Jaccard similarity ≥ 0.5 **[Guess]** at the threshold | Implemented |
 | Size ratio | New/old size within 0.5–2.0; fail outside 0.25–4.0 **[Guess]**. Sanity check only: can fail a candidate, never counts as support | Implemented |
 | Callers / callees | Of the old function's neighbours that have a candidate, ≥ 50% land on the new function's neighbours; fail below that with ≥ 2 mapped neighbours **[Guess]**. Uses this run's candidates, so it measures consistency, not truth | Implemented |
+| Code tables | The old function's slot in a code-pointer table (vtable) holds the new function in the corresponding new table: same length, ≥ 1 other slot agreeing through this run's candidates, none disagreeing. Fails when a table corresponding with ≥ 2 agreeing slots holds another function there and no pair supports it **[Guess]**. Independent of the code hash, so it confirms hash-matched virtuals that have no callers: on the corpus +7 to +28 accepted per TinyXML-2 and zstd variant, 0 wrong. Implied by table-slot evidence. Never failed on the corpus | Implemented |
 | Constants, imports | Jaccard ≥ 0.5 passes; < 0.2 with ≥ 2 items on each side fails **[Guess]**. Constants are implied by a hash match, imports are not (IAT operands are masked). On zlib /Od this raised accepted matches from 130 to 133 | Implemented |
 | Calling convention / prologue | Compatible with the hook's prototype and trampoline needs (e.g. enough bytes before a branch target for Detours) | Planned |
 | Hookability | Moved to repair (§7.2): it's a property of the hook target, not evidence of identity, so it doesn't affect matching scores | Implemented in repair |
@@ -390,7 +391,7 @@ Implemented as small `StructuralCheck`s returning `pass | fail | inconclusive` w
 **Independence (implemented):** a check that measures what the candidate's evidence already established adds
 nothing, so its pass doesn't count (`CheckResult.counted = false`, visible to reviewers). Implied checks per
 evidence kind (`permanent_beta_verify::implied_checks`): normalized hash → string refs, size, constants and inferred
-args; strings → string refs; call sequence → callers; matched callees → callees; similarity → string refs, size,
+args; strings → string refs; call sequence → callers; matched callees → callees; table slot → code tables; similarity → string refs, size,
 callers, callees, constants and imports. Failures always count, so evidence can't excuse a failing check.
 
 ### 6.2 Behavioral checks

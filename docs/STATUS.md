@@ -4,7 +4,14 @@
 (repair loop) is done** apart from the recording harness and struct-layout proposals. 0 wrong matches on every
 corpus variant, 0 wrong relocations in the hook loop.
 
-Latest work: **table-slot matching** (design §5.1 pass 5b). The analyzer records code-pointer tables (runs of
+Latest work: **a code-tables verification check** (design §6.1). A candidate passes it when the old and new
+function fill the same slot of corresponding vtables or function tables. It's independent of the code hash, so
+hash-matched virtuals with no callers are now accepted: +7 to +28 accepted per TinyXML-2 and zstd variant, the
+same correct counts, 0 wrong; it never failed on the corpus. **Decided 2026-11-07:** table-slot candidates don't count it,
+since it's the evidence that found them. Counting it anyway (measured, not adopted) would accept another 32–42
+per TinyXML-2 variant with 0 wrong, but would mean accepting a `return null` body on one fact counted twice.
+
+Before that: **table-slot matching** (design §5.1 pass 5b). The analyzer records code-pointer tables (runs of
 ≥ 2 relocated pointers to function starts in data: vtables and C function tables), and a new pass pairs the
 functions at the same slot of corresponding tables when their code is identical. On TinyXML-2 that tells apart
 the byte-identical tiny virtuals: /O2 +39 to +51 correct, /Od +38 to +44, /O2+ICF +5 to +9; zstd +9 at /O2 and
@@ -153,10 +160,9 @@ What's new:
 1. **Decide whether `pbeta propose` runs as part of `repair`** for unmatched hook targets (proposals into the
    hook's review item, never applied). Optionally describe unmatched callees in the prompt, the lever for zstd's
    `*_noDict_*` family; instruction text wouldn't separate it (design §8).
-2. **Acceptance for table-slot matches:** they're correct on the corpus but mostly held for review. Decide
-   whether a corresponding table counts as an independent structural check (it is independent of the code hash),
-   measured on the corpus before changing policy.
-3. **Corpus breadth:** a C++ project heavy on exceptions and the STL (yaml-cpp), `/LTCG` and PGO flag sets.
+2. **Corpus breadth for C++:** a project heavy on exceptions and the STL (yaml-cpp), so table-slot matching and
+   the code-tables check are measured beyond one codebase before anything leans on them further.
+3. **Corpus breadth:** `/LTCG` and PGO flag sets.
 4. **Rest of M4's design:** the recording harness (per-call test cases with memory, §7.3) and struct-layout
    proposals; both lean on PDB or Ghidra types.
 5. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
