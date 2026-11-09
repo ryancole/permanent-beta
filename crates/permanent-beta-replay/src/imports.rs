@@ -93,6 +93,83 @@ pub const MODELLED: [&str; 3] = [
     "__stdio_common_vsprintf",
 ];
 
+/// CRT functions replay runs itself instead of answering from the recording: their effect follows from their
+/// arguments and the memory they read, which the emulator checks like any other access (unrecorded memory is
+/// refused). A build may inline them, or call them a different number of times, without behaving differently, so
+/// recorded calls to them are skipped when matching the recorded sequence. `memcmp` and `strcmp` aren't here:
+/// only the sign of their result is defined, and a caller may keep the value.
+pub const EXECUTED: [&str; 4] = ["memcpy", "memmove", "memset", "strlen"];
+
+/// Most bytes an executed function copies, sets or scans. **[Guess]**
+pub const MAX_EXECUTED: u64 = 1 << 24;
+
+/// Runs `import` if it's one of [`EXECUTED`]: `None` for any other import.
+pub fn execute(import: &str, now: &dyn CallView) -> Option<Result<Effect, Refusal>> {
+    let name = base_name(import);
+    if !EXECUTED.contains(&name) {
+        return None;
+    }
+    Some(execute_named(name, now))
+}
+
+fn execute_named(name: &str, now: &dyn CallView) -> Result<Effect, Refusal> {
+    let arg = |i| arg_of(now, i, name);
+    let len = |n: u64| -> Result<usize, Refusal> {
+        if n > MAX_EXECUTED {
+            return Err(format!("{name} of {n} bytes: more than replay runs"));
+        }
+        Ok(n as usize)
+    };
+    match name {
+        // memcpy runs as memmove: the source is read before anything is written.
+        "memcpy" | "memmove" => {
+            let (dst, src, n) = (arg(0)?, arg(1)?, len(arg(2)?)?);
+            let bytes = if n == 0 {
+                Vec::new()
+            } else {
+                now.read(src, n).ok_or_else(|| {
+                    format!(
+                        "{name} reads {n} bytes at {src:#x}, memory the recording didn't capture"
+                    )
+                })?
+            };
+            Ok(Effect {
+                rax: dst,
+                writes: if n == 0 {
+                    Vec::new()
+                } else {
+                    vec![(dst, bytes)]
+                },
+            })
+        }
+        "memset" => {
+            let (dst, c, n) = (arg(0)?, arg(1)? as u8, len(arg(2)?)?);
+            Ok(Effect {
+                rax: dst,
+                writes: if n == 0 {
+                    Vec::new()
+                } else {
+                    vec![(dst, vec![c; n])]
+                },
+            })
+        }
+        "strlen" => {
+            let at = arg(0)?;
+            let s = read_str(now, at, MAX_EXECUTED as usize).ok_or_else(|| {
+                format!("strlen reads at {at:#x}, memory the recording didn't capture")
+            })?;
+            if s.len() == MAX_EXECUTED as usize {
+                return Err(format!("strlen: no NUL within {MAX_EXECUTED} bytes"));
+            }
+            Ok(Effect {
+                rax: s.len() as u64,
+                writes: Vec::new(),
+            })
+        }
+        _ => unreachable!("EXECUTED lists {name}"),
+    }
+}
+
 /// The recorded import calls of one case, answered in order.
 #[derive(Debug, Clone)]
 pub struct StandIns {
@@ -107,6 +184,7 @@ impl StandIns {
 
     /// Stands in for the candidate's call to `import` (`dll!name`), whose arguments `now` shows.
     pub fn call(&mut self, import: &str, now: &dyn CallView) -> Result<Effect, Refusal> {
+        self.skip_executed();
         let name = base_name(import);
         if !MODELLED.contains(&name) {
             return Err(format!(
@@ -187,7 +265,19 @@ impl StandIns {
     }
 
     /// After the candidate returned: it must have made every recorded import call.
-    pub fn finish(&self) -> Result<(), Refusal> {
+    /// Recorded calls to [`EXECUTED`] functions: replay ran its own.
+    fn skip_executed(&mut self) {
+        while self
+            .calls
+            .get(self.next)
+            .is_some_and(|c| EXECUTED.contains(&base_name(&c.call.import)))
+        {
+            self.next += 1;
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<(), Refusal> {
+        self.skip_executed();
         if self.next < self.calls.len() {
             return Err(format!(
                 "made {} of the {} recorded import call(s) (next: {})",
@@ -636,5 +726,69 @@ mod tests {
                 Slot::Int(8),
             ]
         );
+    }
+
+    #[test]
+    fn memory_functions_run_on_the_candidates_arguments() {
+        let mut now = Now {
+            args: vec![0x2000, 0x1000, 4],
+            memory: BTreeMap::new(),
+        };
+        now.put(0x1000, b"abcd");
+        let e = execute("vcruntime140.dll!memcpy", &now).unwrap().unwrap();
+        assert_eq!(e.rax, 0x2000);
+        assert_eq!(e.writes, vec![(0x2000, b"abcd".to_vec())]);
+        now.args = vec![0x2000, 0x7f, 3];
+        let e = execute("x!memset", &now).unwrap().unwrap();
+        assert_eq!(e.writes, vec![(0x2000, vec![0x7f; 3])]);
+        now.put(0x3000, &cstr("hello"));
+        now.args = vec![0x3000];
+        assert_eq!(execute("x!strlen", &now).unwrap().unwrap().rax, 5);
+        // Other imports aren't executed.
+        assert!(execute("x!memcmp", &now).is_none());
+        assert!(execute("x!__acrt_iob_func", &now).is_none());
+    }
+
+    #[test]
+    fn memory_functions_refuse_memory_nobody_recorded() {
+        // Negative: a source or string the recording doesn't hold is inconclusive, never bytes made up.
+        let now = Now {
+            args: vec![0x2000, 0x1000, 4],
+            memory: BTreeMap::new(),
+        };
+        assert!(
+            matches!(execute("x!memcpy", &now), Some(Err(why)) if why.contains("didn't capture"))
+        );
+        let now = Now {
+            args: vec![0x1000],
+            memory: BTreeMap::new(),
+        };
+        assert!(matches!(execute("x!strlen", &now), Some(Err(_))));
+        // Negative: an absurd length.
+        let now = Now {
+            args: vec![0x2000, 0, MAX_EXECUTED + 1],
+            memory: BTreeMap::new(),
+        };
+        assert!(matches!(execute("x!memset", &now), Some(Err(why)) if why.contains("more than")));
+    }
+
+    #[test]
+    fn recorded_memory_calls_are_skipped_in_the_sequence() {
+        // The old build called memcpy before __acrt_iob_func; the candidate (with memcpy inlined) doesn't.
+        let copy = recorded("x!memcpy", &[0x2000, 0x1000, 4], 0x2000, Vec::new());
+        let iob = recorded("x!__acrt_iob_func", &[1], 0x7ff0_0010, Vec::new());
+        let tail = recorded("x!memset", &[0x2000, 0, 4], 0x2000, Vec::new());
+        let mut s = StandIns::new(vec![copy, iob, tail]);
+        let now = Now {
+            args: vec![1],
+            memory: BTreeMap::new(),
+        };
+        assert_eq!(s.call("x!__acrt_iob_func", &now).unwrap().rax, 0x7ff0_0010);
+        assert_eq!(s.finish(), Ok(()));
+        // Negative: skipping them doesn't excuse a missing modelled call.
+        let iob = recorded("x!__acrt_iob_func", &[1], 0x7ff0_0010, Vec::new());
+        let copy = recorded("x!memcpy", &[0x2000, 0x1000, 4], 0x2000, Vec::new());
+        let mut s = StandIns::new(vec![copy, iob]);
+        assert!(s.finish().is_err());
     }
 }

@@ -1,0 +1,147 @@
+# zlib functions hooked in minigzip to measure replay on real code (corpus/replay-measure.ps1). Prototypes use
+# base C types (the record spec doesn't resolve zlib's typedefs) and PDB struct names. Record mode attaches at most
+# 16 hooks.
+
+[[hook]]
+name = "adler32_z"
+detour = "record"
+prototype = "unsigned long adler32_z(unsigned long adler, const unsigned char* buf, size_t len)"
+
+[hook.target]
+build = "v1"
+symbol = "adler32_z"
+
+[[hook]]
+name = "crc32_z"
+detour = "record"
+prototype = "unsigned long crc32_z(unsigned long crc, const unsigned char* buf, size_t len)"
+
+[hook.target]
+build = "v1"
+symbol = "crc32_z"
+
+[[hook]]
+name = "deflate"
+detour = "record"
+prototype = "int deflate(z_stream_s* strm, int flush)"
+
+[hook.target]
+build = "v1"
+symbol = "deflate"
+
+[[hook]]
+name = "inflate"
+detour = "record"
+prototype = "int inflate(z_stream_s* strm, int flush)"
+
+[hook.target]
+build = "v1"
+symbol = "inflate"
+
+[[hook]]
+name = "longest_match"
+detour = "record"
+prototype = "unsigned int longest_match(internal_state* s, unsigned int cur_match)"
+
+[hook.target]
+build = "v1"
+symbol = "longest_match"
+
+[[hook]]
+name = "fill_window"
+detour = "record"
+prototype = "void fill_window(internal_state* s)"
+
+[hook.target]
+build = "v1"
+symbol = "fill_window"
+
+[[hook]]
+name = "deflate_slow"
+detour = "record"
+prototype = "int deflate_slow(internal_state* s, int flush)"
+
+[hook.target]
+build = "v1"
+symbol = "deflate_slow"
+
+[[hook]]
+name = "_tr_flush_block"
+detour = "record"
+prototype = "void _tr_flush_block(internal_state* s, unsigned char* buf, unsigned long stored_len, int last)"
+
+[hook.target]
+build = "v1"
+symbol = "_tr_flush_block"
+
+[[hook]]
+name = "compress_block"
+detour = "record"
+prototype = "void compress_block(internal_state* s, const ct_data_s* ltree, const ct_data_s* dtree)"
+
+[hook.target]
+build = "v1"
+symbol = "compress_block"
+
+[[hook]]
+name = "build_tree"
+detour = "record"
+prototype = "void build_tree(internal_state* s, tree_desc_s* desc)"
+
+[hook.target]
+build = "v1"
+symbol = "build_tree"
+
+[[hook]]
+name = "inflate_fast"
+detour = "record"
+prototype = "void inflate_fast(z_stream_s* strm, unsigned int start)"
+
+[hook.target]
+build = "v1"
+symbol = "inflate_fast"
+
+[[hook]]
+name = "inflate_table"
+detour = "record"
+prototype = "int inflate_table(int type, unsigned short* lens, unsigned int codes, code** table, unsigned int* bits, unsigned short* work)"
+
+[hook.target]
+build = "v1"
+symbol = "inflate_table"
+
+[[hook]]
+name = "updatewindow"
+detour = "record"
+prototype = "int updatewindow(z_stream_s* strm, const unsigned char* end, unsigned int copy)"
+
+[hook.target]
+build = "v1"
+symbol = "updatewindow"
+
+[[hook]]
+name = "send_tree"
+detour = "record"
+prototype = "void send_tree(internal_state* s, ct_data_s* tree, int max_code)"
+
+[hook.target]
+build = "v1"
+symbol = "send_tree"
+
+[[hook]]
+name = "deflate_stored"
+detour = "record"
+prototype = "int deflate_stored(internal_state* s, int flush)"
+
+[hook.target]
+build = "v1"
+symbol = "deflate_stored"
+
+[[hook]]
+name = "_tr_init"
+detour = "record"
+prototype = "void _tr_init(internal_state* s)"
+
+[hook.target]
+build = "v1"
+symbol = "_tr_init"

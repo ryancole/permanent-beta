@@ -25,6 +25,10 @@ const UPPER_GARBAGE: u32 = 0x1080; // mov rax, 0x1_0000_002a; ret
 const TRIPLE: u32 = 0x1090; // lea eax, [rcx+rcx*2]; ret
 const CALL_IOB: u32 = 0x10a0; // sub rsp, 28h; mov ecx, 1; call [rip -> IAT+8]; add rsp, 28h; ret
 const WRITE_GLOBAL: u32 = 0x10c0; // mov [rip -> .data], ecx; ret
+const WRITE_IMAGE_PTR: u32 = 0x10d0; // lea rax, [rip -> .rdata+0x100]; mov [rcx], rax; ret
+
+/// Where the recording process had the old image loaded (cases record `image_size` 0x4000).
+const OLD_BASE: u64 = 0x7ff6_0000_0000;
 
 fn rel32(at: u32, len: u32, target: u32) -> [u8; 4] {
     (target.wrapping_sub(at + len) as i32).to_le_bytes()
@@ -68,6 +72,10 @@ fn text() -> Vec<u8> {
     w.extend(rel32(WRITE_GLOBAL, 6, DATA));
     w.push(0xc3);
     put(WRITE_GLOBAL, &w);
+    let mut p = vec![0x48, 0x8d, 0x05];
+    p.extend(rel32(WRITE_IMAGE_PTR, 7, RDATA + 0x100));
+    p.extend([0x48, 0x89, 0x01, 0xc3]);
+    put(WRITE_IMAGE_PTR, &p);
     t
 }
 
@@ -210,7 +218,8 @@ fn case(rcx: u64, rdx: u64, rax: u64, region: Option<(&[u8], &[u8], Option<&str>
             rva: Rva(0x1000),
             recorder: "test".into(),
             abi: permanent_beta_model::ABI_WIN64.into(),
-            image_base: Word(0x7ff6_0000_0000),
+            image_base: Word(OLD_BASE),
+            image_size: Some(Word(0x4000)),
             entry: EntryState {
                 rcx: Word(rcx),
                 rdx: Word(rdx),
@@ -626,4 +635,106 @@ mod emulated {
         let o = run(READ_AT_8, ValueType::Int(4), &c, &[added]);
         inconclusive(&o, "inserted is new");
     }
+}
+
+/// The old build's address of its `.rdata+0x100` (another build would have it elsewhere).
+#[cfg(feature = "emulator")]
+fn old_image_ptr() -> [u8; 8] {
+    (OLD_BASE + 0x2100).to_le_bytes()
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_written_image_address_is_inconclusive_not_a_fail() {
+    // zlib's _tr_init stores &static_l_desc in its state: the new build's address isn't the old one's, though the
+    // function is the same. That's not a difference in behavior, and not a pass either.
+    let c = case(STRUCT_AT, 0, 0, Some((&[0; 8], &old_image_ptr(), None)));
+    let o = replay(
+        &image(),
+        Rva(u64::from(WRITE_IMAGE_PTR)),
+        &spec(ValueType::Void),
+        &c,
+        &NewBuild::default(),
+    );
+    match o {
+        CaseOutcome::Inconclusive { reason } => {
+            assert!(reason.contains("address into the image"), "{reason}")
+        }
+        other => panic!("expected inconclusive, got {other:?}"),
+    }
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_non_address_where_an_image_address_was_recorded_still_fails() {
+    // Negative: the old build stored an image address at offset 0; this function stores 5 at offset 4 instead.
+    let c = case(STRUCT_AT, 5, 0, Some((&[0; 8], &old_image_ptr(), None)));
+    let o = replay(
+        &image(),
+        Rva(u64::from(WRITE_FIELD)),
+        &spec(ValueType::Void),
+        &c,
+        &NewBuild::default(),
+    );
+    assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn an_image_address_where_a_plain_value_was_recorded_fails() {
+    // Negative: the old build stored a plain value; this function stores an image address.
+    let c = case(
+        STRUCT_AT,
+        0,
+        0,
+        Some((&[0; 8], &[7, 0, 0, 0, 0, 0, 0, 0], None)),
+    );
+    let o = replay(
+        &image(),
+        Rva(u64::from(WRITE_IMAGE_PTR)),
+        &spec(ValueType::Void),
+        &c,
+        &NewBuild::default(),
+    );
+    assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn another_difference_fails_even_with_an_image_address() {
+    // Negative: a 16-byte region whose first word is an image address (tolerated) and whose second word
+    // differs for real: the real difference decides.
+    let mut after = old_image_ptr().to_vec();
+    after.extend([9, 0, 0, 0, 0, 0, 0, 0]);
+    let c = case(STRUCT_AT - 0x10, 0, 0, Some((&[0; 16], &after, None)));
+    let mut c = c;
+    c.regions[0].region.address = Word(STRUCT_AT - 0x10);
+    c.case.regions[0].address = Word(STRUCT_AT - 0x10);
+    let o = replay(
+        &image(),
+        Rva(u64::from(WRITE_IMAGE_PTR)),
+        &spec(ValueType::Void),
+        &c,
+        &NewBuild::default(),
+    );
+    match o {
+        CaseOutcome::Fail { detail } => assert!(detail.contains("byte 0x8"), "{detail}"),
+        other => panic!("expected a fail, got {other:?}"),
+    }
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn without_the_image_size_an_image_address_still_fails() {
+    // Older recordings have no image size: nothing is treated as an image address, as before.
+    let mut c = case(STRUCT_AT, 0, 0, Some((&[0; 8], &old_image_ptr(), None)));
+    c.case.image_size = None;
+    let o = replay(
+        &image(),
+        Rva(u64::from(WRITE_IMAGE_PTR)),
+        &spec(ValueType::Void),
+        &c,
+        &NewBuild::default(),
+    );
+    assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
 }

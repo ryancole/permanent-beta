@@ -278,7 +278,73 @@ fn run_and_compare(
         Ok(r) => r,
         Err(why) => return CaseOutcome::inconclusive(why),
     };
-    compare(ret, &case.case.observed, prepared, globals, &ran)
+    let old_image = case
+        .case
+        .image_size
+        .map(|s| case.case.image_base.0..case.case.image_base.0.saturating_add(s.0));
+    compare(ret, &case.case.observed, prepared, globals, &ran, old_image)
+}
+
+/// Where `expected` and `got` differ, except words that hold an address into each run's own image (see
+/// [`ImagePointers`]). `base` is the bytes' address, for word alignment.
+#[cfg(feature = "emulator")]
+fn first_difference(
+    base: u64,
+    expected: &[u8],
+    got: &[u8],
+    range: Range<usize>,
+    pointers: &mut ImagePointers,
+) -> Option<usize> {
+    let mut i = range.start;
+    while i < range.end {
+        if got[i] == expected[i] {
+            i += 1;
+            continue;
+        }
+        // The aligned 8-byte word holding byte i, if it lies inside the bytes.
+        let aligned = (base + i as u64) & !7;
+        let start = aligned
+            .checked_sub(base)
+            .and_then(|o| usize::try_from(o).ok());
+        if let Some(start) = start
+            && start + 8 <= expected.len()
+            && pointers.both_in_image(&expected[start..start + 8], &got[start..start + 8])
+        {
+            i = start + 8;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// Addresses into the image differ between builds: the old build's `&static_table` isn't the new build's. A word
+/// that held an address into the recorded image and holds one into the new image after the replay is therefore
+/// not a difference in behavior, but replay can't tell whether both point at the same thing (that would need
+/// the old build's symbols), so the case is inconclusive, never a pass. Without the recorded image's size
+/// (older recordings) no word is treated this way.
+#[cfg(feature = "emulator")]
+struct ImagePointers {
+    old: Option<Range<u64>>,
+    new: Range<u64>,
+    /// The first such word: (expected, got).
+    seen: Option<(u64, u64)>,
+}
+
+#[cfg(feature = "emulator")]
+impl ImagePointers {
+    fn both_in_image(&mut self, expected: &[u8], got: &[u8]) -> bool {
+        let Some(old) = &self.old else {
+            return false;
+        };
+        let word = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
+        let (e, g) = (word(expected), word(got));
+        let yes = old.contains(&e) && self.new.contains(&g);
+        if yes && self.seen.is_none() {
+            self.seen = Some((e, g));
+        }
+        yes
+    }
 }
 
 #[cfg(feature = "emulator")]
@@ -288,7 +354,13 @@ fn compare(
     prepared: &[Prepared],
     globals: &[PreparedGlobal],
     ran: &emulate::Ran,
+    old_image: Option<Range<u64>>,
 ) -> CaseOutcome {
+    let mut pointers = ImagePointers {
+        old: old_image,
+        new: ran.image.clone(),
+        seen: None,
+    };
     let mut compared = Vec::new();
     match ret {
         ValueType::Int(w) => {
@@ -326,7 +398,9 @@ fn compare(
     }
     for (p, got) in prepared.iter().zip(&ran.regions) {
         for r in &p.compare {
-            if let Some(i) = r.clone().find(|&i| got[i] != p.expected_after[i]) {
+            if let Some(i) =
+                first_difference(p.address, &p.expected_after, got, r.clone(), &mut pointers)
+            {
                 return CaseOutcome::Fail {
                     detail: format!(
                         "{} byte {i:#x} is {:#04x} after the call, expected {:#04x}",
@@ -343,7 +417,13 @@ fn compare(
         ));
     }
     for (g, got) in globals.iter().zip(&ran.globals) {
-        if let Some(i) = (0..got.len()).find(|&i| got[i] != g.expected_after[i]) {
+        if let Some(i) = first_difference(
+            ran.image.start + g.rva,
+            &g.expected_after,
+            got,
+            0..got.len(),
+            &mut pointers,
+        ) {
             return CaseOutcome::Fail {
                 detail: format!(
                     "global {} byte {i:#x} is {:#04x} after the call, expected {:#04x}",
@@ -354,6 +434,12 @@ fn compare(
         if g.before != g.expected_after {
             compared.push(format!("global {} writes", g.name));
         }
+    }
+    if let Some((expected, got)) = pointers.seen {
+        return CaseOutcome::inconclusive(format!(
+            "writes an address into the image ({got:#x}; recorded {expected:#x}): the builds' addresses differ, \
+             and whether both point at the same thing isn't checked"
+        ));
     }
     if ran.import_calls > 0 {
         compared.push(format!("{} import call(s) as recorded", ran.import_calls));

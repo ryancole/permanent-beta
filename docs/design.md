@@ -641,6 +641,27 @@ Repair outcomes and traces are unchanged from the run without recordings. Negati
 cases replayed on `stock_level`'s v2 function fail, and the reverse (both flag sets). The hook app's `Order` never
 changes layout, so translation is covered by unit tests only.
 
+**Measured on real code (2026-11-08):** `corpus/replay-measure.ps1` hooks 16 zlib functions in minigzip
+(`corpus/replay/zlib.template.toml`), records compressing and decompressing zlib's `deflate.c` in one release and
+replays every case on the same function, by symbol, in the next. Every pair is correct, so a failure is replay's
+error. The first run failed `_tr_init` (v1.3 → v1.3.1, /O2): it stores `&static_l_desc` in its state, and the new
+build's address of the table isn't the old one's. Now fixed: the recorder saves the image's size
+(`TestCase::image_size`), and a word that held an address into the recorded image and holds one into the new image
+after the replay is not a difference in behavior. Whether both point at the same thing isn't checked (that needs
+the old build's symbols), so the case is **inconclusive**, never a pass; any other difference still fails, and a
+recording without the size compares as before. Result: 1 of 16 hooks replays (`crc32_z`, 18 of 18 cases), 0 fail,
+on o2 v1.3 → v1.3.1 and od v1.2.13 → v1.3; 2 hooks are never called by the workload. Every other hook stops on
+memory behind pointers inside its arguments (`z_stream.state`, `next_in`, the window, `pending_buf`): depth 1
+isn't enough for real code. `build_tree` also reads old-image addresses recorded in its arguments
+(`tree_desc_s.stat_desc`).
+
+**Executed CRT functions (2026-11-08):** `memcpy`, `memmove`, `memset` and `strlen` are run by replay itself
+(`imports::EXECUTED`) instead of answered from the recording: their effect follows from their arguments and the
+memory they read, which the emulator checks like any other access, and a build may inline them or call them a
+different number of times without behaving differently. Recorded calls to them are skipped when matching the
+recorded sequence. Up to 16 MiB each **[Guess]**. `memcmp` and `strcmp` aren't: only their result's sign is
+defined, and a caller may keep the value.
+
 Not recorded: memory behind pointers inside structs (depth 1 only), the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is
 inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks.

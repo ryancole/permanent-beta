@@ -26,7 +26,7 @@
 //! change a correct result. **[Guess]** at 32 (AVX2's width).
 
 use crate::image::{Image, PAGE, page_up};
-use crate::imports::{CallView, StandIns};
+use crate::imports::{self, CallView, StandIns};
 use icicle_vm::cpu::mem::{Mapping, perm};
 use icicle_vm::cpu::{Config, ExceptionCode, VmExit};
 use permanent_beta_model::EntryState;
@@ -68,6 +68,8 @@ pub struct Ran {
     pub globals: Vec<Vec<u8>>,
     /// Import calls answered from the recording.
     pub import_calls: usize,
+    /// Where the new image was mapped: a pointer into it is the new build's address of something.
+    pub image: Range<u64>,
     pub instructions: u64,
 }
 
@@ -423,15 +425,20 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
                     .get(((pc - layout.import_first) / 16) as usize)
                     .cloned()
                     .unwrap_or_else(|| "?".into());
-                let Some(s) = stand_ins.as_mut() else {
-                    return Err(format!("calls the import {name}"));
-                };
-                let effect = s.call(
-                    &name,
-                    &EmuView {
+                let effect = {
+                    let view = EmuView {
                         vm: RefCell::new(vm),
-                    },
-                )?;
+                    };
+                    match imports::execute(&name, &view) {
+                        Some(ran) => ran?,
+                        None => {
+                            let Some(s) = stand_ins.as_mut() else {
+                                return Err(format!("calls the import {name}"));
+                            };
+                            s.call(&name, &view)?
+                        }
+                    }
+                };
                 // Make the import's writes (only where the function may write), set its result, return.
                 for (at, bytes) in &effect.writes {
                     vm.cpu.mem.write_bytes(*at, bytes, perm::WRITE).map_err(|_| {
@@ -464,7 +471,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     if vm.cpu.read_reg(rsp) != rsp0 + 8 {
         return Err("returned with an unbalanced stack".into());
     }
-    if let Some(s) = &stand_ins {
+    if let Some(s) = &mut stand_ins {
         s.finish()?;
     }
     let rax = reg(vm, "RAX")?;
@@ -498,5 +505,6 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         globals,
         import_calls,
         instructions: vm.cpu.icount - started_at,
+        image: base..base + image.size(),
     })
 }

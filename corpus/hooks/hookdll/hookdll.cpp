@@ -511,6 +511,7 @@ std::string g_rec_dir;
 std::string g_rec_build;
 unsigned g_rec_max = 32;
 unsigned long long g_image_base = 0;
+unsigned long long g_image_size = 0;  // SizeOfImage: replay tells pointers into the image from other values
 
 // Copies n bytes, or fails on memory that can't be read. No C++ objects here: __try needs none to unwind.
 bool safe_copy(void* dst, const void* src, size_t n) {
@@ -736,6 +737,7 @@ void finish_case(RecordCall* call, const RecordFrame* f) {
     // Everything but the id, for spotting identical calls.
     std::string body = "\"build\":" + quoted(g_rec_build) + ",\"rva\":" + word(site.rva) + ",\"recorder\":" +
                        quoted(kRecorder) + ",\"abi\":\"win64\",\"image_base\":" + word(g_image_base) +
+                       ",\"image_size\":" + word(g_image_size) +
                        ",\"entry\":{\"rcx\":" + word(call->gpr[0]) + ",\"rdx\":" + word(call->gpr[1]) +
                        ",\"r8\":" + word(call->gpr[2]) + ",\"r9\":" + word(call->gpr[3]) + ",\"xmm\":[";
     for (int i = 0; i < 4; i++) {
@@ -1011,6 +1013,11 @@ void record_all(const std::string& build) {
     g_rec_max = spec.max_cases;
     g_import_memory = spec.import_memory;
     g_image_base = reinterpret_cast<unsigned long long>(GetModuleHandleW(nullptr));
+    {
+        auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_image_base);
+        auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(g_image_base + dos->e_lfanew);
+        g_image_size = nt->OptionalHeader.SizeOfImage;
+    }
     CreateDirectoryA(g_rec_dir.c_str(), nullptr);
     CreateDirectoryA((g_rec_dir + "\\cases").c_str(), nullptr);
     CreateDirectoryA((g_rec_dir + "\\blobs").c_str(), nullptr);

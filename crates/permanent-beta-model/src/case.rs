@@ -376,6 +376,10 @@ pub struct TestCase {
     /// Where the recorded process had the image loaded. Pointers into it (string literals, globals) mean nothing
     /// in another build.
     pub image_base: Word,
+    /// The image's size in memory (`SizeOfImage`), so replay can tell a pointer into the image from other
+    /// values. Older recordings don't have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<Word>,
     pub entry: EntryState,
     /// The memory behind pointer arguments, as the spec said to capture it.
     #[serde(default)]
@@ -548,6 +552,7 @@ mod tests {
             recorder: "test".into(),
             abi: ABI_WIN64.into(),
             image_base: Word(0x7ff6_0000_0000),
+            image_size: Some(Word(0x4000)),
             entry: EntryState {
                 rcx: Word(10),
                 rdx: Word(0),

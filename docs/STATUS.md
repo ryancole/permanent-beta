@@ -4,7 +4,21 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **M6, the Ghidra review extension: built and verified end to end in the GUI** (design §11.3).
+Latest work: **replay measured on real code, and a false failure fixed** (design §7.3).
+- `corpus/replay-measure.ps1` (local): 16 zlib functions hooked in minigzip, compress and decompress recorded in one
+  release, every case replayed on the same function (by symbol, so every pair is correct) in the next.
+- It found a **false failure**: `_tr_init` stores `&static_l_desc` in its state, and the new build's address isn't
+  the old one's. The recorder now saves the image's size; an address into each run's own image is no longer a
+  difference, and the case is inconclusive (never a pass) since what the addresses point at isn't compared. Any
+  other difference still fails. Unit tests with negatives (a plain value where an address was recorded and the
+  reverse fail; a real difference next to an address fails; recordings without the size compare as before).
+- `memcpy`, `memmove`, `memset` and `strlen` are now executed by replay rather than answered from the recording,
+  and recorded calls to them are skipped (a build may inline them).
+- Result: 1 of 16 zlib hooks replays (`crc32_z`, 18/18), 0 fail, o2 v1.3 → v1.3.1 and od v1.2.13 → v1.3. The rest
+  stop on memory behind pointers inside structs (depth > 1), which is the next step. Hook loop unchanged: 22 of 24
+  replay, all passing, the negative control failing (o2 and od).
+
+Before that: **M6, the Ghidra review extension: built and verified end to end in the GUI** (design §11.3).
 - Evaluated first: Version Tracking ports markup between versions, with correlator scores and no independent
   verification, no hooks and no shared decision log; BSim is a similarity search. The extension adds the review
   queue and reuses Ghidra's Function Comparison and Go To; a VT link and a BSim proposer are deferred.
@@ -353,10 +367,11 @@ What's new:
    costs 108 correct, 3 costs 198, 0 wrong throughout); `WRAPPER_MIN_DIRECT_CALLERS` 2 is calibrated (1 adds 27
    correct and one wrong match in zstd, 3 costs 12). The code-tables fail threshold (now the named constant
    `CODE_TABLE_FAIL_AGREEING`) stays a guess: the check never fails on the corpus at 1, 2 or 3.
-4. **Widen replay further** (§7.3): globals and the UCRT's printing imports are done. Open: more import models
-   (`memcpy`/`memset`/`strlen`-style CRT imports, heap allocation), globals reached only through pointers,
-   pointers inside structs (depth > 1), a target whose callee changed telling "this function changed" from "a
-   callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
+4. **Widen replay further** (§7.3): globals, the UCRT's printing imports and the CRT memory functions are done,
+   and replay is measured on zlib (`corpus/replay-measure.ps1`: 1 of 16 hooks replays). Next: pointers inside
+   structs (depth > 1), which stops all the others; then heap allocation, globals reached only through pointers,
+   old-image addresses in recorded memory (mapping them needs the old build's symbols), a target whose callee
+   changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
    Still to choose: contributor terms (DCO or CLA).
