@@ -307,10 +307,20 @@ std::string lower(std::string s) {
 // (permanent_beta_model::TestCase) to PBETA_RECORD/cases/<hook>/, the memory behind pointer arguments before and
 // after the call to PBETA_RECORD/blobs/<sha256>, and copies the spec to PBETA_RECORD/spec.toml. Identical calls are
 // recorded once, and at most `max_cases` per hook. Recordings can contain customer data: they stay local.
+//
+// With each call it also captures the spec's globals for the hook (`[[hook.global]]`) before and after, and the
+// import calls made while the call runs ("Import calls" below).
 
-const char kRecorder[] = "permanent-beta-hookdll 0.1";
+const char kRecorder[] = "permanent-beta-hookdll 0.2";
 constexpr int kThunks = 16;
 constexpr int kMaxArgs = 16;
+// Import calls: patched import address table slots (the 64 import thunks in record_thunk.asm), stack arguments
+// recorded, and bytes captured behind an argument (kImportBlock) and behind a pointer inside that (kImportInner).
+// [Guess]
+constexpr int kImportThunks = 64;
+constexpr int kImportStackArgs = 8;
+constexpr size_t kImportBlock = 512;
+constexpr size_t kImportInner = 256;
 
 // Must match record_thunk.asm.
 struct RecordFrame {
@@ -337,10 +347,17 @@ struct RecArg {
     unsigned long long size = 0, max = 0;
 };
 
+// A global to capture with each call (`[[hook.global]]`).
+struct RecGlobal {
+    std::string name, rva;
+    unsigned long long size = 0;
+};
+
 struct RecHook {
     std::string name, rva;
     unsigned stack_args = 0;
     std::vector<RecArg> args;
+    std::vector<RecGlobal> globals;
 };
 
 struct RecSpec {
@@ -349,7 +366,8 @@ struct RecSpec {
     std::vector<RecHook> hooks;
 };
 
-// The TOML subset `pbeta harness-spec` writes: top-level keys, [[hook]], [[hook.arg]]; other tables are skipped.
+// The TOML subset `pbeta harness-spec` writes: top-level keys, [[hook]], [[hook.arg]], [[hook.global]]; other
+// tables are skipped.
 bool parse_spec(const char* path, RecSpec& spec) {
     FILE* f = std::fopen(path, "rb");
     if (!f) {
@@ -371,6 +389,13 @@ bool parse_spec(const char* path, RecSpec& spec) {
             if (!spec.hooks.empty()) {
                 spec.hooks.back().args.emplace_back();
                 section = "arg";
+            }
+            continue;
+        }
+        if (line == "[[hook.global]]") {
+            if (!spec.hooks.empty()) {
+                spec.hooks.back().globals.emplace_back();
+                section = "global";
             }
             continue;
         }
@@ -416,6 +441,15 @@ bool parse_spec(const char* path, RecSpec& spec) {
                 a.len_slot = value;
             } else if (key == "max") {
                 a.max = n;
+            }
+        } else if (section == "global") {
+            RecGlobal& g = spec.hooks.back().globals.back();
+            if (key == "name") {
+                g.name = value;
+            } else if (key == "rva") {
+                g.rva = value;
+            } else if (key == "size") {
+                g.size = n;
             }
         }
     }
@@ -532,13 +566,95 @@ struct PendingRegion {
     std::vector<unsigned char> before, after;
 };
 
+struct PendingGlobal {
+    const RecGlobal* global = nullptr;
+    std::vector<unsigned char> before;
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Import calls
+//
+// In record mode every named import of the app's own import address table is pointed at an import thunk
+// (record_thunk.asm), which calls the real function. A call made while a recorded call runs on the same thread
+// (nested hooked calls included) is recorded into each of them: the argument registers and kImportStackArgs stack
+// arguments, what it returned, and memory: for each argument that points to readable memory, up to kImportBlock
+// bytes from it before and after the call; inside those blocks, for each 8-byte word that points to readable
+// memory, up to kImportInner bytes before the call (the strings a va_list points to). Only the app's slots are
+// patched: this DLL's own calls into the CRT go through its own import table.
+//
+// A case says `imports_recorded` only when every import of the app was patched (none by ordinal, no more than
+// kImportThunks): otherwise its import calls might be incomplete, and a replay mustn't stand in for any.
+
+struct Snap {
+    unsigned long long address = 0;
+    std::vector<unsigned char> before, after;
+    bool outer = false;  // an argument's block: captured after the call too
+};
+
+struct ImportRecord {
+    std::string name;
+    unsigned long long gpr[4] = {};
+    unsigned char xmm[4][16] = {};
+    unsigned long long stack[kImportStackArgs] = {};
+    unsigned long long rax = 0;
+    unsigned char xmm0[16] = {};
+    std::vector<Snap> memory;
+};
+
 struct RecordCall {
     RecSite* site = nullptr;
     unsigned long long gpr[4] = {};
     unsigned char xmm[4][16] = {};
     std::vector<unsigned long long> stack;
     std::vector<PendingRegion> regions;
+    std::vector<PendingGlobal> globals;
+    std::vector<ImportRecord> imports;
 };
+
+struct ImpSite {
+    std::string name;  // dll!name, the DLL lowercased
+    void* real = nullptr;
+};
+
+ImpSite g_imp_sites[kImportThunks];
+bool g_imports_complete = false;
+// The recorded calls running on this thread, innermost last.
+thread_local std::vector<RecordCall*> t_active;
+
+// Up to max bytes from address, stopping at the first page that can't be read.
+std::vector<unsigned char> readable_prefix(unsigned long long address, size_t max) {
+    std::vector<unsigned char> out;
+    if (address < 0x10000) {
+        return out;
+    }
+    while (out.size() < max) {
+        unsigned long long at = address + out.size();
+        size_t in_page = static_cast<size_t>(0x1000 - (at & 0xfff));
+        size_t n = in_page < max - out.size() ? in_page : max - out.size();
+        size_t old = out.size();
+        out.resize(old + n);
+        if (!safe_copy(out.data() + old, reinterpret_cast<const void*>(at), n)) {
+            out.resize(old);
+            break;
+        }
+    }
+    return out;
+}
+
+void snap_add(std::vector<Snap>& memory, unsigned long long address, size_t max, bool outer) {
+    for (const Snap& s : memory) {
+        if (s.address == address) {
+            return;
+        }
+    }
+    Snap s;
+    s.address = address;
+    s.outer = outer;
+    s.before = readable_prefix(address, max);
+    if (!s.before.empty()) {
+        memory.push_back(std::move(s));
+    }
+}
 
 std::string write_blob(const std::vector<unsigned char>& data) {
     std::string digest = sha256_hex(data);
@@ -556,6 +672,32 @@ std::string write_blob(const std::vector<unsigned char>& data) {
 
 std::string word(unsigned long long v) {
     return quoted(hex(v));
+}
+
+std::string entry_json(const unsigned long long gpr[4], const unsigned char xmm[4][16],
+                       const unsigned long long* stack, size_t stack_n) {
+    std::string out = "{\"rcx\":" + word(gpr[0]) + ",\"rdx\":" + word(gpr[1]) + ",\"r8\":" + word(gpr[2]) +
+                      ",\"r9\":" + word(gpr[3]) + ",\"xmm\":[";
+    for (int i = 0; i < 4; i++) {
+        out += (i ? "," : "") + quoted(hex_bytes(xmm[i], 16));
+    }
+    out += "],\"stack\":[";
+    for (size_t i = 0; i < stack_n; i++) {
+        out += (i ? "," : "") + word(stack[i]);
+    }
+    return out + "]}";
+}
+
+std::string import_json(const ImportRecord& r) {
+    std::string out = "{\"import\":" + quoted(r.name) + ",\"entry\":" +
+                      entry_json(r.gpr, r.xmm, r.stack, kImportStackArgs) + ",\"observed\":{\"rax\":" +
+                      word(r.rax) + ",\"xmm0\":" + quoted(hex_bytes(r.xmm0, 16)) + "},\"memory\":[";
+    for (size_t i = 0; i < r.memory.size(); i++) {
+        const Snap& s = r.memory[i];
+        out += std::string(i ? "," : "") + "{\"address\":" + word(s.address) + ",\"before\":" +
+               quoted(write_blob(s.before)) + (s.outer ? ",\"after\":" + quoted(write_blob(s.after)) : "") + "}";
+    }
+    return out + "]}";
 }
 
 void finish_case(RecordCall* call, const RecordFrame* f) {
@@ -585,6 +727,23 @@ void finish_case(RecordCall* call, const RecordFrame* f) {
                 (r.layout.empty() ? "" : ",\"layout\":" + quoted(r.layout)) + ",\"before\":" +
                 quoted(write_blob(r.before)) + ",\"after\":" + quoted(write_blob(r.after)) + "}";
         first = false;
+    }
+    body += "],\"globals\":[";
+    first = true;
+    for (const PendingGlobal& g : call->globals) {
+        std::vector<unsigned char> after(g.before.size());
+        unsigned long long address = g_image_base + std::strtoull(g.global->rva.c_str(), nullptr, 0);
+        if (!safe_copy(after.data(), reinterpret_cast<const void*>(address), after.size())) {
+            return;
+        }
+        body += std::string(first ? "" : ",") + "{\"name\":" + quoted(g.global->name) + ",\"rva\":" +
+                quoted(g.global->rva) + ",\"size\":" + num(static_cast<long long>(g.before.size())) +
+                ",\"before\":" + quoted(write_blob(g.before)) + ",\"after\":" + quoted(write_blob(after)) + "}";
+        first = false;
+    }
+    body += std::string("],\"imports_recorded\":") + (g_imports_complete ? "true" : "false") + ",\"imports\":[";
+    for (size_t i = 0; i < call->imports.size(); i++) {
+        body += (i ? "," : "") + import_json(call->imports[i]);
     }
     body += "],\"observed\":{\"rax\":" + word(f->rax) + ",\"xmm0\":" + quoted(hex_bytes(f->xmm0, 16)) + "}";
 
@@ -663,7 +822,18 @@ extern "C" void* pbeta_record_before(RecordFrame* f) {
         }
         call->regions.push_back(std::move(r));
     }
+    for (const RecGlobal& g : site.hook.globals) {
+        PendingGlobal pg;
+        pg.global = &g;
+        pg.before.resize(static_cast<size_t>(g.size));
+        unsigned long long address = g_image_base + std::strtoull(g.rva.c_str(), nullptr, 0);
+        if (!safe_copy(pg.before.data(), reinterpret_cast<const void*>(address), pg.before.size())) {
+            continue;  // not captured: a replay that reads it is inconclusive
+        }
+        call->globals.push_back(std::move(pg));
+    }
     f->call = call;
+    t_active.push_back(call);
     return site.real;
 }
 
@@ -673,11 +843,115 @@ extern "C" void pbeta_record_after(RecordFrame* f) {
     if (!call) {
         return;
     }
+    if (!t_active.empty() && t_active.back() == call) {
+        t_active.pop_back();
+    }
     finish_case(call, f);
     delete call;
 }
 
+// Called by record_thunk.asm before an import: captures the call if a recorded call is running on this thread.
+// Returns the real function.
+extern "C" void* pbeta_import_before(RecordFrame* f) {
+    ImpSite& site = g_imp_sites[f->slot % kImportThunks];
+    f->call = nullptr;
+    if (t_active.empty()) {
+        return site.real;
+    }
+    auto* r = new ImportRecord;
+    r->name = site.name;
+    std::memcpy(r->gpr, f->gpr, sizeof r->gpr);
+    std::memcpy(r->xmm, f->xmm, sizeof r->xmm);
+    for (int i = 0; i < kImportStackArgs; i++) {
+        safe_copy(&r->stack[i], reinterpret_cast<const void*>(f->entry_rsp + 0x28 + 8 * i), 8);
+    }
+    std::vector<unsigned long long> args(r->gpr, r->gpr + 4);
+    args.insert(args.end(), r->stack, r->stack + kImportStackArgs);
+    for (unsigned long long a : args) {
+        snap_add(r->memory, a, kImportBlock, true);
+    }
+    size_t outer = r->memory.size();
+    for (size_t i = 0; i < outer; i++) {
+        const std::vector<unsigned char> block = r->memory[i].before;
+        for (size_t off = 0; off + 8 <= block.size(); off += 8) {
+            unsigned long long p = 0;
+            std::memcpy(&p, block.data() + off, 8);
+            snap_add(r->memory, p, kImportInner, false);
+        }
+    }
+    f->call = r;
+    return site.real;
+}
+
+// Called by record_thunk.asm after the import returned: the blocks again, then the call into every recorded call
+// running on this thread.
+extern "C" void pbeta_import_after(RecordFrame* f) {
+    auto* r = static_cast<ImportRecord*>(f->call);
+    if (!r) {
+        return;
+    }
+    r->rax = f->rax;
+    std::memcpy(r->xmm0, f->xmm0, sizeof r->xmm0);
+    for (Snap& s : r->memory) {
+        if (s.outer) {
+            s.after = readable_prefix(s.address, s.before.size());
+            s.after.resize(s.before.size());
+        }
+    }
+    for (RecordCall* call : t_active) {
+        call->imports.push_back(*r);
+    }
+    delete r;
+}
+
 namespace {
+
+extern "C" void* const pbeta_import_thunks[kImportThunks];
+
+// Points every named import of the app's import address table at an import thunk. Sets g_imports_complete when
+// none was left out.
+void patch_imports() {
+    auto base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) {
+        g_imports_complete = true;
+        return;
+    }
+    bool complete = true;
+    int used = 0;
+    for (auto d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); d->Name; d++) {
+        std::string dll = lower(reinterpret_cast<const char*>(base + d->Name));
+        if (dll.find("hookdll") != std::string::npos) {
+            continue;  // this DLL, added to the import table by the launcher
+        }
+        DWORD names_rva = d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk;
+        auto names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + names_rva);
+        auto slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + d->FirstThunk);
+        for (; names->u1.AddressOfData; names++, slots++) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal) || used == kImportThunks) {
+                complete = false;
+                continue;
+            }
+            auto by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+            ImpSite& site = g_imp_sites[used];
+            site.name = dll + "!" + reinterpret_cast<const char*>(by_name->Name);
+            site.real = reinterpret_cast<void*>(slots->u1.Function);
+            DWORD old = 0;
+            if (!VirtualProtect(&slots->u1.Function, 8, PAGE_READWRITE, &old)) {
+                complete = false;
+                continue;
+            }
+            slots->u1.Function = reinterpret_cast<ULONGLONG>(pbeta_import_thunks[used]);
+            VirtualProtect(&slots->u1.Function, 8, old, &old);
+            used++;
+        }
+    }
+    g_imports_complete = complete;
+    emit("{\"event\":\"imports\",\"patched\":" + num(used) + ",\"complete\":" +
+         (complete ? "true" : "false") + "}");
+}
 
 void record_all(const std::string& build) {
     emit("{\"event\":\"start\",\"build\":" + quoted(build) + "}");
@@ -698,6 +972,7 @@ void record_all(const std::string& build) {
     CreateDirectoryA((g_rec_dir + "\\cases").c_str(), nullptr);
     CreateDirectoryA((g_rec_dir + "\\blobs").c_str(), nullptr);
     CopyFileA(path.c_str(), (g_rec_dir + "\\spec.toml").c_str(), FALSE);
+    patch_imports();
 
     int used = 0;
     for (const RecHook& h : spec.hooks) {

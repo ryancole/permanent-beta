@@ -4,7 +4,25 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **the recording harness: per-call test cases, replayed by emulation** (design §7.3, goal 4).
+Latest work: **replay through globals and import calls** (design §7.3, goal 4): **22 of 24** resolved hook
+repairs replay now, all passing (16 before).
+- The analysis records each function's RIP-relative references into writable sections (`data_refs`, native) and,
+  with `--pdb`, the globals they fall in (`globals`; static locals named `procedure::name`, so the CRT's printf and
+  scanf `_OptionsStorage` stay apart). Optional fields: no schema bump, and all 60 corpus scorecards are identical.
+- The record spec lists per hook the globals it or anything it calls refers to (`[[hook.global]]`); the recorder
+  captures them before and after each call, and replay places them at the new build's RVAs by name.
+- The recorder points the app's import table at import thunks and records each import call made during a
+  recorded call (arguments, result, the memory behind its pointer arguments). Replay answers modelled imports
+  from the recording in order, after checking the inputs (`imports.rs`: `__acrt_iob_func`, the UCRT's
+  `__stdio_common_vfprintf` and `__stdio_common_vsprintf`; conversions compared by type, `%s` by content).
+  Different inputs are **inconclusive**, not a fail: the first run failed `order_add` and `ship_order` v1 → v2,
+  correct relocations, because their callee `log_event` prints a severity in v2. Any other import is still
+  inconclusive.
+- Hook loop: `format_receipt` replays everywhere, `ship_order` and `order_add` (21 of 21) v2 → v3. Left
+  inconclusive: `ship_order` v1 → v2 and `order_add`'s "order full" case v1 → v2 (the `log_event` change). The
+  swapped negative control still fails replay. Repair outcomes and traces unchanged; corpus gates unchanged.
+
+Before that: **the recording harness: per-call test cases, replayed by emulation** (design §7.3, goal 4).
 - `pbeta harness-spec` writes a record spec from the hook manifest, the prototypes and the build's PDB struct
   layouts: per argument its Win64 slot, value class and width, and what a pointer points to (a struct of N bytes,
   a C string, a buffer sized by the next argument [Guess], or nothing).
@@ -249,7 +267,7 @@ What's new:
 | 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2 and yaml-cpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
 | 2. Verify it's the same function | Done for symbol-less binaries, including C++ vtable slots (code-tables check); with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
 | 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim) and for changed struct layouts (PDB types: changes, new definition, offsets) |
-| 4. Behavioral tests from the old version | Done: scenario trace diff and trial runs (M4), and recorded per-call test cases replayed by emulation, with struct layouts translated by field name; on the hook loop 16 of 24 resolved hook repairs replay, all passing |
+| 4. Behavioral tests from the old version | Done: scenario trace diff and trial runs (M4), and recorded per-call test cases replayed by emulation, with struct layouts translated by field name, globals placed by name and the UCRT's printing imports answered from the recording; on the hook loop 22 of 24 resolved hook repairs replay, all passing |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
 | Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; UI extension (M6) not started |
@@ -278,20 +296,23 @@ What's new:
 3. **Calibrate the C++ guesses:** the table-slot anchor count, the code-tables fail threshold and the wrapper
    callers threshold are single-project guesses; recheck them with `pbeta-corpus sweep`-style grids once a third
    C++ project exists.
-4. **Widen replay** (§7.3): the CRT's printf options global makes every printing hook inconclusive; recording
-   the globals a function reads (the spec could list them from the PDB) would make them replayable. Also
-   pointers inside structs (depth > 1), callee sequences, and a real target with a changed struct to measure
-   layout translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
+4. **Widen replay further** (§7.3): globals and the UCRT's printing imports are done. Open: more import models
+   (`memcpy`/`memset`/`strlen`-style CRT imports, heap allocation), globals reached only through pointers,
+   pointers inside structs (depth > 1), a target whose callee changed telling "this function changed" from "a
+   callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
+   translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
 5. **License decision** now has Unicorn (GPL-2.0) in it: an Apache-2.0 `pbeta` with replay needs the emulator out
    of process or a permissive one (design §11.5).
 6. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 
 ## Known rough edges
 
-- Replay is inconclusive for any function that reads a writable global, which includes everything that calls the
-  CRT's inline `printf` family. The record spec's `sized` buffers are guessed from parameter names. The thunk forwards
-  at most 8 stack arguments and doesn't support variadic functions. The emulator build needs CMake, Ninja and
-  libclang; without the `emulator` feature every case is inconclusive (pbeta says so).
+- Replay needs the PDB of both builds for globals (named by it), and is inconclusive for a global without a
+  unique PDB name, one only a callee reached through a pointer reads, and any import without a model (three are
+  modelled). The recorder patches at most 64 imports, and its import memory sizes (512 bytes per argument, 256
+  behind each pointer in that) are guesses. The record spec's `sized` buffers are guessed from parameter names.
+  The thunks forward at most 8 stack arguments and don't support variadic functions. The emulator build needs
+  CMake, Ninja and libclang; without the `emulator` feature every case is inconclusive (pbeta says so).
 
 - The hook manifest needs the build's SHA-256 typed in by hand (`pbeta analyze` prints it in its JSON);
   `pbeta-corpus hook-manifest` does it for the corpus only.

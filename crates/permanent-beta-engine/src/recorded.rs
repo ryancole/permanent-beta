@@ -2,14 +2,14 @@
 //! candidate's old RVA in its old build is replayed on the candidate in the new build (`permanent-beta-replay`).
 //!
 //! Pass if every case that can be replayed matches and at least one can; fail if any differs; inconclusive if
-//! none can be replayed (imports, uncaptured memory or globals, unmappable layouts, no emulator), or there are no
+//! none can be replayed (unmodelled imports, uncaptured memory or globals, unmappable layouts, no emulator), or there are no
 //! cases for this function of this build. Cases are matched to builds like scenario traces: a case of another
 //! build is no evidence, its RVA being another function there.
 
 use permanent_beta_model::{
-    BuildId, Candidate, CheckOutcome, CheckResult, FunctionFeatures, Rva, TypeLayout,
+    BuildId, Candidate, CheckOutcome, CheckResult, FunctionFeatures, GlobalVar, Rva, TypeLayout,
 };
-use permanent_beta_replay::{CaseOutcome, Image, Recording, replay};
+use permanent_beta_replay::{CaseOutcome, Image, NewBuild, Recording, replay};
 use permanent_beta_verify::{BehavioralRunner, VerifyContext};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -18,6 +18,7 @@ pub struct RecordedCasesRunner {
     recordings: Vec<Recording>,
     image: Image,
     new_layouts: Vec<TypeLayout>,
+    new_globals: Vec<GlobalVar>,
 }
 
 /// Every case for one old function, replayed on one new function.
@@ -36,12 +37,19 @@ pub struct CaseResult {
 }
 
 impl RecordedCasesRunner {
-    /// `image` is the new build's binary; `new_layouts` its PDB struct layouts (the new analysis' `types`).
-    pub fn new(recordings: Vec<Recording>, image: Image, new_layouts: Vec<TypeLayout>) -> Self {
+    /// `image` is the new build's binary; `new_layouts` and `new_globals` its PDB struct layouts and globals
+    /// (the new analysis' `types` and `globals`).
+    pub fn new(
+        recordings: Vec<Recording>,
+        image: Image,
+        new_layouts: Vec<TypeLayout>,
+        new_globals: Vec<GlobalVar>,
+    ) -> Self {
         Self {
             recordings,
             image,
             new_layouts,
+            new_globals,
         }
     }
 
@@ -60,7 +68,16 @@ impl RecordedCasesRunner {
             for c in rec.cases.iter().filter(|c| c.case.rva == old_rva) {
                 cases.push(CaseResult {
                     test_id: c.case.test_id.clone(),
-                    outcome: replay(&self.image, new_rva, &rec.spec, c, &self.new_layouts),
+                    outcome: replay(
+                        &self.image,
+                        new_rva,
+                        &rec.spec,
+                        c,
+                        &NewBuild {
+                            layouts: &self.new_layouts,
+                            globals: &self.new_globals,
+                        },
+                    ),
                 });
             }
         }

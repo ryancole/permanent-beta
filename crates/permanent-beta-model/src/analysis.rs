@@ -25,12 +25,41 @@ pub struct AnalysisExport {
     /// schema version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<TypeLayout>,
+    /// Global variables in writable sections, from a PDB (`pbeta analyze --pdb`), for recording and replaying
+    /// the global state a hooked function reads (design §7.3). Optional, so adding it didn't change the schema
+    /// version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globals: Vec<GlobalVar>,
 }
 
 impl AnalysisExport {
     pub fn type_layout(&self, name: &str) -> Option<&TypeLayout> {
         self.types.iter().find(|t| t.name == name)
     }
+
+    pub fn global(&self, name: &str) -> Option<&GlobalVar> {
+        self.globals.iter().find(|g| g.name == name)
+    }
+
+    /// The global whose bytes contain `rva`.
+    pub fn global_at(&self, rva: Rva) -> Option<&GlobalVar> {
+        self.globals
+            .iter()
+            .find(|g| (g.rva.0..g.rva.0 + g.size.max(1)).contains(&rva.0))
+    }
+}
+
+/// A global variable from a PDB data symbol. Names are unique within one build: a static local is qualified by
+/// its procedure (`__local_stdio_printf_options::_OptionsStorage`), and a name that's still ambiguous (two
+/// files' `static int count`) is left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalVar {
+    pub name: String,
+    pub rva: Rva,
+    pub size: u64,
+    /// The type's name as the PDB spells it.
+    #[serde(rename = "type")]
+    pub ty: String,
 }
 
 /// A struct, class or union as laid out in one build.
@@ -132,6 +161,11 @@ pub struct FunctionFeatures {
     pub constants: Vec<u64>,
     #[serde(default)]
     pub imports: Vec<String>,
+    /// Addresses in writable sections the function's code refers to RIP-relatively (globals it reads or
+    /// writes), sorted. Not matched on and not hashed (the hash masks them); for recording global state
+    /// (design §7.3). Optional, so adding it didn't change the schema version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_refs: Vec<Rva>,
     pub signature: Option<FunctionSignature>,
     /// Register arguments the code reads before writing (Win64: rcx/xmm0, rdx/xmm1, r8/xmm2, r9/xmm3), up to
     /// the first call, as 1 + the highest slot used. A lower bound on the parameter count: unused trailing

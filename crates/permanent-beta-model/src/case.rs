@@ -4,7 +4,8 @@
 //! A recording directory holds:
 //! - `spec.toml`: the [`HarnessSpec`] the recorder ran with (`pbeta harness-spec`), copied in by the recorder;
 //! - `cases/<hook>/<test_id>.json`: one [`TestCase`] per recorded call;
-//! - `blobs/<sha256>`: the memory behind pointer arguments, content-addressed ([`BlobRef`]).
+//! - `blobs/<sha256>`: the memory behind pointer arguments, the globals the hook reads and what imports touched,
+//!   content-addressed ([`BlobRef`]).
 //!
 //! Recordings can contain customer data and stay local (design §7.3, privacy).
 
@@ -66,6 +67,19 @@ pub struct HookRecordSpec {
     pub stack_args: u32,
     #[serde(rename = "arg", default)]
     pub args: Vec<ArgSpec>,
+    /// Globals the function or anything it calls refers to (the analysis's `data_refs`, named by the PDB):
+    /// captured before and after each call, so a replay can place them in the new build by name.
+    #[serde(rename = "global", default, skip_serializing_if = "Vec::is_empty")]
+    pub globals: Vec<GlobalSpec>,
+}
+
+/// A global variable to capture with each call: its bytes at `rva` in the recorded build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalSpec {
+    /// The PDB name, which is how the new build's copy is found.
+    pub name: String,
+    pub rva: Rva,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,7 +363,54 @@ pub struct TestCase {
     /// The memory behind pointer arguments, as the spec said to capture it.
     #[serde(default)]
     pub regions: Vec<Region>,
+    /// The spec's globals before and after the call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globals: Vec<GlobalRegion>,
+    /// True when the recorder intercepted every named import of the module, so `imports` is every import call
+    /// the function (and what it called) made, in order. Otherwise a replay can't stand in for imports.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub imports_recorded: bool,
+    /// The import calls made during the call, in order (nested hooked calls included).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<ImportCall>,
     pub observed: Observed,
+}
+
+/// A global's bytes before and after the call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalRegion {
+    pub name: String,
+    /// In the recorded build.
+    pub rva: Rva,
+    pub size: u64,
+    pub before: BlobRef,
+    pub after: BlobRef,
+}
+
+/// One call into an import (a DLL function) during a recorded call: its arguments, what it returned, and the
+/// memory behind its pointer arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportCall {
+    /// `dll!name`, the DLL lowercased.
+    pub import: String,
+    /// Argument registers and the first stack arguments (from `rsp+0x28` up) at the call.
+    pub entry: EntryState,
+    pub observed: Observed,
+    /// Memory behind the arguments. Each argument that points to readable memory: up to a fixed number of
+    /// bytes from it, before and after the call (`after` set). Inside those, each 8-byte word that points to
+    /// readable memory: up to a smaller number of bytes from it, before the call only (strings a `va_list`
+    /// points to). Truncated at the first unreadable page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory: Vec<Snapshot>,
+}
+
+/// Memory at an address of the recorded process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub address: Word,
+    pub before: BlobRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<BlobRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,7 +546,35 @@ mod tests {
                 kind: CaptureKind::Fixed,
                 layout: None,
                 before: blob.clone(),
-                after: blob,
+                after: blob.clone(),
+            }],
+            globals: vec![GlobalRegion {
+                name: "g_events".into(),
+                rva: Rva(0x4088),
+                size: 4,
+                before: blob.clone(),
+                after: blob.clone(),
+            }],
+            imports_recorded: true,
+            imports: vec![ImportCall {
+                import: "ucrtbase.dll!__acrt_iob_func".into(),
+                entry: EntryState {
+                    rcx: Word(1),
+                    rdx: Word(0),
+                    r8: Word(0),
+                    r9: Word(0),
+                    xmm: [Xmm::default(); 4],
+                    stack: vec![],
+                },
+                observed: Observed {
+                    rax: Word(0x7ff0_1234),
+                    xmm0: Xmm::default(),
+                },
+                memory: vec![Snapshot {
+                    address: Word(0x10),
+                    before: blob,
+                    after: None,
+                }],
             }],
             observed: Observed {
                 rax: Word(470),

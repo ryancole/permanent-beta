@@ -637,6 +637,7 @@ mod tests {
             strings: strings.iter().map(|s| s.to_string()).collect(),
             constants: vec![],
             imports: vec![],
+            data_refs: vec![],
             signature: params.map(|n| FunctionSignature {
                 calling_convention: None,
                 return_type: None,
@@ -682,6 +683,7 @@ mod tests {
             functions,
             code_tables: Vec::new(),
             types: Vec::new(),
+            globals: Vec::new(),
         }
     }
 

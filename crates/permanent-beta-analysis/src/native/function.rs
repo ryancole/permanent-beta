@@ -373,6 +373,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
     let mut strings = BTreeSet::new();
     let mut constants = BTreeSet::new();
     let mut imports = BTreeSet::new();
+    let mut data_refs = BTreeSet::new();
     let mut leaders: BTreeSet<u64> = segments.iter().map(|&(s, _)| s).collect();
     let mut internal_targets = BTreeSet::new();
     let mut mnemonic_counts: BTreeMap<String, u32> = BTreeMap::new();
@@ -425,6 +426,8 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
                                 imports.insert(name.clone());
                             } else if let Some(s) = image.string_literal(rva) {
                                 strings.insert(s);
+                            } else if image.is_writable(rva) {
+                                data_refs.insert(Rva(u64::from(rva)));
                             }
                         }
                     } else {
@@ -522,6 +525,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         strings: strings.into_iter().collect(),
         constants: constants.into_iter().collect(),
         imports: imports.into_iter().collect(),
+        data_refs: data_refs.into_iter().collect(),
         signature: None,
         inferred_args: (!insns.is_empty()).then_some(args.0),
         inferred_arg_classes: args.1,

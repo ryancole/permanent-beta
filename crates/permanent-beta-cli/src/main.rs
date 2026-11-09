@@ -515,6 +515,7 @@ fn recorded_runner(
         recordings,
         image,
         new.types.clone(),
+        new.globals.clone(),
     ))
 }
 

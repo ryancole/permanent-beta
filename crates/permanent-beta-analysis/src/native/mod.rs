@@ -134,6 +134,7 @@ pub(crate) fn analyze_ranges(
         functions,
         code_tables,
         types: Vec::new(),
+        globals: Vec::new(),
     }
 }
 

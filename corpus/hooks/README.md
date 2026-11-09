@@ -83,8 +83,9 @@ libclang, found by `corpus/lib/emulator.ps1` (see `third_party/README.md`). On t
 1. **Record:** v1 (after its baseline) and v2 (after its step) run once more under the hook DLL's record mode:
    `PBETA_RECORD` (the recording directory, `target/hooks/<flags>/<version>/rec`) and `PBETA_SPEC` (from
    `pbeta harness-spec` on the version's manifest and its `--pdb` analysis). `hookdll/record_thunk.asm` is the
-   generic thunk: it captures the argument registers and stack, the DLL the memory behind pointers before and
-   after the call, one JSON case per distinct call.
+   generic thunk: it captures the argument registers and stack, the DLL the memory behind pointers and the
+   globals the hook can reach before and after the call, and the app's import calls during it (its import table
+   points at import thunks), one JSON case per distinct call.
 2. **Decide with them:** the decision step also gets `--cases` for every older version's recording. A replay
    failure would send the hook to review (and fail the step's expectations).
 3. **Replay every resolved hook:** `pbeta replay` with the older recordings on the hook's new RVA. All resolved hooks
@@ -92,9 +93,10 @@ libclang, found by `corpus/lib/emulator.ps1` (see `third_party/README.md`). On t
 4. **Negative control:** v1's `price_lookup` cases replayed on the function the swapped manifest gives it
    (`stock_level`'s), and the reverse, must fail.
 
-Which hooks replay: the leaf functions (`price_lookup`, `stock_level`, `apply_discount`, `checksum`) and
-`order_add` (its `Order` struct is recorded with its PDB layout). Those that print are inconclusive: `printf`
-family code reads the CRT's options global, and `log_event` also updates `g_events`.
+Which hooks replay: all resolved ones (22 of 24 per run). The printing ones (`format_receipt`, `ship_order`)
+replay through the stand-ins for the UCRT's `printf` and `snprintf` imports, with the CRT's options global and
+`g_events` recorded. `ship_order` v1 → v2 is inconclusive, as is `order_add`'s "order full" case: their callee
+`log_event` prints a severity in v2, so the `printf` inputs differ from the recording.
 
 Recordings can contain the app's data. They stay under `target/`.
 

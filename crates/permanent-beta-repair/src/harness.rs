@@ -12,13 +12,22 @@
 //! - anything else (a struct without a layout, `T**`, an unknown typedef): nothing. A replay that reads it is
 //!   inconclusive.
 //!
+//! Per hook, the globals to capture with each call: those the function, or anything it calls directly or
+//! indirectly, refers to (the analysis's `data_refs` that fall in a PDB-named global; `__security_cookie` is
+//! left out, replay gives it a fixed value). Calls through pointers aren't followed, so a global only such a
+//! callee reads isn't listed and a replay that reads it is inconclusive.
+//!
 //! The spec is TOML, meant to be read and edited before recording.
 
 use crate::prototype::Prototype;
 use permanent_beta_model::{
-    AnalysisExport, ArgSlot, ArgSpec, CaptureKind, HarnessSpec, HookManifest, HookRecordSpec,
-    SkippedHook, ValueType,
+    AnalysisExport, ArgSlot, ArgSpec, CaptureKind, GlobalSpec, HarnessSpec, HookManifest,
+    HookRecordSpec, Rva, SkippedHook, ValueType,
 };
+use std::collections::BTreeSet;
+
+/// Globals replay already handles and that aren't captured.
+const UNCAPTURED_GLOBALS: [&str; 1] = ["__security_cookie"];
 
 /// Default cap on distinct cases per hook. **[Guess]**
 pub const DEFAULT_MAX_CASES: u32 = 32;
@@ -122,8 +131,39 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
             ret: return_type(&proto),
             stack_args: proto.params.len().saturating_sub(4) as u32,
             args,
+            globals: reachable_globals(build, rva),
         });
     }
+    out
+}
+
+/// The named globals the function at `rva` and its direct and indirect callees refer to, by RVA.
+fn reachable_globals(build: &AnalysisExport, rva: Rva) -> Vec<GlobalSpec> {
+    let mut seen: BTreeSet<Rva> = BTreeSet::new();
+    let mut todo = vec![rva];
+    let mut out: Vec<GlobalSpec> = Vec::new();
+    while let Some(r) = todo.pop() {
+        if !seen.insert(r) {
+            continue;
+        }
+        let Some(f) = build.function(r) else {
+            continue;
+        };
+        for d in &f.data_refs {
+            if let Some(g) = build.global_at(*d)
+                && !UNCAPTURED_GLOBALS.contains(&g.name.as_str())
+                && !out.iter().any(|o| o.name == g.name)
+            {
+                out.push(GlobalSpec {
+                    name: g.name.clone(),
+                    rva: g.rva,
+                    size: g.size,
+                });
+            }
+        }
+        todo.extend(f.callees.iter().copied());
+    }
+    out.sort_by_key(|g| g.rva);
     out
 }
 
@@ -421,6 +461,53 @@ mod tests {
         assert!(s.hooks.is_empty());
         let names: Vec<&str> = s.skipped.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["other", "none", "bad"]);
+    }
+
+    #[test]
+    fn globals_are_collected_through_callees() {
+        let mut e = export("v1", vec![]);
+        let func = |rva: u64, callees: &[u64], refs: &[u64]| {
+            let mut f: permanent_beta_model::FunctionFeatures = serde_json::from_value(
+                serde_json::json!({"rva": format!("{rva:#x}"), "size": 16, "name": null, "name_source": null,
+                    "normalized_hash": null, "mnemonic_hash": null, "basic_blocks": null, "edges": null,
+                    "signature": null}),
+            )
+            .unwrap();
+            f.callees = callees.iter().map(|&c| Rva(c)).collect();
+            f.data_refs = refs.iter().map(|&d| Rva(d)).collect();
+            f
+        };
+        // The hook (0x1000) calls 0x1100, which calls 0x1200 (reads the printf options) and recurses into 0x1100.
+        e.functions = vec![
+            func(0x1000, &[0x1100], &[0x4000]),
+            func(0x1100, &[0x1200, 0x1100], &[0x4088]),
+            func(0x1200, &[], &[0x4080, 0x4090]),
+            func(0x1300, &[], &[0x40a0]),
+        ];
+        let g = |name: &str, rva, size| permanent_beta_model::GlobalVar {
+            name: name.into(),
+            rva: Rva(rva),
+            size,
+            ty: "int".into(),
+        };
+        e.globals = vec![
+            g("__security_cookie", 0x4000, 8),
+            g("__local_stdio_printf_options::_OptionsStorage", 0x4080, 8),
+            g("g_events", 0x4088, 4),
+            g("g_other", 0x40a0, 4),
+        ];
+        let m = manifest(&[("hook", Some("int hook(int x)"), "v1")]);
+        let s = spec(&m, &e, 8);
+        let names: Vec<&str> = s.hooks[0].globals.iter().map(|g| g.name.as_str()).collect();
+        // Negative: the security cookie, an unnamed reference (0x4090) and a global only an uncalled function
+        // reads aren't listed.
+        assert_eq!(
+            names,
+            ["__local_stdio_printf_options::_OptionsStorage", "g_events"]
+        );
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(text.contains("[[hook.global]]"), "{text}");
+        assert_eq!(toml::from_str::<HarnessSpec>(&text).unwrap(), s);
     }
 
     #[test]

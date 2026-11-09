@@ -2,14 +2,16 @@
 //!
 //! A case recorded in the old build (`permanent_beta_model::TestCase`) is replayed on the candidate function of
 //! the new build: the new image is mapped in Unicorn, the recorded memory placed at its recorded addresses (in the
-//! new layout, when a struct's layout changed: [`translate`]), the entry registers and stack set, and the function
-//! run until it returns. Then:
-//! - **pass**: the return value (its declared width) and every recorded region's bytes after the call are what
-//!   the old build produced;
-//! - **fail**: either differs;
-//! - **inconclusive**: the case couldn't be replayed faithfully (an import call, uncaptured memory or global
-//!   state, a struct layout that doesn't map by name, an unknown return type, nothing to compare, ...).
-//!   Inconclusive is never a pass.
+//! new layout, when a struct's layout changed: [`translate`]), the recorded globals placed at the new build's
+//! addresses for the same names, the entry registers and stack set, and the function run until it returns.
+//! Import calls are answered from the recording when the recorder intercepted them and replay models the import
+//! ([`imports`]). Then:
+//! - **pass**: the return value (its declared width), every recorded region's bytes and every recorded global's
+//!   bytes after the call are what the old build produced, and the modelled import calls had the same inputs;
+//! - **fail**: the return value, a region or a global differs;
+//! - **inconclusive**: the case couldn't be replayed faithfully (an import replay doesn't model or that was
+//!   called with other inputs, uncaptured memory or global state, a global or struct layout that doesn't map by
+//!   name, an unknown return type, nothing to compare, ...). Inconclusive is never a pass.
 //!
 //! Depends on `permanent-beta-model` only (design §3.1). Emulation needs the `emulator` feature (Unicorn,
 //! GPL-2.0); without it every case is inconclusive.
@@ -17,13 +19,14 @@
 #[cfg(feature = "emulator")]
 pub mod emulate;
 pub mod image;
+pub mod imports;
 pub mod recording;
 pub mod translate;
 
 pub use image::Image;
-pub use recording::{LoadedCase, LoadedRegion, Recording};
+pub use recording::{LoadedCase, LoadedGlobal, LoadedImport, LoadedRegion, Recording};
 
-use permanent_beta_model::{HarnessSpec, Rva, TypeLayout, ValueType};
+use permanent_beta_model::{GlobalVar, HarnessSpec, Rva, TypeLayout, ValueType};
 use serde::Serialize;
 use std::ops::Range;
 
@@ -44,6 +47,53 @@ impl CaseOutcome {
             reason: reason.into(),
         }
     }
+}
+
+/// What replay needs to know about the new build besides its image: from its analysis with `--pdb`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NewBuild<'a> {
+    /// Struct layouts, for translating recorded structs.
+    pub layouts: &'a [TypeLayout],
+    /// Globals, for placing recorded globals by name.
+    pub globals: &'a [GlobalVar],
+}
+
+/// A recorded global as placed for the replay: at the new build's RVA for its name.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "emulator"), allow(dead_code))]
+struct PreparedGlobal {
+    name: String,
+    rva: u64,
+    before: Vec<u8>,
+    expected_after: Vec<u8>,
+}
+
+fn prepare_globals(case: &LoadedCase, new: &NewBuild) -> Result<Vec<PreparedGlobal>, String> {
+    case.globals
+        .iter()
+        .map(|g| {
+            let name = &g.global.name;
+            let n = new
+                .globals
+                .iter()
+                .find(|n| &n.name == name)
+                .ok_or_else(|| {
+                    format!("the new build has no global {name} (analyze it with --pdb)")
+                })?;
+            if n.size != g.global.size {
+                return Err(format!(
+                    "global {name} is {} bytes in the new build, {} when recorded",
+                    n.size, g.global.size
+                ));
+            }
+            Ok(PreparedGlobal {
+                name: name.clone(),
+                rva: n.rva.0,
+                before: g.before.clone(),
+                expected_after: g.after.clone(),
+            })
+        })
+        .collect()
 }
 
 /// One recorded region as placed for the replay: its bytes in the new layout and which of them to compare.
@@ -126,13 +176,13 @@ fn low_bytes(v: u64, width: u8) -> u64 {
 }
 
 /// Replays one case on the function at `new_rva` of `image`. `spec` is the recording's spec (the hook's
-/// prototype and the old layouts); `new_layouts` are the new build's PDB types.
+/// prototype and the old layouts); `new` has the new build's PDB types and globals.
 pub fn replay(
     image: &Image,
     new_rva: Rva,
     spec: &HarnessSpec,
     case: &LoadedCase,
-    new_layouts: &[TypeLayout],
+    new: &NewBuild,
 ) -> CaseOutcome {
     let c = &case.case;
     if c.abi != permanent_beta_model::ABI_WIN64 {
@@ -147,13 +197,17 @@ pub fn replay(
             hook.prototype
         ));
     }
-    if hook.ret == ValueType::Void && case.regions.is_empty() {
+    if hook.ret == ValueType::Void && case.regions.is_empty() && case.globals.is_empty() {
         return CaseOutcome::inconclusive(
             "returns nothing and has no recorded memory: nothing to compare",
         );
     }
-    let prepared = match prepare(spec, case, new_layouts) {
+    let prepared = match prepare(spec, case, new.layouts) {
         Ok(p) => p,
+        Err(why) => return CaseOutcome::inconclusive(why),
+    };
+    let globals = match prepare_globals(case, new) {
+        Ok(g) => g,
         Err(why) => return CaseOutcome::inconclusive(why),
     };
     // A returned pointer only means something inside the recorded memory, which keeps its addresses.
@@ -168,11 +222,18 @@ pub fn replay(
             ));
         }
     }
-    run_and_compare(image, new_rva, hook.ret, case, &prepared)
+    run_and_compare(image, new_rva, hook.ret, case, &prepared, &globals)
 }
 
 #[cfg(not(feature = "emulator"))]
-fn run_and_compare(_: &Image, _: Rva, _: ValueType, _: &LoadedCase, _: &[Prepared]) -> CaseOutcome {
+fn run_and_compare(
+    _: &Image,
+    _: Rva,
+    _: ValueType,
+    _: &LoadedCase,
+    _: &[Prepared],
+    _: &[PreparedGlobal],
+) -> CaseOutcome {
     CaseOutcome::inconclusive(
         "built without the emulator (permanent-beta-replay's `emulator` feature)",
     )
@@ -185,6 +246,7 @@ fn run_and_compare(
     ret: ValueType,
     case: &LoadedCase,
     prepared: &[Prepared],
+    globals: &[PreparedGlobal],
 ) -> CaseOutcome {
     let placed: Vec<emulate::Placed> = prepared
         .iter()
@@ -193,16 +255,28 @@ fn run_and_compare(
             bytes: p.before.clone(),
         })
         .collect();
+    let placed_globals: Vec<emulate::Placed> = globals
+        .iter()
+        .map(|g| emulate::Placed {
+            address: g.rva,
+            bytes: g.before.clone(),
+        })
+        .collect();
     let ran = match emulate::run(&emulate::Setup {
         image,
         rva: new_rva.0,
         entry: &case.case.entry,
         regions: &placed,
+        globals: &placed_globals,
+        imports: case
+            .case
+            .imports_recorded
+            .then(|| imports::StandIns::new(case.imports.clone())),
     }) {
         Ok(r) => r,
         Err(why) => return CaseOutcome::inconclusive(why),
     };
-    compare(ret, &case.case.observed, prepared, &ran)
+    compare(ret, &case.case.observed, prepared, globals, &ran)
 }
 
 #[cfg(feature = "emulator")]
@@ -210,6 +284,7 @@ fn compare(
     ret: ValueType,
     observed: &permanent_beta_model::Observed,
     prepared: &[Prepared],
+    globals: &[PreparedGlobal],
     ran: &emulate::Ran,
 ) -> CaseOutcome {
     let mut compared = Vec::new();
@@ -264,6 +339,22 @@ fn compare(
             p.label,
             if written { "writes" } else { "unchanged" }
         ));
+    }
+    for (g, got) in globals.iter().zip(&ran.globals) {
+        if let Some(i) = (0..got.len()).find(|&i| got[i] != g.expected_after[i]) {
+            return CaseOutcome::Fail {
+                detail: format!(
+                    "global {} byte {i:#x} is {:#04x} after the call, expected {:#04x}",
+                    g.name, got[i], g.expected_after[i]
+                ),
+            };
+        }
+        if g.before != g.expected_after {
+            compared.push(format!("global {} writes", g.name));
+        }
+    }
+    if ran.import_calls > 0 {
+        compared.push(format!("{} import call(s) as recorded", ran.import_calls));
     }
     CaseOutcome::Pass {
         detail: format!(

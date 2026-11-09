@@ -4,18 +4,24 @@
 //! - the new image at a base clear of the recorded memory (rebased if needed), its import address table pointing
 //!   at trap addresses;
 //! - the recorded memory at the addresses it had when recorded (pointer arguments keep their values);
+//! - the recorded globals, at the new image's addresses for them;
 //! - a fresh stack, whose return address is a trap: reaching it means the function returned.
 //!
-//! Anything else stops the run, and the case is inconclusive, never a pass: a call into an import, a read of a
-//! writable image section (mutable global state the recording didn't capture; `__security_cookie` excepted),
-//! a write anywhere but the stack and the recorded memory, a read of memory nobody recorded, an interrupt or
-//! `syscall`, an instruction Unicorn can't run, or running out of instructions.
+//! A call into an import reaches a trap. With the case's recorded import calls ([`StandIns`]), a modelled import is
+//! answered from the recording: its writes are made (only to the stack, the recorded memory or the globals), rax
+//! set, and the run returns to the caller. Otherwise, and for anything else, the run stops and the case is
+//! inconclusive, never a pass: an import with no stand-in, a read of a writable image section outside the
+//! recorded globals (mutable global state the recording didn't capture; `__security_cookie` excepted), a write
+//! anywhere but the stack, the recorded memory and the globals, a read of memory nobody recorded, an interrupt
+//! or `syscall`, an instruction Unicorn can't run, or running out of instructions, and a stand-in that sees other
+//! inputs than recorded.
 //!
 //! Reads of uncaptured bytes in a 32-byte-aligned block that also holds captured bytes are allowed (they read
 //! zeros): vectorized string and memory code reads whole aligned blocks past the end of its data, which can't
 //! change a correct result. **[Guess]** at 32 (AVX2's width).
 
 use crate::image::{Image, PAGE, page_up};
+use crate::imports::{CallView, StandIns};
 use permanent_beta_model::EntryState;
 use std::ops::Range;
 use unicorn_engine::{
@@ -41,6 +47,10 @@ pub struct Setup<'a> {
     pub rva: u64,
     pub entry: &'a EntryState,
     pub regions: &'a [Placed],
+    /// Globals: `address` is an RVA of the image.
+    pub globals: &'a [Placed],
+    /// The case's recorded import calls, if the recorder intercepted the module's imports.
+    pub imports: Option<StandIns>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +59,10 @@ pub struct Ran {
     pub xmm0: [u8; 16],
     /// Each placed region's bytes after the call, in `Setup::regions` order.
     pub regions: Vec<Vec<u8>>,
+    /// Each global's bytes after the call, in `Setup::globals` order.
+    pub globals: Vec<Vec<u8>>,
+    /// Import calls answered from the recording.
+    pub import_calls: usize,
     pub instructions: u64,
 }
 
@@ -56,10 +70,13 @@ struct State {
     image: Range<u64>,
     stack: Range<u64>,
     regions: Vec<Range<u64>>,
+    globals: Vec<Range<u64>>,
     readonly: Vec<Range<u64>>,
     cookie: Option<Range<u64>>,
     imports: Range<u64>,
     import_names: Vec<String>,
+    stand_ins: Option<StandIns>,
+    import_calls: usize,
     violation: Option<String>,
     instructions: u64,
 }
@@ -72,6 +89,7 @@ impl State {
     fn byte_readable(&self, a: u64) -> bool {
         if self.stack.contains(&a)
             || inside(&self.regions, a)
+            || inside(&self.globals, a)
             || inside(&self.readonly, a)
             || self.cookie.as_ref().is_some_and(|c| c.contains(&a))
         {
@@ -84,7 +102,7 @@ impl State {
     }
 
     fn byte_writable(&self, a: u64) -> bool {
-        self.stack.contains(&a) || inside(&self.regions, a)
+        self.stack.contains(&a) || inside(&self.regions, a) || inside(&self.globals, a)
     }
 
     /// Where an address is, for a reason: an image RVA, or the address.
@@ -98,6 +116,39 @@ impl State {
 
     fn stop(&mut self, why: String) {
         self.violation.get_or_insert(why);
+    }
+}
+
+/// The candidate's import call as the stand-ins see it: argument registers, stack arguments above the return
+/// address, and memory it may read.
+struct EmuView<'u, 'a> {
+    uc: &'u Unicorn<'a, State>,
+}
+
+impl CallView for EmuView<'_, '_> {
+    fn arg(&self, i: usize) -> Option<u64> {
+        let reg = [
+            RegisterX86::RCX,
+            RegisterX86::RDX,
+            RegisterX86::R8,
+            RegisterX86::R9,
+        ];
+        if let Some(r) = reg.get(i) {
+            return self.uc.reg_read(*r).ok();
+        }
+        // At the trap, [rsp] is the return address: the fifth argument is at rsp + 0x28.
+        let rsp = self.uc.reg_read(RegisterX86::RSP).ok()?;
+        let b = self.read(rsp + 8 * (i as u64 + 1), 8)?;
+        Some(u64::from_le_bytes(b.try_into().ok()?))
+    }
+
+    fn read(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+        let s = self.uc.get_data();
+        let end = address.checked_add(len as u64)?;
+        if !(address..end).all(|b| s.byte_readable(b)) {
+            return None;
+        }
+        self.uc.mem_read_as_vec(address, len).ok()
     }
 }
 
@@ -140,6 +191,10 @@ fn err(e: impl std::fmt::Debug) -> String {
     format!("Unicorn: {e:?}")
 }
 
+fn inconclusive(why: &str) -> String {
+    why.to_owned()
+}
+
 /// Runs the function at `setup.rva` with the recorded entry state. `Err` is why the case can't be judged.
 pub fn run(setup: &Setup) -> Result<Ran, String> {
     let image = setup.image;
@@ -151,9 +206,9 @@ pub fn run(setup: &Setup) -> Result<Ran, String> {
         std::iter::once(image.preferred_base)
             .chain((1..256u64).map(|i| 0x7000_0000_0000 + i * 0x1_0000_0000)),
     )
-    .ok_or("no room for the image clear of the recorded memory")?;
+    .ok_or_else(|| inconclusive("no room for the image clear of the recorded memory"))?;
     let stack_base = place(STACK_SIZE, &mut taken, (1..4096u64).map(|i| i * 0x100_0000))
-        .ok_or("no room for a stack clear of the recorded memory")?;
+        .ok_or_else(|| inconclusive("no room for a stack clear of the recorded memory"))?;
     let import_count = image.imports.len() as u64;
     let traps_len = 16 * (import_count + 1);
     let traps = place(
@@ -161,7 +216,7 @@ pub fn run(setup: &Setup) -> Result<Ran, String> {
         &mut taken,
         (1..4096u64).map(|i| 0x6000_0000_0000 + i * 0x100_0000),
     )
-    .ok_or("no room for import traps")?;
+    .ok_or_else(|| inconclusive("no room for import traps"))?;
     let return_trap = traps;
     let import_trap = |i: u64| traps + 16 * (i + 1);
 
@@ -185,10 +240,17 @@ pub fn run(setup: &Setup) -> Result<Ran, String> {
             .iter()
             .map(|r| r.address..r.address + r.bytes.len() as u64)
             .collect(),
+        globals: setup
+            .globals
+            .iter()
+            .map(|g| base + g.address..base + g.address + g.bytes.len() as u64)
+            .collect(),
         readonly,
         cookie,
         imports: import_trap(0)..traps + page_up(traps_len),
         import_names: image.imports.iter().map(|(_, n)| n.clone()).collect(),
+        stand_ins: setup.imports.clone(),
+        import_calls: 0,
         violation: None,
         instructions: 0,
     };
@@ -207,6 +269,13 @@ pub fn run(setup: &Setup) -> Result<Ran, String> {
     if let Some(r) = image.security_cookie {
         let r = r as usize;
         memory[r..r + 8].copy_from_slice(&SECURITY_COOKIE.to_le_bytes());
+    }
+    for g in setup.globals {
+        let at = g.address as usize;
+        memory
+            .get_mut(at..at + g.bytes.len())
+            .ok_or_else(|| inconclusive("a recorded global is outside the new image"))?
+            .copy_from_slice(&g.bytes);
     }
     uc.mem_map(base, image.size(), Prot::READ | Prot::WRITE)
         .map_err(err)?;
@@ -334,14 +403,60 @@ pub fn run(setup: &Setup) -> Result<Ran, String> {
         // Code hook ranges are inclusive; begin > end would mean every address.
         let first = import_trap(0);
         uc.add_code_hook(first, import_trap(import_count) - 1, move |uc, a, _| {
-            let s = uc.get_data_mut();
-            let name = s
+            let name = uc
+                .get_data()
                 .import_names
                 .get(((a - first) / 16) as usize)
                 .cloned()
                 .unwrap_or_else(|| "?".into());
-            s.stop(format!("calls the import {name}"));
-            let _ = uc.emu_stop();
+            let Some(mut stand_ins) = uc.get_data_mut().stand_ins.take() else {
+                uc.get_data_mut()
+                    .stop(format!("calls the import {name}"));
+                let _ = uc.emu_stop();
+                return;
+            };
+            let answer = stand_ins.call(&name, &EmuView { uc: &*uc });
+            uc.get_data_mut().stand_ins = Some(stand_ins);
+            let checked = answer.and_then(|effect| {
+                let s = uc.get_data();
+                match effect.writes.iter().find(|(at, bytes)| {
+                    !(*at..at + bytes.len() as u64).all(|b| s.byte_writable(b))
+                }) {
+                    Some((at, _)) => Err(format!(
+                        "the recorded {name} wrote at {at:#x}, outside the recorded memory, the globals and \
+                         the stack"
+                    )),
+                    None => Ok(effect),
+                }
+            });
+            let effect = match checked {
+                Ok(effect) => effect,
+                Err(why) => {
+                    uc.get_data_mut().violation.get_or_insert(why);
+                    let _ = uc.emu_stop();
+                    return;
+                }
+            };
+            // Make the import's writes, set its result and return to the caller.
+            let returned = (|| -> Result<(), unicorn_engine::uc_error> {
+                for (at, bytes) in &effect.writes {
+                    uc.mem_write(*at, bytes)?;
+                }
+                uc.reg_write(RegisterX86::RAX, effect.rax)?;
+                let rsp = uc.reg_read(RegisterX86::RSP)?;
+                let mut ret = [0u8; 8];
+                uc.mem_read(rsp, &mut ret)?;
+                uc.reg_write(RegisterX86::RSP, rsp + 8)?;
+                uc.reg_write(RegisterX86::RIP, u64::from_le_bytes(ret))
+            })();
+            match returned {
+                Ok(()) => uc.get_data_mut().import_calls += 1,
+                Err(e) => {
+                    uc.get_data_mut()
+                        .stop(format!("returning from the stand-in for {name}: {e:?}"));
+                    let _ = uc.emu_stop();
+                }
+            }
         })
         .map_err(err)?;
     }
@@ -384,7 +499,10 @@ pub fn run(setup: &Setup) -> Result<Ran, String> {
         ));
     }
     if uc.reg_read(RegisterX86::RSP).map_err(err)? != rsp + 8 {
-        return Err("returned with an unbalanced stack".into());
+        return Err(inconclusive("returned with an unbalanced stack"));
+    }
+    if let Some(s) = &uc.get_data().stand_ins {
+        s.finish()?;
     }
     let rax = uc.reg_read(RegisterX86::RAX).map_err(err)?;
     let x = uc.reg_read_long(RegisterX86::XMM0).map_err(err)?;
@@ -395,10 +513,20 @@ pub fn run(setup: &Setup) -> Result<Ran, String> {
         .iter()
         .map(|r| uc.mem_read_as_vec(r.address, r.bytes.len()).map_err(err))
         .collect::<Result<Vec<_>, _>>()?;
+    let globals = setup
+        .globals
+        .iter()
+        .map(|g| {
+            uc.mem_read_as_vec(base + g.address, g.bytes.len())
+                .map_err(err)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Ran {
         rax,
         xmm0,
         regions,
+        globals,
+        import_calls: uc.get_data().import_calls,
         instructions: uc.get_data().instructions,
     })
 }

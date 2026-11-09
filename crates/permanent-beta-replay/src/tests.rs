@@ -1,10 +1,10 @@
-//! Replay tests on a hand-built PE image: `.text` with one small function per case, `.rdata` with an import of
-//! `kernel32.dll!Sleep` and a constant, `.data` with a global.
+//! Replay tests on a hand-built PE image: `.text` with one small function per case, `.rdata` with imports of
+//! `kernel32.dll!Sleep` and `kernel32.dll!__acrt_iob_func` and a constant, `.data` with a global.
 
 use super::*;
 use permanent_beta_model::{
-    BlobRef, BuildId, CaptureKind, EntryState, FieldLayout, HarnessSpec, HookRecordSpec, Observed,
-    Region, TestCase, Word, Xmm,
+    BlobRef, BuildId, CaptureKind, EntryState, FieldLayout, GlobalRegion, GlobalVar, HarnessSpec,
+    HookRecordSpec, Observed, Region, TestCase, Word, Xmm,
 };
 
 const BASE: u64 = 0x1_4000_0000;
@@ -23,6 +23,8 @@ const READ_AT_8: u32 = 0x1060; // mov eax, [rcx+8]; ret
 const READ_CONST: u32 = 0x1070; // mov eax, [rip -> .rdata]; ret
 const UPPER_GARBAGE: u32 = 0x1080; // mov rax, 0x1_0000_002a; ret
 const TRIPLE: u32 = 0x1090; // lea eax, [rcx+rcx*2]; ret
+const CALL_IOB: u32 = 0x10a0; // sub rsp, 28h; mov ecx, 1; call [rip -> IAT+8]; add rsp, 28h; ret
+const WRITE_GLOBAL: u32 = 0x10c0; // mov [rip -> .data], ecx; ret
 
 fn rel32(at: u32, len: u32, target: u32) -> [u8; 4] {
     (target.wrapping_sub(at + len) as i32).to_le_bytes()
@@ -56,6 +58,16 @@ fn text() -> Vec<u8> {
     u.push(0xc3);
     put(UPPER_GARBAGE, &u);
     put(TRIPLE, &[0x8d, 0x04, 0x49, 0xc3]);
+    let mut i = vec![
+        0x48, 0x83, 0xec, 0x28, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xff, 0x15,
+    ];
+    i.extend(rel32(CALL_IOB + 9, 6, RDATA + 0x68));
+    i.extend([0x48, 0x83, 0xc4, 0x28, 0xc3]);
+    put(CALL_IOB, &i);
+    let mut w = vec![0x89, 0x0d];
+    w.extend(rel32(WRITE_GLOBAL, 6, DATA));
+    w.push(0xc3);
+    put(WRITE_GLOBAL, &w);
     t
 }
 
@@ -67,9 +79,12 @@ fn rdata() -> Vec<u8> {
     put(0x0c, &(RDATA + 0x80).to_le_bytes());
     put(0x10, &(RDATA + 0x60).to_le_bytes());
     put(0x40, &u64::from(RDATA + 0xa0).to_le_bytes()); // INT
+    put(0x48, &u64::from(RDATA + 0xc0).to_le_bytes());
     put(0x60, &u64::from(RDATA + 0xa0).to_le_bytes()); // IAT
+    put(0x68, &u64::from(RDATA + 0xc0).to_le_bytes());
     put(0x80, b"kernel32.dll\0");
     put(0xa2, b"Sleep\0");
+    put(0xc2, b"__acrt_iob_func\0");
     put(0x100, &1234u32.to_le_bytes());
     r
 }
@@ -135,6 +150,7 @@ fn spec(ret: ValueType) -> HarnessSpec {
             ret,
             stack_args: 0,
             args: Vec::new(),
+            globals: Vec::new(),
         }],
         skipped: Vec::new(),
         layouts: vec![config_v1()],
@@ -203,13 +219,77 @@ fn case(rcx: u64, rdx: u64, rax: u64, region: Option<(&[u8], &[u8], Option<&str>
                 stack: Vec::new(),
             },
             regions: regions.iter().map(|r| r.region.clone()).collect(),
+            globals: Vec::new(),
+            imports_recorded: false,
+            imports: Vec::new(),
             observed: Observed {
                 rax: Word(rax),
                 xmm0: Xmm::default(),
             },
         },
         regions,
+        globals: Vec::new(),
+        imports: Vec::new(),
     }
+}
+
+/// `c` with the global `g_x` (4 bytes, at .data's start when recorded) before and after the call.
+fn with_global(mut c: LoadedCase, before: u32, after: u32) -> LoadedCase {
+    let blob = BlobRef(format!("{:064x}", 0));
+    let g = GlobalRegion {
+        name: "g_x".into(),
+        rva: Rva(u64::from(DATA)),
+        size: 4,
+        before: blob.clone(),
+        after: blob,
+    };
+    c.case.globals.push(g.clone());
+    c.globals.push(LoadedGlobal {
+        global: g,
+        before: before.to_le_bytes().to_vec(),
+        after: after.to_le_bytes().to_vec(),
+    });
+    c
+}
+
+/// The new build's `g_x`, `size` bytes at .data's start.
+fn g_x(size: u64) -> Vec<GlobalVar> {
+    vec![GlobalVar {
+        name: "g_x".into(),
+        rva: Rva(u64::from(DATA)),
+        size,
+        ty: "int".into(),
+    }]
+}
+
+/// `c` with its import calls recorded: `__acrt_iob_func(index)` returning `file`, when `call` is given.
+#[cfg(feature = "emulator")]
+fn with_imports(mut c: LoadedCase, call: Option<(u64, u64)>) -> LoadedCase {
+    c.case.imports_recorded = true;
+    if let Some((index, file)) = call {
+        let call = permanent_beta_model::ImportCall {
+            import: "kernel32.dll!__acrt_iob_func".into(),
+            entry: EntryState {
+                rcx: Word(index),
+                rdx: Word(0),
+                r8: Word(0),
+                r9: Word(0),
+                xmm: [Xmm::default(); 4],
+                stack: Vec::new(),
+            },
+            observed: Observed {
+                rax: Word(file),
+                xmm0: Xmm::default(),
+            },
+            memory: Vec::new(),
+        };
+        c.case.imports.push(call.clone());
+        c.imports.push(LoadedImport {
+            call,
+            memory: Vec::new(),
+        });
+    }
+    c
 }
 
 #[test]
@@ -218,7 +298,10 @@ fn the_test_image_parses() {
     assert_eq!(img.preferred_base, BASE);
     assert_eq!(
         img.imports,
-        vec![(RDATA + 0x60, "kernel32.dll!Sleep".to_owned())]
+        vec![
+            (RDATA + 0x60, "kernel32.dll!Sleep".to_owned()),
+            (RDATA + 0x68, "kernel32.dll!__acrt_iob_func".to_owned())
+        ]
     );
     let data = img.section_at(u64::from(DATA)).unwrap();
     assert!(data.writable && !data.executable);
@@ -233,7 +316,7 @@ fn nothing_to_compare_is_inconclusive() {
         Rva(u64::from(DOUBLE)),
         &spec(ValueType::Void),
         &case(1, 0, 0, None),
-        &[],
+        &NewBuild::default(),
     );
     assert!(matches!(o, CaseOutcome::Inconclusive { .. }), "{o:?}");
     // Negative: a return type that can't be compared.
@@ -242,7 +325,7 @@ fn nothing_to_compare_is_inconclusive() {
         Rva(u64::from(DOUBLE)),
         &spec(ValueType::Unknown),
         &case(1, 0, 2, None),
-        &[],
+        &NewBuild::default(),
     );
     assert!(matches!(o, CaseOutcome::Inconclusive { .. }), "{o:?}");
 }
@@ -256,7 +339,7 @@ fn a_struct_without_a_new_layout_is_inconclusive() {
         Rva(u64::from(READ_AT_8)),
         &spec(ValueType::Int(4)),
         &case(STRUCT_AT, 0, 2, Some((&r, &r, Some("Config")))),
-        &[],
+        &NewBuild::default(),
     );
     assert!(
         matches!(&o, CaseOutcome::Inconclusive { reason } if reason.contains("--pdb")),
@@ -272,10 +355,41 @@ fn without_the_emulator_every_case_is_inconclusive() {
         Rva(u64::from(DOUBLE)),
         &spec(ValueType::Int(4)),
         &case(21, 0, 42, None),
-        &[],
+        &NewBuild::default(),
     );
     assert!(
         matches!(&o, CaseOutcome::Inconclusive { reason } if reason.contains("emulator")),
+        "{o:?}"
+    );
+}
+
+#[test]
+fn a_global_the_new_build_lacks_is_inconclusive() {
+    // Negative: no global of that name in the new build (analyzed without its PDB), or a different size.
+    let c = with_global(case(0, 0, 5, None), 5, 5);
+    let o = replay(
+        &image(),
+        Rva(u64::from(READ_GLOBAL)),
+        &spec(ValueType::Int(4)),
+        &c,
+        &NewBuild::default(),
+    );
+    assert!(
+        matches!(&o, CaseOutcome::Inconclusive { reason } if reason.contains("no global g_x")),
+        "{o:?}"
+    );
+    let o = replay(
+        &image(),
+        Rva(u64::from(READ_GLOBAL)),
+        &spec(ValueType::Int(4)),
+        &c,
+        &NewBuild {
+            layouts: &[],
+            globals: &g_x(8),
+        },
+    );
+    assert!(
+        matches!(&o, CaseOutcome::Inconclusive { reason } if reason.contains("8 bytes")),
         "{o:?}"
     );
 }
@@ -285,7 +399,16 @@ mod emulated {
     use super::*;
 
     fn run(rva: u32, ret: ValueType, c: &LoadedCase, layouts: &[TypeLayout]) -> CaseOutcome {
-        replay(&image(), Rva(u64::from(rva)), &spec(ret), c, layouts)
+        replay(
+            &image(),
+            Rva(u64::from(rva)),
+            &spec(ret),
+            c,
+            &NewBuild {
+                layouts,
+                globals: &g_x(4),
+            },
+        )
     }
 
     fn inconclusive(o: &CaseOutcome, why: &str) {
@@ -369,6 +492,95 @@ mod emulated {
     fn calling_an_import_is_inconclusive() {
         let o = run(CALL_IMPORT, ValueType::Int(4), &case(0, 0, 0, None), &[]);
         inconclusive(&o, "kernel32.dll!Sleep");
+        // Negative: recorded imports don't help an import replay has no model of.
+        let c = with_imports(case(0, 0, 0, None), None);
+        let o = run(CALL_IMPORT, ValueType::Int(4), &c, &[]);
+        inconclusive(&o, "no model");
+    }
+
+    #[test]
+    fn a_recorded_global_is_placed_and_compared() {
+        // .data holds 77 in the file; the recording says the global was 5.
+        let o = run(
+            READ_GLOBAL,
+            ValueType::Int(4),
+            &with_global(case(0, 0, 5, None), 5, 5),
+            &[],
+        );
+        assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
+        // Negative: the file's value isn't what's read.
+        let o = run(
+            READ_GLOBAL,
+            ValueType::Int(4),
+            &with_global(case(0, 0, 77, None), 5, 5),
+            &[],
+        );
+        assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
+        // Writes to it are compared.
+        let o = run(
+            WRITE_GLOBAL,
+            ValueType::Void,
+            &with_global(case(9, 0, 0, None), 5, 9),
+            &[],
+        );
+        assert!(
+            matches!(&o, CaseOutcome::Pass { detail } if detail.contains("global g_x writes")),
+            "{o:?}"
+        );
+        // Negative: the recording says 8 was written.
+        let o = run(
+            WRITE_GLOBAL,
+            ValueType::Void,
+            &with_global(case(9, 0, 0, None), 5, 8),
+            &[],
+        );
+        assert!(
+            matches!(&o, CaseOutcome::Fail { detail } if detail.contains("global g_x byte 0x0")),
+            "{o:?}"
+        );
+    }
+
+    #[test]
+    fn a_recorded_import_call_is_answered_from_the_recording() {
+        let file = 0x7ff0_0000_0010;
+        let o = run(
+            CALL_IOB,
+            ValueType::Int(8),
+            &with_imports(case(0, 0, file, None), Some((1, file))),
+            &[],
+        );
+        assert!(
+            matches!(&o, CaseOutcome::Pass { detail } if detail.contains("1 import call")),
+            "{o:?}"
+        );
+        // Negative: the recorded call asked for another stream (here or in a callee whose behaviour changed:
+        // never a pass, and not a fail of this function either).
+        let o = run(
+            CALL_IOB,
+            ValueType::Int(8),
+            &with_imports(case(0, 0, file, None), Some((2, file))),
+            &[],
+        );
+        inconclusive(&o, "index 0x1, recorded 0x2");
+        // Negative: imports recorded, but this call wasn't (the old function made none).
+        let o = run(
+            CALL_IOB,
+            ValueType::Int(8),
+            &with_imports(case(0, 0, file, None), None),
+            &[],
+        );
+        inconclusive(&o, "after the 0 import call");
+        // Negative: the old function made a call the candidate doesn't.
+        let o = run(
+            DOUBLE,
+            ValueType::Int(4),
+            &with_imports(case(21, 0, 42, None), Some((1, file))),
+            &[],
+        );
+        inconclusive(&o, "made 0 of the 1");
+        // Negative: without recorded imports, the call stops the run.
+        let o = run(CALL_IOB, ValueType::Int(8), &case(0, 0, file, None), &[]);
+        inconclusive(&o, "calls the import kernel32.dll!__acrt_iob_func");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! to what it names is refused, not replayed.
 
 use crate::image::hex;
-use permanent_beta_model::{BlobRef, HarnessSpec, Region, TestCase};
+use permanent_beta_model::{BlobRef, GlobalRegion, HarnessSpec, ImportCall, Region, TestCase};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,22 @@ use std::path::{Path, PathBuf};
 pub struct LoadedCase {
     pub case: TestCase,
     pub regions: Vec<LoadedRegion>,
+    pub globals: Vec<LoadedGlobal>,
+    pub imports: Vec<LoadedImport>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedGlobal {
+    pub global: GlobalRegion,
+    pub before: Vec<u8>,
+    pub after: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedImport {
+    pub call: ImportCall,
+    /// (address, before, after) per snapshot.
+    pub memory: Vec<(u64, Vec<u8>, Option<Vec<u8>>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +148,55 @@ impl Recording {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            cases.push(LoadedCase { case, regions });
+            let globals = case
+                .globals
+                .iter()
+                .map(|g| {
+                    let (before, after) = (load_blob(dir, &g.before)?, load_blob(dir, &g.after)?);
+                    if before.len() as u64 != g.size || after.len() as u64 != g.size {
+                        return Err(invalid(
+                            &path,
+                            format!("global {} isn't {} bytes", g.name, g.size),
+                        ));
+                    }
+                    Ok(LoadedGlobal {
+                        global: g.clone(),
+                        before,
+                        after,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let imports = case
+                .imports
+                .iter()
+                .map(|call| {
+                    let memory = call
+                        .memory
+                        .iter()
+                        .map(|m| {
+                            let before = load_blob(dir, &m.before)?;
+                            let after = m.after.as_ref().map(|a| load_blob(dir, a)).transpose()?;
+                            if after.as_ref().is_some_and(|a| a.len() != before.len()) {
+                                return Err(invalid(
+                                    &path,
+                                    format!("{} memory at {} changed size", call.import, m.address),
+                                ));
+                            }
+                            Ok((m.address.0, before, after))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(LoadedImport {
+                        call: call.clone(),
+                        memory,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            cases.push(LoadedCase {
+                case,
+                regions,
+                globals,
+                imports,
+            });
         }
         Ok(Self {
             dir: dir.to_owned(),

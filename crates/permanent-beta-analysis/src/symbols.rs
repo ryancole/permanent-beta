@@ -2,7 +2,8 @@
 //!
 //! What it reads: procedure symbols (`S_GPROC32`/`S_LPROC32`) from every module, which gives each function's
 //! entry, length, undecorated name and type; and from the type stream, the procedure's return and parameter
-//! types. Parameter names (local symbols) are not read: a renamed parameter must not look like a changed
+//! types. Data symbols (`S_GDATA32`/`S_LDATA32`) give the global variables, for recording global state
+//! (design §7.3). Parameter names (local symbols) are not read: a renamed parameter must not look like a changed
 //! signature (repair compares signatures for equality).
 //!
 //! What it never does: decide a function's boundaries for the native analyzer, or name a function when more than
@@ -16,7 +17,7 @@ use crate::AnalysisError;
 use pdb::{FallibleIterator, TypeData, TypeFinder, TypeIndex};
 use permanent_beta_model::{
     ANALYSIS_SCHEMA_VERSION, AnalysisExport, BuildInfo, FieldLayout, FunctionFeatures,
-    FunctionSignature, NameSource, Param, Producer, Rva, TypeLayout,
+    FunctionSignature, GlobalVar, NameSource, Param, Producer, Rva, TypeLayout,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -39,6 +40,9 @@ pub struct PdbSymbols {
     /// Layouts of the structs, classes and unions the procedures' signatures use (and of the structs inside
     /// them by value), sorted by name.
     pub types: Vec<TypeLayout>,
+    /// Global variables with a unique name, sorted by name. A static local is named `procedure::name`; a name
+    /// two variables at different addresses share is left out (it couldn't be found again by name).
+    pub globals: Vec<GlobalVar>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +67,8 @@ pub struct ApplyReport {
     /// PDB entries the analysis has no function at. `pbeta analysis-diff` against [`procedures_export`]
     /// lists them.
     pub not_in_analysis: usize,
+    /// Globals the code refers to, recorded in the analysis.
+    pub globals: usize,
 }
 
 /// Read a PDB file.
@@ -104,17 +110,50 @@ pub fn read(path: &Path) -> Result<PdbSymbols, AnalysisError> {
     let mut used_types: Vec<String> = Vec::new();
 
     let mut procedures: BTreeMap<Rva, Vec<PdbProcedure>> = BTreeMap::new();
+    // Data symbols by qualified name: (RVA, size, type). More than one RVA under a name: ambiguous.
+    let mut data: BTreeMap<String, Vec<(Rva, u64, String)>> = BTreeMap::new();
+    let mut add_data = |name: String, d: &pdb::DataSymbol<'_>| {
+        let Some(rva) = d.offset.to_rva(&address_map) else {
+            return;
+        };
+        let entry = (
+            Rva(u64::from(rva.0)),
+            type_size(&finder, &definitions, d.type_index, 0),
+            type_name(&finder, d.type_index, 0),
+        );
+        let at = data.entry(name).or_default();
+        if !at.iter().any(|e| e.0 == entry.0) {
+            at.push(entry);
+        }
+    };
     let mut modules = dbi.modules().map_err(err)?;
     while let Some(module) = modules.next().map_err(err)? {
         let Some(module_info) = pdb.module_info(&module).map_err(err)? else {
             continue;
         };
         let mut symbols = module_info.symbols().map_err(err)?;
+        // Enclosing procedures, innermost last: (index of their S_END, name). A data symbol inside one is a
+        // static local.
+        let mut scopes: Vec<(pdb::SymbolIndex, String)> = Vec::new();
         while let Some(symbol) = symbols.next().map_err(err)? {
-            // Symbol kinds the crate can't parse are skipped, not fatal: only procedures matter here.
-            let Ok(pdb::SymbolData::Procedure(p)) = symbol.parse() else {
-                continue;
+            while scopes.last().is_some_and(|(end, _)| *end <= symbol.index()) {
+                scopes.pop();
+            }
+            // Symbol kinds the crate can't parse are skipped, not fatal: only procedures and data matter here.
+            let p = match symbol.parse() {
+                Ok(pdb::SymbolData::Procedure(p)) => p,
+                Ok(pdb::SymbolData::Data(d)) => {
+                    let name = d.name.to_string();
+                    let name = match scopes.last() {
+                        Some((_, proc_name)) => format!("{proc_name}::{name}"),
+                        None => name.into_owned(),
+                    };
+                    add_data(name, &d);
+                    continue;
+                }
+                _ => continue,
             };
+            scopes.push((p.end, p.name.to_string().into_owned()));
             let Some(rva) = p.offset.to_rva(&address_map) else {
                 continue;
             };
@@ -134,6 +173,26 @@ pub fn read(path: &Path) -> Result<PdbSymbols, AnalysisError> {
             }
         }
     }
+    // Globals (S_GDATA32) are in the global symbol stream; file statics can be in both.
+    let global_symbols = pdb.global_symbols().map_err(err)?;
+    let mut symbols = global_symbols.iter();
+    while let Some(symbol) = symbols.next().map_err(err)? {
+        if let Ok(pdb::SymbolData::Data(d)) = symbol.parse() {
+            add_data(d.name.to_string().into_owned(), &d);
+        }
+    }
+    let globals = data
+        .into_iter()
+        .filter_map(|(name, at)| match at.as_slice() {
+            [(rva, size, ty)] => Some(GlobalVar {
+                name,
+                rva: *rva,
+                size: *size,
+                ty: ty.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
     used_types.sort();
     used_types.dedup();
     let types = layouts(&finder, &definitions, used_types);
@@ -142,6 +201,7 @@ pub fn read(path: &Path) -> Result<PdbSymbols, AnalysisError> {
         age,
         procedures,
         types,
+        globals,
     })
 }
 
@@ -193,6 +253,22 @@ pub fn apply(export: &mut AnalysisExport, symbols: &PdbSymbols) -> Result<ApplyR
     }
     report.not_in_analysis = symbols.procedures.len() - seen;
     export.types = symbols.types.clone();
+    // Only the globals the code refers to: `data_refs` are the analyzer's references into writable sections.
+    let refs: Vec<Rva> = export
+        .functions
+        .iter()
+        .flat_map(|f| f.data_refs.iter().copied())
+        .collect();
+    export.globals = symbols
+        .globals
+        .iter()
+        .filter(|g| {
+            refs.iter()
+                .any(|r| (g.rva.0..g.rva.0 + g.size.max(1)).contains(&r.0))
+        })
+        .cloned()
+        .collect();
+    report.globals = export.globals.len();
     Ok(report)
 }
 
@@ -221,6 +297,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
                 strings: vec![],
                 constants: vec![],
                 imports: vec![],
+                data_refs: vec![],
                 signature: single.and_then(|p| p.signature.clone()),
                 inferred_args: None,
                 inferred_arg_classes: vec![],
@@ -240,6 +317,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
         functions,
         code_tables: Vec::new(),
         types: Vec::new(),
+        globals: Vec::new(),
     }
 }
 
@@ -584,6 +662,7 @@ mod tests {
                 age: 0,
                 procedures: BTreeMap::new(),
                 types: Vec::new(),
+                globals: Vec::new(),
             },
         );
         e.functions = rvas
@@ -624,6 +703,7 @@ mod tests {
             age: 3,
             procedures,
             types: Vec::new(),
+            globals: Vec::new(),
         }
     }
 
@@ -645,7 +725,8 @@ mod tests {
                 named: 1,
                 signed: 2,
                 ambiguous: 0,
-                not_in_analysis: 1
+                not_in_analysis: 1,
+                globals: 0,
             }
         );
         assert_eq!(e.functions[0].name.as_deref(), Some("helper"));
@@ -655,6 +736,37 @@ mod tests {
         assert_eq!(e.functions[1].name.as_deref(), Some("api_fn"));
         assert_eq!(e.functions[1].name_source, Some(NameSource::Export));
         assert!(e.functions[1].signature.is_some());
+    }
+
+    #[test]
+    fn keeps_only_the_globals_the_code_refers_to() {
+        let mut e = export_with_pdb(
+            Some(("AAAAAAAA-0000-0000-0000-000000000001", 3)),
+            &[(0x1000, None)],
+        );
+        // One reference into the middle of a struct, none to the other global.
+        e.functions[0].data_refs = vec![Rva(0x4008)];
+        let mut s = symbols(&[(0x1000, "reader", 0)]);
+        let global = |name: &str, rva, size| GlobalVar {
+            name: name.into(),
+            rva: Rva(rva),
+            size,
+            ty: "int".into(),
+        };
+        s.globals = vec![
+            global("g_config", 0x4000, 16),
+            global("g_unused", 0x4010, 4),
+        ];
+        let r = apply(&mut e, &s).unwrap();
+        assert_eq!(r.globals, 1);
+        assert_eq!(e.globals, vec![global("g_config", 0x4000, 16)]);
+        assert_eq!(
+            e.global_at(Rva(0x400f)).map(|g| g.name.as_str()),
+            Some("g_config")
+        );
+        // Negative: the unreferenced global isn't recorded, and nothing claims an address past the struct.
+        assert!(e.global("g_unused").is_none());
+        assert!(e.global_at(Rva(0x4010)).is_none());
     }
 
     #[test]

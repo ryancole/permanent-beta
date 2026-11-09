@@ -453,6 +453,7 @@ mod tests {
             strings: vec![],
             constants: vec![],
             imports: vec![],
+            data_refs: vec![],
             signature: None,
             mnemonic_counts: Default::default(),
             pseudocode: None,
@@ -476,6 +477,7 @@ mod tests {
             functions,
             code_tables: Vec::new(),
             types: Vec::new(),
+            globals: Vec::new(),
         }
     }
 

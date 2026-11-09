@@ -6,7 +6,7 @@
 
 use object::pe::{
     IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_DIRECTORY_ENTRY_IMPORT,
-    IMAGE_REL_BASED_DIR64, IMAGE_SCN_MEM_EXECUTE,
+    IMAGE_REL_BASED_DIR64, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE,
 };
 use object::read::pe::PeFile64;
 use object::{Architecture, LittleEndian as LE, Object, ObjectSection, SectionFlags};
@@ -21,6 +21,7 @@ pub(crate) struct Section {
     pub virtual_size: u32,
     pub data: Vec<u8>,
     pub executable: bool,
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,13 +70,16 @@ impl Image {
         let mut sections = Vec::new();
         for s in pe.sections() {
             let header = s.pe_section();
-            let executable = matches!(s.flags(), SectionFlags::Coff { characteristics }
-                if characteristics & IMAGE_SCN_MEM_EXECUTE != 0);
+            let flag = |bit| {
+                matches!(s.flags(), SectionFlags::Coff { characteristics }
+                    if characteristics & bit != 0)
+            };
             sections.push(Section {
                 rva: header.virtual_address.get(LE),
                 virtual_size: header.virtual_size.get(LE),
                 data: s.data().map(<[u8]>::to_vec).unwrap_or_default(),
-                executable,
+                executable: flag(IMAGE_SCN_MEM_EXECUTE),
+                writable: flag(IMAGE_SCN_MEM_WRITE),
             });
         }
         let size_of_image = sections
@@ -171,6 +175,11 @@ impl Image {
 
     pub fn is_executable(&self, rva: u32) -> bool {
         self.section_at(rva).is_some_and(|s| s.executable)
+    }
+
+    /// In a writable section (`.data`, `.bss`): global state.
+    pub fn is_writable(&self, rva: u32) -> bool {
+        self.section_at(rva).is_some_and(|s| s.writable)
     }
 
     pub fn va_to_rva(&self, va: u64) -> Option<u32> {
@@ -379,12 +388,14 @@ pub(crate) mod tests {
                     virtual_size: 0x1000,
                     data: code.to_vec(),
                     executable: true,
+                    writable: false,
                 },
                 Section {
                     rva: 0x2000,
                     virtual_size: 0x1000,
                     data: data.to_vec(),
                     executable: false,
+                    writable: true,
                 },
             ],
             ..Default::default()

@@ -12,10 +12,16 @@
 ; Nonvolatile registers are never touched. Variadic functions and functions with more than MAX_STACK_ARGS stack
 ; arguments aren't supported (their extra stack arguments wouldn't be forwarded).
 ;
+; pbeta_import_thunkN / pbeta_import_common do the same for the app's import calls: the DLL points the Nth patched
+; import address table slot at pbeta_import_thunkN, and pbeta_import_before / pbeta_import_after record the call
+; when it happens inside a recorded call (hookdll.cpp, "Import calls").
+;
 ; The RecordFrame offsets below must match struct RecordFrame in hookdll.cpp (static_asserts there).
 
 EXTERN pbeta_record_before:PROC
 EXTERN pbeta_record_after:PROC
+EXTERN pbeta_import_before:PROC
+EXTERN pbeta_import_after:PROC
 
 MAX_STACK_ARGS  EQU 8
 
@@ -34,7 +40,9 @@ STACK_SIZE      EQU 0F8h        ; >= REC + FRAME_BYTES, and 8 mod 16 so calls se
 
 .code
 
-pbeta_record_common PROC FRAME
+; The common body, parameterized by the before/after callbacks.
+COMMON MACRO procname, before, after
+procname PROC FRAME
     sub     rsp, STACK_SIZE
     .allocstack STACK_SIZE
     .endprolog
@@ -53,7 +61,7 @@ pbeta_record_common PROC FRAME
     mov     qword ptr [rsp + REC + F_CALL], 0
 
     lea     rcx, [rsp + REC]
-    call    pbeta_record_before
+    call    before
     mov     r11, rax                                    ; the original function
 
     mov     r10, [rsp + REC + F_RSP]
@@ -77,13 +85,17 @@ pbeta_record_common PROC FRAME
     mov     [rsp + REC + F_RAX], rax
     movdqu  [rsp + REC + F_XMM0], xmm0
     lea     rcx, [rsp + REC]
-    call    pbeta_record_after
+    call    after
 
     mov     rax, [rsp + REC + F_RAX]
     movdqu  xmm0, [rsp + REC + F_XMM0]
     add     rsp, STACK_SIZE
     ret
-pbeta_record_common ENDP
+procname ENDP
+ENDM
+
+COMMON pbeta_record_common, pbeta_record_before, pbeta_record_after
+COMMON pbeta_import_common, pbeta_import_before, pbeta_import_after
 
 ; Entry stubs: leaf code that doesn't touch the stack, so it needs no unwind information.
 THUNK MACRO n
@@ -109,5 +121,33 @@ THUNK 12
 THUNK 13
 THUNK 14
 THUNK 15
+
+IMPORT_THUNK MACRO n
+pbeta_import_thunk&n& PROC
+    mov     eax, n
+    jmp     pbeta_import_common
+pbeta_import_thunk&n& ENDP
+ENDM
+
+; IMPORT_THUNKS in hookdll.cpp.
+j = 0
+REPT 64
+    IMPORT_THUNK %j
+    j = j + 1
+ENDM
+
+THUNK_ADDR MACRO n
+    DQ pbeta_import_thunk&n&
+ENDM
+
+; The import thunks' addresses, for the DLL to put in the import address table.
+.const
+PUBLIC pbeta_import_thunks
+pbeta_import_thunks LABEL QWORD
+j = 0
+REPT 64
+    THUNK_ADDR %j
+    j = j + 1
+ENDM
 
 END
