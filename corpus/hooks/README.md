@@ -77,8 +77,8 @@ failure.
 pwsh corpus/build-hooks.ps1 -Run -Replay
 ```
 
-Design §7.3, replay by emulation. Needs pbeta built with the `emulator` feature (Unicorn): CMake, Ninja and
-libclang, found by `corpus/lib/emulator.ps1` (see `third_party/README.md`). On top of the checks above:
+Design §7.3, replay by emulation. Builds pbeta with the `emulator` feature (icicle, running Ghidra's x86-64
+SLEIGH specification). On top of the checks above:
 
 1. **Record:** v1 (after its baseline) and v2 (after its step) run once more under the hook DLL's record mode:
    `PBETA_RECORD` (the recording directory, `target/hooks/<flags>/<version>/rec`) and `PBETA_SPEC` (from

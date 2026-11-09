@@ -1,7 +1,7 @@
 //! Replay of recorded per-call test cases against a new build, by emulation (design §7.3).
 //!
 //! A case recorded in the old build (`permanent_beta_model::TestCase`) is replayed on the candidate function of
-//! the new build: the new image is mapped in Unicorn, the recorded memory placed at its recorded addresses (in the
+//! the new build: the new image is mapped in the emulator, the recorded memory placed at its recorded addresses (in the
 //! new layout, when a struct's layout changed: [`translate`]), the recorded globals placed at the new build's
 //! addresses for the same names, the entry registers and stack set, and the function run until it returns.
 //! Import calls are answered from the recording when the recorder intercepted them and replay models the import
@@ -13,14 +13,16 @@
 //!   called with other inputs, uncaptured memory or global state, a global or struct layout that doesn't map by
 //!   name, an unknown return type, nothing to compare, ...). Inconclusive is never a pass.
 //!
-//! Depends on `permanent-beta-model` only (design §3.1). Emulation needs the `emulator` feature (Unicorn,
-//! GPL-2.0); without it every case is inconclusive.
+//! Depends on `permanent-beta-model` only (design §3.1). Emulation needs the `emulator` feature (icicle, MIT or
+//! Apache-2.0, running Ghidra's x86-64 SLEIGH specification, Apache-2.0); without it every case is inconclusive.
 
 #[cfg(feature = "emulator")]
 pub mod emulate;
 pub mod image;
 pub mod imports;
 pub mod recording;
+#[cfg(feature = "emulator")]
+mod sleigh;
 pub mod translate;
 
 pub use image::Image;

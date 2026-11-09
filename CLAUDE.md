@@ -12,7 +12,8 @@ stop plausible-but-wrong matching logic from merging.
   - `permanent-beta-engine`: model, match, verify, repair, replay
   - `permanent-beta-replay`: model only; only engine and CLI may depend on it. It replays recorded test cases by
     emulation and reports pass/fail/inconclusive; verification decides what that's worth. Its `emulator` feature
-    links Unicorn (GPL-2.0, patched copy in `third_party/`): keep it optional and off by default.
+    links icicle (MIT or Apache-2.0) and embeds Ghidra's x86 SLEIGH specification (Apache-2.0, `sleigh/`): keep it
+    optional and off by default, and add no GPL dependency.
   - `permanent-beta-ai`: model only. It proposes candidates; callers verify them and queue them for review.
   - `permanent-beta-cli`: engine, analysis, store, model, ai, replay. `pbeta propose` queues AI proposals for review and
     never writes a mapping.

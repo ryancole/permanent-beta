@@ -126,7 +126,7 @@ flowchart LR
 | `permanent-beta-repair` | Per-hook decisions, manifest rewrite, generated code. | model |
 | `permanent-beta-store` | Versioned mapping history, evidence, review queue persistence. | model |
 | `permanent-beta-engine` | Orchestrates analysis output → match → verify → repair. | model, match, verify, repair, replay |
-| `permanent-beta-replay` | Replays recorded per-call test cases (§7.3) on a new build by emulation: image mapping, memory placement, layout translation, comparison. Reports pass, fail or inconclusive per case; verification decides what that's worth. Emulation (Unicorn, GPL-2.0) is its optional `emulator` feature. Only engine and CLI may depend on it. | model |
+| `permanent-beta-replay` | Replays recorded per-call test cases (§7.3) on a new build by emulation: image mapping, memory placement, layout translation, comparison. Reports pass, fail or inconclusive per case; verification decides what that's worth. Emulation (icicle, MIT or Apache-2.0, executing Ghidra's x86-64 SLEIGH specification) is its optional `emulator` feature. Only engine and CLI may depend on it. | model |
 | `permanent-beta-cli` | `pbeta` binary; argument parsing, I/O, exit codes. | engine, analysis, store, model, ai, replay |
 | `permanent-beta-corpus` | Test tooling: linker map parser, ground-truth answer keys (`pbeta-corpus`). Nothing depends on it. | model |
 | `permanent-beta-ai` | AI proposer (§8): shortlist, prompt, strict answer parsing, model backends, recordings. Emits `Candidate`s only. | model |
@@ -605,7 +605,7 @@ Each detour logs what its prototype makes meaningful, written by hand.
   points to readable memory, up to 256 bytes before (the strings a `va_list` points to; sizes **[Guess]**). The DLL's
   own CRT calls go through its own table. A case is marked `imports_recorded` only when every import was patched
   (none by ordinal, no more than the thunks).
-- *Replay* (`permanent-beta-replay`, Unicorn): the new image mapped clear of the recorded memory (rebased if
+- *Replay* (`permanent-beta-replay`, icicle): the new image mapped clear of the recorded memory (rebased if
   needed), its IAT pointing at traps, the recorded memory at its recorded addresses, a fresh stack whose return
   address is a trap. The candidate runs until it returns; the return value (its declared width: an `int` is eax)
   and every region's and global's bytes after the call must equal the recording. Recorded globals are placed at
@@ -643,8 +643,15 @@ changes layout, so translation is covered by unit tests only.
 
 Not recorded: memory behind pointers inside structs (depth 1 only), the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is
-inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks. Unicorn is
-GPL-2.0 and an optional feature (§11.5).
+inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks.
+
+*Emulator* (2026-11-08): **icicle** (MIT or Apache-2.0), which executes Ghidra's SLEIGH specification of x86-64,
+replaced Unicorn (GPL-2.0, §11.5), so replay and Ghidra share one definition of the instruction set. The x86
+specification from Ghidra 12.2 (Apache-2.0) is embedded in `permanent-beta-replay/sleigh/` and compiled when the
+first case runs (about 0.2 s, once per thread); no Ghidra install is needed. What a function may touch is
+enforced by icicle's per-byte memory permissions, and the traps are breakpoints. icicle isn't on crates.io; it's
+pinned to a git commit. Measured the same as with Unicorn: all 23 replay unit tests (negatives included) and the
+hook loop's 22 of 24 replaying hook repairs, the negative control failing.
 
 **Privacy:** recorded memory can contain customer data. Recordings stay local by default. **Redaction**
 (implemented 2026-11-08): an argument or global marked `redact` in the spec (`pbeta harness-spec --redact
@@ -982,12 +989,11 @@ validated on the corpus.
 
 The repo currently has a placeholder `LICENSE`. Until a license is chosen, nothing is licensed for reuse.
 
-**Unicorn is GPL-2.0** (decided 2026-11-08 to replay by emulating with it, §7.3). It's linked only by
-`permanent-beta-replay`'s optional `emulator` feature, off by default: a default build contains no GPL code, and any
-`pbeta` built with the feature is GPL-2.0 as a whole. GPL-2.0 and Apache-2.0 are generally considered incompatible,
-so shipping an Apache-2.0 `pbeta` with replay would need the emulator moved out of process (a separate GPL helper
-binary) or replaced by a permissive one (icicle-emu, MIT/Apache-2.0). The patched copy of its sys crate in
-`third_party/` keeps its own license. Not legal advice; part of the license decision.
+**No GPL code** (2026-11-08). Replay first emulated with Unicorn (GPL-2.0), which made any `pbeta` built with
+replay GPL-2.0 as a whole; GPL-2.0 and Apache-2.0 are generally considered incompatible. It now uses icicle (MIT or
+Apache-2.0) with Ghidra's x86 SLEIGH specification (Apache-2.0, embedded with Ghidra's license in
+`permanent-beta-replay/sleigh/`), so every build can carry an Apache-2.0 license. Keep it that way: add no GPL
+dependency. Not legal advice; part of the license decision.
 Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing options open but deters contributors.
 
 ---
@@ -1040,7 +1046,8 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 11. Recording mechanism: own Detours-based harness, Windows Time Travel Debugging (TTD) traces (redistribution and
     licensing **[Validate]**), or DynamoRIO / Frida instrumentation?
 12. Replay mechanism: emulation, live in-process, scenario trace diff, or a combination (§7.3)? (Decided
-    2026-11-08: scenario trace diff and emulation with Unicorn, both implemented; live in-process not built.
+    2026-11-08: scenario trace diff and emulation, both implemented, emulation with icicle and Ghidra's SLEIGH
+    specification since it replaced Unicorn the same day; live in-process not built.
     Recording uses the own Detours harness, question 11.)
 13. Reuse existing behavioral-diffing research (e.g. blanket execution / BLEX-style approaches, differential
     tracing)? Needs a literature and tool survey. **[Validate]**

@@ -4,7 +4,14 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **protected binaries refused, recordings redactable** (design §4.2, §7.3, §12).
+Latest work: **replay emulates with icicle instead of Unicorn** (design §7.3, §11.5). icicle (MIT or
+Apache-2.0) executes Ghidra's SLEIGH specification of x86-64, embedded from Ghidra 12.2 (Apache-2.0) in
+`permanent-beta-replay/sleigh/`, so replay and Ghidra share the instruction semantics and no build contains GPL
+code. Same results: all 23 replay unit tests, and the hook loop's 22 of 24 replaying hook repairs with the
+negative control failing. Memory rules are icicle's per-byte permissions; traps are breakpoints. Building the
+emulator no longer needs CMake, Ninja or libclang, and the patched Unicorn crate in `third_party/` is gone.
+
+Before that: **protected binaries refused, recordings redactable** (design §4.2, §7.3, §12).
 - The analyzer refuses protected and packed binaries before reading any code: a protector's or packer's default
   section name (UPX, VMProtect, Themida/WinLicense, Enigma, ASPack, MPRESS, PECompact, Petite, NsPack), an entry
   point in a writable and executable section, or executable space with no file data. No override; analysis,
@@ -329,8 +336,8 @@ What's new:
    pointers inside structs (depth > 1), a target whose callee changed telling "this function changed" from "a
    callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
-5. **License decision** now has Unicorn (GPL-2.0) in it: an Apache-2.0 `pbeta` with replay needs the emulator out
-   of process or a permissive one (design §11.5).
+5. **License decision** (design §11.5): no GPL code is left (icicle replaced Unicorn), so Apache-2.0 for
+   everything is open again. Still to choose: the license itself and contributor terms (DCO or CLA).
 6. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
 
 ## Known rough edges

@@ -1,2 +1,2 @@
-# Vendored third-party sources stay byte-for-byte as published.
-third_party/** -text
+# Vendored third-party sources stay byte-for-byte as published (Ghidra's SLEIGH specification).
+crates/permanent-beta-replay/sleigh/** -text

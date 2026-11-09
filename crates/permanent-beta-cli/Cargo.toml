@@ -24,6 +24,6 @@ serde_json.workspace = true
 toml.workspace = true
 
 [features]
-# Replay recorded test cases by emulation (Unicorn, GPL-2.0: a pbeta built with it is GPL-2.0; design §11.5).
-# Needs CMake, Ninja and libclang to build (third_party/README.md). Without it, recorded cases are inconclusive.
+# Replay recorded test cases by emulation (icicle, MIT or Apache-2.0, running Ghidra's x86-64 SLEIGH specification,
+# Apache-2.0; design §7.3, §11.5). Without it, recorded cases are inconclusive.
 emulator = ["permanent-beta-replay/emulator"]

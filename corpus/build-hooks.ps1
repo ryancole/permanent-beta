@@ -34,8 +34,7 @@
   recording hook DLL (PBETA_RECORD, spec from `pbeta harness-spec` on its PDB analysis). The decision step adds
   the older versions' recordings as behavioral evidence (`pbeta repair --cases`), every resolved hook's cases are
   replayed on its new RVA (`pbeta replay`: a correct candidate must never fail), and the negative control's swapped
-  hooks must fail replay. Needs pbeta built with the `emulator` feature: CMake, Ninja and libclang
-  (corpus/lib/emulator.ps1, third_party/README.md).
+  hooks must fail replay. Builds pbeta with the `emulator` feature (icicle; nothing to install besides cargo).
 
   Requires Visual Studio (or Build Tools) with the x64 C++ toolset, git (first run), and cargo.
 
@@ -53,7 +52,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib/msvc.ps1')
-. (Join-Path $PSScriptRoot 'lib/emulator.ps1')
 $repo = Split-Path -Parent $PSScriptRoot
 $hooksDir = Join-Path $PSScriptRoot 'hooks'
 $outRoot = Join-Path $repo 'target/hooks'
@@ -356,7 +354,6 @@ function Invoke-Loop([string] $flagName) {
 }
 
 Import-VsDevEnvironment
-if ($Replay) { Use-EmulatorToolchain }
 Build-Detours
 Build-Harness
 $flagNames = if ($Flags) { $Flags } else { @('o2', 'od') }

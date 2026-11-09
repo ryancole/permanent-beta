@@ -15,10 +15,11 @@ thiserror.workspace = true
 toml.workspace = true
 object = { version = "0.36", default-features = false, features = ["std", "read_core", "pe"] }
 sha2 = "0.10"
-# Unicorn is GPL-2.0: a binary built with the `emulator` feature is GPL-2.0 (design §11.5). Building it needs
-# CMake, Ninja and libclang (third_party/README.md).
-unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"], optional = true }
+# icicle (MIT or Apache-2.0) executes Ghidra's SLEIGH specifications; the x86 one is embedded (sleigh/). Not on
+# crates.io: pinned to a commit.
+icicle-vm = { git = "https://github.com/icicle-emu/icicle-emu", rev = "638508b72f480f9be6fe2e267ef09de8f1541f9a", optional = true }
+pcode = { git = "https://github.com/icicle-emu/icicle-emu", rev = "638508b72f480f9be6fe2e267ef09de8f1541f9a", optional = true }
 
 [features]
 # Without it, every case replays as inconclusive ("built without the emulator").
-emulator = ["dep:unicorn-engine"]
+emulator = ["dep:icicle-vm", "dep:pcode"]
