@@ -971,9 +971,85 @@ fits an Apache-2.0 extension. Responsibilities:
 - Export `AnalysisExport` JSON (also usable headless).
 - Show mapping results, evidence and review items next to the listing and decompiler. Accept or reject from the UI.
 
-Overlap: Ghidra already ships **Version Tracking** (function correlators across program versions) and **BSim**. The
-extension should reuse or complement them, and the differentiation (hook repair, verification, CI, history) has to
-be clear. **[Validate]**
+#### Overlap with Version Tracking and BSim (evaluated 2026-11-08, against Ghidra 12.2)
+
+**Version Tracking** (`Features/VersionTracking`) is a session between a source and a destination program, stored
+as a Ghidra domain object. Correlators fill match sets: exact bytes, instructions or mnemonics, symbol name
+(exact, similar, duplicate), data and function references, combined, and a BSim correlator
+(`Features/VersionTrackingBSim`). Its match table lets a user accept, reject and tag matches, and accepting is what
+transfers **markup** (names, comments, signatures, labels, data types) from source to destination. That is its
+purpose: porting reverse-engineering work forward. What it doesn't do, and we need:
+
+- **No independent verification.** A match's score and confidence come from the correlator that found it; accepting
+  is a click, with no checks between correlation and decision. Our rule is that matchers propose and verification
+  judges (§6), counting only evidence independent of the match.
+- **Ambiguity is shown, not withheld.** Correlators emit every plausible pair (duplicates included) and the user
+  picks. Our invariant is that ambiguity gives no candidate (§5.2); a human decides, with the reason.
+- **No hooks.** No manifest, criticality policy, AOB patterns, prototype or struct proposals, trial runs or replay
+  (§7).
+- **No CI or shared history.** A session is a Ghidra database in one project. Our decisions are the append-only
+  store that `pbeta repair --store` honors in CI (§9.1); a decision taken in a VT session never reaches it.
+
+**BSim** (`Features/BSim`) indexes decompiler-derived feature vectors into a database (H2, PostgreSQL or
+Elasticsearch) and searches for similar functions across many binaries. It's a similarity search, close to our
+weak similarity pass and to the AI proposer's job (finding leftovers), not identity evidence: it needs every
+function decompiled, and a similar function is exactly what verification has to tell apart from the same one.
+
+**Function Comparison** (`Features/CodeCompare`, `FunctionComparisonService.createComparison(left, right)`) shows
+two functions from two programs side by side, listing and decompiler, with differences highlighted. That's the view
+a reviewer needs for "is this the same function", and it exists.
+
+**Decision (proposed):**
+
+- **Add** what Ghidra lacks: the review queue (items, reasons, candidates, evidence, every check with whether it
+  counted, the verdict and the policy that produced it), hook context (name, criticality, proposed prototype or
+  struct), accept and reject through `pbeta review`, and the item's decision history.
+- **Reuse, don't rebuild:** Function Comparison for old vs new, Ghidra's `GhidraTable` with its filter (as VT's
+  match table does), and its Go To navigation. No correlators, no match table of our own for all pairs, no diff view.
+- **Link, later:** pushing accepted mappings into a VT session as a match set (`VTSession.createMatchSet`), so a
+  user can carry markup forward with VT's own UI. Not M6: VT's "accept" would look like a review decision while
+  meaning only markup transfer, which needs its own design. BSim as an extra proposer for leftovers (its hits
+  verified and queued, like the AI's, §8) is a separate step too.
+
+#### M6 scope (confirmed 2026-11-08)
+
+1. Module `integrations/ghidra/PermanentBeta/`, built headless with Ghidra's own `support/buildExtension.gradle`
+   (`gradle -PGHIDRA_INSTALL_DIR=...`, Gradle ≥ 9.1, JDK 25) into an installable zip.
+2. Reads through `pbeta-mcp` as a child process (its JSON-RPC protocol, `gson` from Ghidra's own libs): review
+   items, explanations, candidates with evidence and checks. Decisions run `pbeta review accept|reject`, the only
+   path that decides an item; the extension writes nothing itself, and its errors (a verification-rejected
+   candidate without `--force`, a function another mapping claims) are pbeta's, shown as they are.
+3. A Permanent Beta window: a review-item table (status, reason, hook, old function, candidates) and a detail pane
+   (explanation, candidates with evidence and checks, verdict). Actions: go to the old or new function, compare
+   them (Function Comparison), accept a chosen candidate, reject, each with reviewer and note. Programs are tied to
+   builds by the executable's SHA-256 (Ghidra records it at import; a build ID is that hash), addresses as image
+   base + RVA; a mismatched program is refused, not guessed.
+4. Settings: paths to `pbeta`, `pbeta-mcp`, the store and the two analyses; reviewer name defaulting to Ghidra's
+   user.
+5. Tests: Java unit tests for the protocol client and parsing, against recorded `pbeta-mcp` output, including
+   negative cases (a program whose hash isn't the build's; a refused accept surfaced, not swallowed).
+6. Install and usage steps in `integrations/ghidra/README.md` an external tester can follow, verified end to end on
+   the hook loop's `checksum` v2 → v3 item (ambiguous: an identical `checksum_backup` was added).
+
+Not in M6: the VT link and BSim proposer above, running analysis or repair from the GUI (the headless exporter
+stays as it is), and any tool that decides an item other than `pbeta review`.
+
+**Built (2026-11-08)**, usage in `integrations/ghidra/README.md`. Where it differs from the scope above:
+
+- Settings take no analyses: `pbeta-mcp --analysis` is now optional, since the review tools read only the store.
+  The extension starts `pbeta-mcp --store <store>` and calls only its read tools (`McpClient.READ_TOOLS`; it
+  refuses `propose_mapping` before sending anything).
+- Tables are `GTable` with `GTableFilterPanel` (Ghidra's docking widgets); `GhidraTable` adds program navigation
+  the item table doesn't need.
+- Tests are a plain main (`SelfTest`, `gradle selfTest`): Ghidra ships no JUnit, and this keeps the build offline.
+  12 tests against replies recorded from the real `pbeta-mcp` on the hook loop's v2 → v3 store, with negative
+  cases: no `propose_mapping`, a program without a recorded hash, another build's hash or an id prefix is not the
+  build, no decision without a reviewer, store or item, a refused `pbeta review` is an error carrying pbeta's
+  message, malformed items are refused.
+- **Verified in the GUI** (Ghidra 12.2, 2026-11-08) on the hook loop's `checksum` v2 → v3 item: accepted `0x1040`
+  through the window, recorded by `pbeta review`, honored by the next `pbeta repair --store`; the forced-accept
+  prompt and the refusal of a build that isn't open were checked too (docs/STATUS.md). An external tester is
+  still to try it.
 
 ### 11.4 IDA Pro plugin (step 5)
 

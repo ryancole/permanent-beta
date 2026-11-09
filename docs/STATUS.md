@@ -4,7 +4,25 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **licensed Apache-2.0** (design §11.5): `LICENSE`, `NOTICE` (crediting Ghidra's vendored x86
+Latest work: **M6, the Ghidra review extension: built and verified end to end in the GUI** (design §11.3).
+- Evaluated first: Version Tracking ports markup between versions, with correlator scores and no independent
+  verification, no hooks and no shared decision log; BSim is a similarity search. The extension adds the review
+  queue and reuses Ghidra's Function Comparison and Go To; a VT link and a BSim proposer are deferred.
+- `integrations/ghidra/PermanentBeta/`: a **Permanent Beta Review** window (items, candidates with evidence and
+  every check, counted or not; go to old/candidate, compare, accept, reject). It reads through `pbeta-mcp` (now
+  startable with only `--store`) using read tools only, and decides only by running `pbeta review accept|reject`.
+  Programs are tied to builds by the executable's SHA-256. `gradle -PGHIDRA_INSTALL_DIR=...` builds the zip
+  headless; `gradle selfTest` passes 12 tests (48 checks) against recorded `pbeta-mcp` replies, negative cases
+  included.
+- **Verified in Ghidra 12.2** on the hook loop's /O2 v2 → v3 store: both open items listed with their checks;
+  Compare Functions opened v2 and v3 at `0x1040` side by side; accepting `log_event`'s rejected candidate asked
+  first (Cancel by default); Go To Old Function on `log_event` (from v1, not open) was refused with the open
+  builds named; accepting `checksum` → `0x1040` (the map file's `checksum`) was recorded by `pbeta review`, and the
+  next `pbeta repair --store` resolved it ("decided by Ryan", 7 of 8 hooks). Two fixes from that run: a registered
+  plugin package (Ghidra created a stub for ours) and a one-line note prompt.
+- Not yet tried by an external tester (the exit criterion). The README's steps are what they'd follow.
+
+Before that: **licensed Apache-2.0** (design §11.5): `LICENSE`, `NOTICE` (crediting Ghidra's vendored x86
 specification), `license = "Apache-2.0"` on every crate. Contributor terms (DCO or CLA) are still open.
 
 Before that: **replay emulates with icicle instead of Unicorn** (design §7.3, §11.5). icicle (MIT or
@@ -300,7 +318,7 @@ What's new:
 | 4. Behavioral tests from the old version | Done: scenario trace diff and trial runs (M4), and recorded per-call test cases replayed by emulation, with struct layouts translated by field name, globals placed by name and the UCRT's printing imports answered from the recording; on the hook loop 22 of 24 resolved hook repairs replay, all passing |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
-| Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; UI extension (M6) not started |
+| Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; review extension (M6) built and verified end to end in the GUI; external tester pending |
 | Hosted service, IDA plugin | Not started (designed) |
 | AI fallback | Built and measured (M5), in `propose` and `repair --propose`: 75 of 77 proposals correct on Lua and zstd, /O2 and /Od (remeasured 2026-11-07); `none` on 11 of 12 deleted functions; no wrong proposal passes verification (design §8) |
 | License choice | Apache-2.0 (2026-11-08); contributor terms open |

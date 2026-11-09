@@ -19,8 +19,9 @@ use std::path::PathBuf;
     about = "Permanent Beta MCP server (stdio)"
 )]
 struct Cli {
-    /// An analysis export (`pbeta analyze`). Repeatable: every build the agent may look at.
-    #[arg(long, required = true)]
+    /// An analysis export (`pbeta analyze`). Repeatable: every build the agent may look at. Optional: the review
+    /// tools need only the store (the Ghidra extension starts it that way).
+    #[arg(long)]
     analysis: Vec<PathBuf>,
     /// Review store. Read for review items; proposals are added to it. Without it, the review tools and
     /// propose_mapping report an error.

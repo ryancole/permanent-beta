@@ -1,0 +1,45 @@
+// Permanent Beta's Ghidra extension (design §11.3). Builds against a Ghidra installation:
+//
+//     gradle -PGHIDRA_INSTALL_DIR=<Ghidra folder>      (or set GHIDRA_INSTALL_DIR)
+//
+// The installable zip lands in dist/. `gradle selfTest` runs the tests (no dependencies to download: they use
+// only gson, which Ghidra ships).
+
+//----------------------START "DO NOT MODIFY" SECTION------------------------------
+def ghidraInstallDir
+
+if (System.env.GHIDRA_INSTALL_DIR) {
+	ghidraInstallDir = System.env.GHIDRA_INSTALL_DIR
+}
+else if (project.hasProperty("GHIDRA_INSTALL_DIR")) {
+	ghidraInstallDir = project.getProperty("GHIDRA_INSTALL_DIR")
+}
+else {
+	ghidraInstallDir = "<REPLACE>"
+}
+
+task distributeExtension {
+	group = "Ghidra"
+
+	apply from: new File(ghidraInstallDir).getCanonicalPath() + "/support/buildExtension.gradle"
+	dependsOn ':buildExtension'
+}
+//----------------------END "DO NOT MODIFY" SECTION-------------------------------
+
+// Tests are a plain main (permanentbeta.core.SelfTest): Ghidra ships no JUnit, and this keeps the build offline.
+sourceSets {
+	test {
+		java.srcDirs = ['src/test/java']
+		resources.srcDirs = ['src/test/resources']
+	}
+}
+
+tasks.register('selfTest', JavaExec) {
+	group = 'verification'
+	description = 'Runs the extension tests'
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = 'permanentbeta.core.SelfTest'
+}
+tasks.named('check') { dependsOn 'selfTest' }
+
+buildExtension.exclude 'dist/**'
