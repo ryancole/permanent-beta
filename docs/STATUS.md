@@ -14,6 +14,9 @@ Latest work: **the hook-prototype check, heap allocation in replay, and buffers*
   pointer, and behind a stack pointer too). CRT functions replay runs itself read only memory something put there
   (6 `deflate` cases had passed by copying the zeros kept around regions for over-reads; now inconclusive).
 - zlib: **13 of 16** hooks replay (was 10), 0 fail, o2 and od. Hook loop unchanged (22 of 24), fixtures 0 wrong.
+- **Prototype proposals from PDB signatures** (§7.2): with both builds' signatures, added (stack included),
+  removed, reordered and retyped parameters are proposed, matched by name, with a shim that keeps the existing
+  detour (a generated one compiles with `cl /W4 /WX`). No PDBs: register inference as before.
 
 Before that: **replay maps old-image addresses** (design §7.3). Recorded memory holds addresses into the old
 image (static tables, function pointers); replay now maps them to the new image: data symbols by unique name and
@@ -355,7 +358,7 @@ What's new:
 |---|---|
 | 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2, yaml-cpp and JsonCpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
 | 2. Verify it's the same function | Done for symbol-less binaries, including C++ vtable slots (code-tables check); with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
-| 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim) and for changed struct layouts (PDB types: changes, new definition, offsets) |
+| 3. Adapt hooks (signature/struct changes) | Prototype + shim proposals: from both builds' PDB signatures any parameter change (added incl. stack, removed, reordered, retyped), otherwise added register parameters; changed struct layouts from PDB types (changes, new definition, offsets). Not without a PDB: struct changes, stack/removed parameters |
 | 4. Behavioral tests from the old version | Done: scenario trace diff and trial runs (M4), and recorded per-call test cases replayed by emulation, with struct layouts translated by field name, globals placed by name and the UCRT's printing imports answered from the recording; on the hook loop 22 of 24 resolved hook repairs replay, all passing |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
@@ -421,8 +424,8 @@ What's new:
   length (8 bytes) is a guess, and patterns are only checked for uniqueness in the build they're made from.
 - A trial run that crashes fails every candidate's behavioral check in that run, holding the whole step for
   review. One run per trialed hook would isolate it, at the cost of more runs.
-- Prototype proposals only cover added register parameters (slots 1–4), with types guessed from the register
-  class; stack parameters, removed or reordered ones aren't proposed.
+- Without PDB signatures, prototype proposals only cover added register parameters (slots 1–4), with types guessed
+  from the register class; stack parameters, removed or reordered ones need both builds' PDBs.
 - Call-sequence pairing by position is a review suggestion only. In the ICF build it suggests `pb_deleted` →
   `pb_body_edited`, which is misleading but not a wrong match.
 - `.exe` hashes change on every rebuild even with `/Brepro` (PE timestamp, PDB signature), so a build ID is

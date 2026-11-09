@@ -207,6 +207,265 @@ pub fn propose(
     })
 }
 
+/// A proposal from both builds' PDB signatures (design §7.2): the new function's parameters are known exactly, so
+/// any change is covered: added parameters (stack ones included), removed, reordered, retyped. Parameters
+/// correspond by name: every parameter of both signatures must have one, unique, or there's no proposal (position
+/// alone can't tell a reorder from a retype). The hook's prototype must have the old signature's parameter count
+/// (it was written against the old function). The shim is the new detour: it takes the new parameters, calls the
+/// existing detour with the old ones (by name; a removed one gets a value-initialized `{}`, a retyped one a cast),
+/// and the existing detour's call to the original goes through `<name>_forward`, which passes the new parameters
+/// (the added ones stashed by the shim). `None` when the signatures are missing or equal, or names don't line up.
+pub fn propose_from_signatures(
+    hook: &HookSpec,
+    old: &FunctionFeatures,
+    new: &FunctionFeatures,
+    new_build: &BuildId,
+) -> Option<PrototypeProposal> {
+    let proto = Prototype::parse(hook.prototype.as_deref()?)?;
+    let (os, ns) = (old.signature.as_ref()?, new.signature.as_ref()?);
+    if os.params == ns.params && os.return_type == ns.return_type {
+        return None;
+    }
+    if proto.params.len() != os.params.len() {
+        return None;
+    }
+    let names = |ps: &[permanent_beta_model::Param]| -> Option<Vec<String>> {
+        let v: Vec<String> = ps.iter().map(|p| p.name.clone()).collect::<Option<_>>()?;
+        let mut sorted = v.clone();
+        sorted.sort();
+        sorted.dedup();
+        (sorted.len() == v.len() && v.iter().all(|n| !n.is_empty())).then_some(v)
+    };
+    let (old_names, new_names) = (names(&os.params)?, names(&ns.params)?);
+    let new_params: Vec<ProtoParam> = ns
+        .params
+        .iter()
+        .map(|p| ProtoParam {
+            ty: p.ty.clone(),
+            name: p.name.clone(),
+        })
+        .collect();
+    let head = match &ns.return_type {
+        Some(r) if os.return_type.as_ref() != Some(r) => r.clone(),
+        _ => proto.head.clone(),
+    };
+    let new_proto = Prototype {
+        head,
+        name: proto.name.clone(),
+        params: new_params.clone(),
+    };
+
+    let mut changes = Vec::new();
+    let added: Vec<&str> = new_names
+        .iter()
+        .filter(|n| !old_names.contains(n))
+        .map(String::as_str)
+        .collect();
+    let removed: Vec<&str> = old_names
+        .iter()
+        .filter(|n| !new_names.contains(n))
+        .map(String::as_str)
+        .collect();
+    let kept_old: Vec<&String> = old_names.iter().filter(|n| new_names.contains(n)).collect();
+    let kept_new: Vec<&String> = new_names.iter().filter(|n| old_names.contains(n)).collect();
+    let retyped: Vec<String> = os
+        .params
+        .iter()
+        .filter_map(|o| {
+            let n = ns.params.iter().find(|n| n.name == o.name)?;
+            (n.ty != o.ty).then(|| {
+                format!(
+                    "{} {} -> {}",
+                    o.name.as_deref().unwrap_or_default(),
+                    o.ty,
+                    n.ty
+                )
+            })
+        })
+        .collect();
+    if !added.is_empty() {
+        changes.push(format!("added {}", added.join(", ")));
+    }
+    if !removed.is_empty() {
+        changes.push(format!(
+            "removed {} (the shim passes the existing detour a value-initialized {{}}: check it doesn't rely on {})",
+            removed.join(", "),
+            if removed.len() == 1 { "it" } else { "them" }
+        ));
+    }
+    if kept_old != kept_new {
+        changes.push("reordered".into());
+    }
+    if !retyped.is_empty() {
+        changes.push(format!(
+            "retyped {} (cast in the shim: check the values survive)",
+            retyped.join(", ")
+        ));
+    }
+    let return_changed = matches!((&os.return_type, &ns.return_type), (Some(a), Some(b)) if a != b);
+    if return_changed {
+        changes.push(format!(
+            "returns {} instead of {}",
+            ns.return_type.as_deref().unwrap_or_default(),
+            os.return_type.as_deref().unwrap_or_default()
+        ));
+    }
+    if changes.is_empty() {
+        return None;
+    }
+    let basis = format!(
+        "from both builds' PDB signatures, parameters matched by name: {}",
+        changes.join("; ")
+    );
+    let shim = if return_changed {
+        format!(
+            "// Proposed by pbeta for hook {} at {}: {basis}.\n// The return type changed: no shim; adapt the detour \
+             by hand.\n",
+            hook.name, new.rva
+        )
+    } else {
+        signature_shim(&proto, &old_names, &new_proto, hook, new, new_build, &basis)
+    };
+    Some(PrototypeProposal {
+        candidate: new.rva,
+        prototype: new_proto.render(&new_proto.name, &new_proto.params),
+        shim,
+        basis,
+    })
+}
+
+/// The shim for [`propose_from_signatures`]: the existing detour keeps the old prototype (`old`, whose parameter
+/// `i` is the old signature's `old_names[i]`).
+#[allow(clippy::too_many_arguments)]
+fn signature_shim(
+    old: &Prototype,
+    old_names: &[String],
+    new: &Prototype,
+    hook: &HookSpec,
+    at: &FunctionFeatures,
+    new_build: &BuildId,
+    basis: &str,
+) -> String {
+    let n = &old.name;
+    let detour = hook.detour.clone().unwrap_or_else(|| format!("Hook_{n}"));
+    let ret = old.return_type();
+    let void = old.returns_void();
+    let list = |ps: &[ProtoParam]| render_list(ps);
+    let ty = |ps: &[ProtoParam]| {
+        let l: Vec<String> = ps.iter().map(|p| p.ty.clone()).collect();
+        if l.is_empty() {
+            "void".to_owned()
+        } else {
+            l.join(", ")
+        }
+    };
+    // The existing detour's own parameters, named after the old signature.
+    let old_params: Vec<ProtoParam> = old
+        .params
+        .iter()
+        .zip(old_names)
+        .map(|(p, name)| ProtoParam {
+            ty: p.ty.clone(),
+            name: Some(name.clone()),
+        })
+        .collect();
+    let added: Vec<&ProtoParam> = new
+        .params
+        .iter()
+        .filter(|p| p.name.as_ref().is_some_and(|nm| !old_names.contains(nm)))
+        .collect();
+    let mut out = format!(
+        "// Proposed by pbeta for hook {} at {} (build {}). Review before use: {basis}.\n",
+        hook.name,
+        at.rva,
+        new_build.0.get(..12).unwrap_or(&new_build.0)
+    );
+    out.push_str(&format!(
+        "using {n}_new_t = {ret} (*)({});\nstatic {n}_new_t Real_{n}_new = nullptr;  // attach this one at {}\n",
+        ty(&new.params),
+        at.rva
+    ));
+    for p in &added {
+        out.push_str(&format!(
+            "static thread_local {} {n}_{};\n",
+            p.ty,
+            p.name.as_deref().unwrap_or_default()
+        ));
+    }
+    // The existing detour calls the original as Real_<name>(old parameters): forward them in the new order.
+    let forward_args: Vec<String> = new
+        .params
+        .iter()
+        .map(|p| {
+            let name = p.name.clone().unwrap_or_default();
+            match old_params
+                .iter()
+                .find(|o| o.name.as_deref() == Some(name.as_str()))
+            {
+                Some(o) if o.ty != p.ty => format!("({}){name}", p.ty),
+                Some(_) => name,
+                None => format!("{n}_{name}"),
+            }
+        })
+        .collect();
+    let dropped: String = old_params
+        .iter()
+        .filter_map(|o| o.name.as_deref())
+        .filter(|name| !new.params.iter().any(|p| p.name.as_deref() == Some(*name)))
+        .map(|name| format!("    (void){name};  // removed in the new build\n"))
+        .collect();
+    out.push_str(&format!(
+        "// Set Real_{n} = {n}_forward: the existing detour calls it as the original function.\n\
+         static {ret} {n}_forward({}) {{\n{dropped}    {}Real_{n}_new({});\n}}\n",
+        list(&old_params),
+        if void { "" } else { "return " },
+        forward_args.join(", ")
+    ));
+    // The detour to attach: stash the added arguments, then run the existing detour with the old ones.
+    out.push_str(&format!(
+        "// The detour to attach: stash the added arguments (saved and restored for nested calls), then run the\n\
+         // existing detour unchanged.\nstatic {ret} Shim_{n}({}) {{\n",
+        list(&new.params)
+    ));
+    for p in &added {
+        let a = p.name.as_deref().unwrap_or_default();
+        out.push_str(&format!(
+            "    {} saved_{a} = {n}_{a};\n    {n}_{a} = {a};\n",
+            p.ty
+        ));
+    }
+    let detour_args: Vec<String> = old_params
+        .iter()
+        .map(|o| {
+            let name = o.name.clone().unwrap_or_default();
+            match new
+                .params
+                .iter()
+                .find(|p| p.name.as_deref() == Some(name.as_str()))
+            {
+                Some(p) if p.ty != o.ty => format!("({}){name}", o.ty),
+                Some(_) => name,
+                None => format!("{}{{}} /* {name}: removed in the new build */", o.ty),
+            }
+        })
+        .collect();
+    let call = format!("{detour}({})", detour_args.join(", "));
+    if void {
+        out.push_str(&format!("    {call};\n"));
+    } else {
+        out.push_str(&format!("    auto r = {call};\n"));
+    }
+    for p in &added {
+        let a = p.name.as_deref().unwrap_or_default();
+        out.push_str(&format!("    {n}_{a} = saved_{a};\n"));
+    }
+    if !void {
+        out.push_str("    return r;\n");
+    }
+    out.push_str("}\n");
+    out
+}
+
 fn register_name(slot: usize, class: ArgClass) -> String {
     let int = ["rcx", "rdx", "r8", "r9"][slot];
     match class {
@@ -480,5 +739,133 @@ mod tests {
         let mut unknown = func(0x20, &[]);
         unknown.inferred_args = None;
         assert_eq!(propose(&h, &func(0x10, &[I, I]), &unknown, &b), None);
+    }
+
+    /// A function with a PDB signature: `(name, type)` parameters and a return type.
+    fn signed(rva: u64, ret: &str, params: &[(&str, &str)]) -> FunctionFeatures {
+        let mut f = func(rva, &[]);
+        f.inferred_args = None;
+        f.signature = Some(permanent_beta_model::FunctionSignature {
+            calling_convention: None,
+            return_type: Some(ret.into()),
+            params: params
+                .iter()
+                .map(|(n, t)| permanent_beta_model::Param {
+                    name: (!n.is_empty()).then(|| (*n).to_owned()),
+                    ty: (*t).into(),
+                })
+                .collect(),
+        });
+        f
+    }
+
+    #[test]
+    fn signatures_cover_added_stack_removed_and_reordered_parameters() {
+        let h = hook("int place(int a, int b, int c, int d, int e)");
+        let old = signed(
+            0x10,
+            "int",
+            &[
+                ("a", "int"),
+                ("b", "int"),
+                ("c", "int"),
+                ("d", "int"),
+                ("e", "int"),
+            ],
+        );
+        // b removed; e moved to the front; f added (a stack parameter); d retyped.
+        let new = signed(
+            0x20,
+            "int",
+            &[
+                ("e", "int"),
+                ("a", "int"),
+                ("c", "int"),
+                ("d", "long long"),
+                ("f", "int"),
+                ("g", "int"),
+            ],
+        );
+        let p = propose_from_signatures(&h, &old, &new, &BuildId("v2".into())).unwrap();
+        assert_eq!(
+            p.prototype,
+            "int place(int e, int a, int c, long long d, int f, int g)"
+        );
+        for want in [
+            "added f, g",
+            "removed b",
+            "reordered",
+            "retyped d int -> long long",
+        ] {
+            assert!(p.basis.contains(want), "{want}: {}", p.basis);
+        }
+        // The new detour calls the existing one with the old parameters, by name: b is gone, d is cast back.
+        assert!(
+            p.shim.contains(
+                "Hook_log_event(a, int{} /* b: removed in the new build */, c, (int)d, e)"
+            ),
+            "{}",
+            p.shim
+        );
+        // And the existing detour's call to the original forwards in the new order, the added ones stashed.
+        assert!(
+            p.shim
+                .contains("Real_place_new(e, a, c, (long long)d, place_f, place_g)"),
+            "{}",
+            p.shim
+        );
+        assert!(
+            p.shim.contains("static thread_local int place_f;"),
+            "{}",
+            p.shim
+        );
+    }
+
+    #[test]
+    fn no_signature_proposal_without_names_or_a_matching_prototype() {
+        let old = signed(0x10, "int", &[("a", "int"), ("b", "int")]);
+        let new = signed(0x20, "int", &[("b", "int"), ("a", "int"), ("c", "int")]);
+        let v2 = BuildId("v2".into());
+        // Negative: an unnamed parameter (position can't tell a reorder from a retype).
+        let unnamed = signed(0x20, "int", &[("", "int"), ("a", "int"), ("c", "int")]);
+        assert_eq!(
+            propose_from_signatures(&hook("int f(int a, int b)"), &old, &unnamed, &v2),
+            None
+        );
+        // Negative: a name twice.
+        let twice = signed(0x20, "int", &[("a", "int"), ("a", "int")]);
+        assert_eq!(
+            propose_from_signatures(&hook("int f(int a, int b)"), &old, &twice, &v2),
+            None
+        );
+        // Negative: the hook's prototype doesn't have the old signature's parameter count.
+        assert_eq!(
+            propose_from_signatures(&hook("int f(int a)"), &old, &new, &v2),
+            None
+        );
+        // Negative: nothing changed, or no signatures.
+        assert_eq!(
+            propose_from_signatures(&hook("int f(int a, int b)"), &old, &old, &v2),
+            None
+        );
+        assert_eq!(
+            propose_from_signatures(
+                &hook("int f(int a, int b)"),
+                &func(0x10, &[I, I]),
+                &new,
+                &v2
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_changed_return_type_gets_no_shim() {
+        let old = signed(0x10, "int", &[("a", "int")]);
+        let new = signed(0x20, "long long", &[("a", "int")]);
+        let p = propose_from_signatures(&hook("int f(int a)"), &old, &new, &BuildId("v2".into()))
+            .unwrap();
+        assert_eq!(p.prototype, "long long f(int a)");
+        assert!(p.shim.contains("no shim"), "{}", p.shim);
     }
 }

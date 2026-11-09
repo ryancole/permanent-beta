@@ -510,7 +510,14 @@ Generators (all output goes to review unless purely mechanical):
   argument registers than the hook's prototype declares (and the old function didn't), the review item gets a
   proposed prototype, with each added parameter typed from its register class (`intptr_t` or `double`), and a C++
   shim: a new detour that stashes the added arguments and calls the existing detour, whose call to the original
-  forwards them. Removed or reordered parameters aren't proposed (inferred arguments are a lower bound). The
+  forwards them. Removed or reordered parameters aren't proposed from registers (inferred arguments are a lower
+  bound). **With both builds' PDB signatures** (2026-11-08) the change is known exactly and proposed first:
+  parameters added (stack ones included), removed, reordered and retyped, and a changed return type. Parameters
+  correspond by name; an unnamed or repeated name, or a hook prototype without the old signature's parameter
+  count, gives no proposal. The shim's new detour takes the new parameters and calls the existing detour with the
+  old ones by name (a removed one gets a value-initialized `{}`, a retyped one a cast, both flagged in the basis);
+  the existing detour's call to the original forwards the new parameters in the new order. A changed return type
+  gets the prototype but no shim. A generated shim with every kind of change compiles with `cl /W4 /WX`. The
   detour body is never rewritten automatically.
 - **Struct layout adaptation** (implemented 2026-11-07, PDB types): `pbeta analyze --pdb` records the layouts
   (size; each field's name, offset, size, type and bitfield position) of the structs, classes and unions that

@@ -321,7 +321,10 @@ impl Engine {
                 .iter()
                 .chain(&repair.alternatives)
                 .filter_map(|v| {
-                    prototype::propose(hook, o, new.function(v.candidate.new)?, &new.build.id)
+                    let n = new.function(v.candidate.new)?;
+                    // Both builds' PDB signatures know the change exactly; otherwise the register inference.
+                    prototype::propose_from_signatures(hook, o, n, &new.build.id)
+                        .or_else(|| prototype::propose(hook, o, n, &new.build.id))
                 })
                 .collect();
         }
