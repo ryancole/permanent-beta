@@ -48,7 +48,8 @@
     # ZSTD_compressSubBlock_sequences / ZSTD_compressSubBlock and ZSTDMT_expandBufferPool / createBufferPool).
     # Similarity pairs the survivors: the new function does the old one's work and its matched callers agree, but
     # the answer key, by name, scores it wrong (3 wrong across the four variants). No structural rule separates
-    # these yet without costing many correct matches elsewhere; see docs/STATUS.md.
+    # these yet without costing many correct matches elsewhere; see docs/STATUS.md. Rechecked 2026-11-08 (three
+    # candidate rules measured, none adopted): the first case differs only in its signature.
     SkipFlags = @('o2-ltcg', 'o2-pgo')
     # PGO training (flag set o2-pgo): compress zstd_compress.c at levels 3 and 19, then decompress.
     Train    = @(

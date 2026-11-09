@@ -360,6 +360,10 @@ neighbourhood passes.
 - **Many-to-one is real.** MSVC `/OPT:ICF` folds identical functions, inlining and function splitting change
   boundaries. The model must eventually express "old function folded into X" and "old function inlined into its
   callers" as outcomes, not just as failures to match. **[Validate]** how often hooked functions are affected.
+  Under /LTCG and PGO the two can swap: the compiler keeps a different one of two related functions out of line in
+  each build, and the survivor can look exactly like the old function (zstd 1.5.7's `_wExtLitBuffer`: same callers
+  and callee, different parameters). Without signatures matching can't tell; zstd's /LTCG and PGO variants are
+  not scored for that reason (docs/STATUS.md).
 
 ### 5.3 Scores
 

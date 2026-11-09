@@ -262,10 +262,19 @@ What's new:
 1. **zstd's `noDict_*` family stays with review:** prompt context made the AI guess wrongly inside it (design
    §8). If anything, matching could separate `_0`/`_1` by which unmatched new callee (`ZSTD_match4Found_cmov` /
    `_branch`) gets matched first; the AI shouldn't.
-2. **Swapped inlining (zstd under /LTCG and PGO):** when the compiler keeps a different one of two related
-   functions out of line in each build, decide what the right answer even is (the survivor does the old one's
-   work) and how to detect it: e.g. the new function's callees include the old function's callees *and* its
-   old caller's, or a size jump matching an inlined callee. Then unskip zstd's two flag sets.
+2. **Swapped inlining (zstd under /LTCG and PGO): examined 2026-11-08, left skipped.** The answer key is right
+   in all three cases. (1) PGO 1.5.6 → 1.5.7: `ZSTD_entropyCompressSeqStore`'s body moved into a new
+   `_wExtLitBuffer` (12 parameters, reordered) and the old function became an inlined wrapper. The survivor has
+   the same callers and callee, so only a signature separates them; a hook moved there would read the wrong
+   registers. (2) /LTCG 1.5.5 → 1.5.6: `ZSTD_compressSubBlock_sequences` was inlined into `ZSTD_compressSubBlock`,
+   which in 1.5.5 was itself inlined into the caller (the survivor calls a new `_literal` whose code used to sit in
+   that caller). (3) /LTCG: `ZSTDMT_expandBufferPool`/`createBufferPool` swapped which was inlined into which,
+   and with the whole `ZSTDMT_*` neighbourhood unmatched, similarity paired old `expand` with new `create`.
+   Measured over all 60 variants, not adopted: an inferred-argument-count veto in similarity (catches 1; −49
+   correct and a new wrong match in yaml-cpp /Od), holding a pair another unmatched old function ranks first
+   (−11, catches nothing), requiring a matched non-thunk neighbour in common (catches 3; −25). Case 1 needs
+   signatures (a PDB, or better inferred ones), so PGO can't be unskipped by a matching rule; /LTCG could be, for
+   −25 correct plus a rule for case 2 that would fit one case.
 3. **Calibrate the C++ guesses:** the table-slot anchor count, the code-tables fail threshold and the wrapper
    callers threshold are single-project guesses; recheck them with `pbeta-corpus sweep`-style grids once a third
    C++ project exists.
