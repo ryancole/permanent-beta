@@ -31,6 +31,7 @@ pwsh corpus/build-projects.ps1 -Score
 | zstd | v1.5.5, v1.5.6, v1.5.7 | `zstd` CLI with the library compiled in | 0 wrong; /O2 680–690 of ~729, /Od 1737–1773 of ~1879 |
 | tinyxml2 | 9.0.0, 10.0.0, 10.1.0 | `xmltest` (C++) with the library compiled in | 0 wrong; /O2 231–247 of ~267, /Od 425–435 of ~474 |
 | yaml-cpp | 0.7.0, 0.8.0, 0.9.0 | `read` (C++: exceptions, STL, lambdas) with the library compiled in | 0 wrong; /O2 256–269 of ~325, /Od 2913–2952 of ~3158 |
+| jsoncpp | 1.9.6, 1.9.7, 1.9.8 | `jsontestrunner` (C++: virtual reader/writer interfaces, exceptions, STL) with the library compiled in | 0 wrong; /O2 272–273 of 300, /Od 1592–1626 of ~1670 |
 
 The scorecard also reports each pass's precision (correct share of its own candidates) and recall (its correct
 matches over the functions present in both builds).

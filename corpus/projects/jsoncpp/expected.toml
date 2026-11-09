@@ -1,0 +1,23 @@
+# Gate for the JsonCpp corpus (the third C++ project). Scored by
+# `pwsh corpus/build-projects.ps1 -Project jsoncpp -Score` (add `--misses` to `pbeta-corpus score` to list what
+# wasn't matched).
+#
+#   - zero wrong matches, always (not configurable);
+#   - at least `min_correct` correct matches per variant (<flags>__<old>__<new>), counting every function from
+#     the project's own object files (STL instantiations included) except exception-handling funclets.
+#
+# Baseline 2026-11-08 (first run, no answer-key or matching changes needed): /O2 272 of 300 and 273 of 300,
+# /O2+ICF 260 of 271 twice, /Od 1592 of 1654 and 1626 of 1685, /LTCG 215 of 243 twice, PGO 327 of 359 and 329 of
+# 361, 0 wrong. Added to calibrate the C++ guesses: TABLE_MIN_ANCHORS and WRAPPER_MIN_DIRECT_CALLERS were swept
+# over all 64 corpus variants (design §5.1).
+[gate.min_correct]
+"o2__1.9.6__1.9.7" = 272
+"o2__1.9.7__1.9.8" = 273
+"o2-icf__1.9.6__1.9.7" = 260
+"o2-icf__1.9.7__1.9.8" = 260
+"od__1.9.6__1.9.7" = 1592
+"od__1.9.7__1.9.8" = 1626
+"o2-ltcg__1.9.6__1.9.7" = 215
+"o2-ltcg__1.9.7__1.9.8" = 215
+"o2-pgo__1.9.6__1.9.7" = 327
+"o2-pgo__1.9.7__1.9.8" = 329

@@ -542,6 +542,11 @@ impl StructuralCheck for CallerCheck {
 /// - Inconclusive otherwise (not in any table, or nothing matched around it).
 pub struct CodeTableCheck;
 
+/// Agreeing slots a corresponding table needs before it holding another function at the candidate's slot fails
+/// the check. [Guess]: on the corpus the check never fails, at 1, 2 or 3 (swept 2026-11-08 over 64 variants), so
+/// this can't be calibrated there.
+pub const CODE_TABLE_FAIL_AGREEING: usize = 2;
+
 /// Agreeing and disagreeing slots between `t` and `u`, ignoring the slots holding `old_self`.
 fn table_agreement(ctx: &VerifyContext, t: &[Rva], u: &[Rva], old_self: Rva) -> (usize, usize) {
     let (mut agree, mut disagree) = (0, 0);
@@ -587,7 +592,7 @@ impl StructuralCheck for CodeTableCheck {
                     .any(|(o, n)| *o == old.rva && *n == new.rva);
                 if same_slot {
                     support += 1;
-                } else if agree >= 2 {
+                } else if agree >= CODE_TABLE_FAIL_AGREEING {
                     against += 1;
                 }
             }

@@ -4,7 +4,13 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **replay through globals and import calls** (design §7.3, goal 4): **22 of 24** resolved hook
+Latest work: **a third C++ project (JsonCpp) and the C++ guesses calibrated** (design §5.1, §6.1). JsonCpp
+1.9.6 → 1.9.7 → 1.9.8 scored 0 wrong on all 10 variants on its first run. With it, two of the three C++
+guesses are calibrated over 64 variants: `TABLE_MIN_ANCHORS` (1) and `WRAPPER_MIN_DIRECT_CALLERS` (2) are the
+lowest clean values. The code-tables fail threshold can't be: the check never fails on the corpus. No matching
+behaviour changed; the other projects' scorecards are identical.
+
+Before that: **replay through globals and import calls** (design §7.3, goal 4): **22 of 24** resolved hook
 repairs replay now, all passing (16 before).
 - The analysis records each function's RIP-relative references into writable sections (`data_refs`, native) and,
   with `--pdb`, the globals they fall in (`globals`; static locals named `procedure::name`, so the CRT's printf and
@@ -254,6 +260,8 @@ What's new:
   - zstd v1.5.5 → v1.5.6 → v1.5.7: /O2 680–690 of ~729 (/O2+ICF 666–676), /Od 1737–1773 of ~1879.
   - TinyXML-2 9.0.0 → 10.0.0 → 10.1.0 (C++): /O2 231–247 of ~267 (/O2+ICF 201–212 of ~228), /Od 425–435 of ~474.
   - yaml-cpp 0.7.0 → 0.8.0 → 0.9.0 (C++): /O2 256–269 of ~325 (/O2+ICF 236–246), /Od 2913–2952 of ~3158.
+  - JsonCpp 1.9.6 → 1.9.7 → 1.9.8 (C++): /O2 272–273 of 300 (/O2+ICF 260 of 271), /Od 1592–1626 of ~1670,
+    /LTCG 215 of 243, PGO 327–329 of ~360.
   - Hook-repair loop (`corpus/hooks`): 8 Detours hooks across 3 versions, /O2 and /Od, 0 wrong relocations,
     with trial runs, patterns, the header and proposed shims checked.
   - Run locally: `pwsh corpus/build-fixtures.ps1 -Score`, `pwsh corpus/build-projects.ps1 -Score` and
@@ -264,7 +272,7 @@ What's new:
 
 | Goal | State |
 |---|---|
-| 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2 and yaml-cpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
+| 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2, yaml-cpp and JsonCpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
 | 2. Verify it's the same function | Done for symbol-less binaries, including C++ vtable slots (code-tables check); with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
 | 3. Adapt hooks (signature/struct changes) | Proposals for added register parameters (prototype + shim) and for changed struct layouts (PDB types: changes, new definition, offsets) |
 | 4. Behavioral tests from the old version | Done: scenario trace diff and trial runs (M4), and recorded per-call test cases replayed by emulation, with struct layouts translated by field name, globals placed by name and the UCRT's printing imports answered from the recording; on the hook loop 22 of 24 resolved hook repairs replay, all passing |
@@ -299,9 +307,11 @@ What's new:
    (−11, catches nothing), requiring a matched non-thunk neighbour in common (catches 3; −25). Case 1 needs
    signatures (a PDB, or better inferred ones), so PGO can't be unskipped by a matching rule; /LTCG could be, for
    −25 correct plus a rule for case 2 that would fit one case.
-3. **Calibrate the C++ guesses:** the table-slot anchor count, the code-tables fail threshold and the wrapper
-   callers threshold are single-project guesses; recheck them with `pbeta-corpus sweep`-style grids once a third
-   C++ project exists.
+3. **Calibrate the C++ guesses: done 2026-11-08** with a third C++ project (JsonCpp, 0 wrong on its first run).
+   Swept one at a time over all 64 corpus variants: `TABLE_MIN_ANCHORS` 1 is calibrated (0 and 1 identical, 2
+   costs 108 correct, 3 costs 198, 0 wrong throughout); `WRAPPER_MIN_DIRECT_CALLERS` 2 is calibrated (1 adds 27
+   correct and one wrong match in zstd, 3 costs 12). The code-tables fail threshold (now the named constant
+   `CODE_TABLE_FAIL_AGREEING`) stays a guess: the check never fails on the corpus at 1, 2 or 3.
 4. **Widen replay further** (§7.3): globals and the UCRT's printing imports are done. Open: more import models
    (`memcpy`/`memset`/`strlen`-style CRT imports, heap allocation), globals reached only through pointers,
    pointers inside structs (depth > 1), a target whose callee changed telling "this function changed" from "a

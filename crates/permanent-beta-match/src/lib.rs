@@ -997,8 +997,10 @@ impl Matcher for CallSequenceMatcher {
 /// - Rechecked against the final matches: if the tables no longer correspond, the pair is vetoed.
 pub struct TableSlotMatcher;
 
-/// Matched slots that must agree before two tables are taken to correspond. [Guess]: uniqueness and the
-/// identical-code requirement carry most of the weight.
+/// Matched slots that must agree before two tables are taken to correspond. [Calibrated] 2026-11-08 over 64
+/// corpus variants (three C++ projects: TinyXML-2, yaml-cpp, JsonCpp): 0 and 1 give identical results with 0
+/// wrong (uniqueness and the identical-code requirement carry the weight); 2 costs 108 correct, 3 costs 198.
+/// 1 is the conservative end of that plateau.
 pub const TABLE_MIN_ANCHORS: usize = 1;
 
 impl TableSlotMatcher {
@@ -1198,7 +1200,8 @@ pub const SIM_MIN_SIZE: u32 = 16;
 /// Anchors shared by more functions than this are ignored when picking candidates. [Guess]
 pub const SIM_MAX_BUCKET: usize = 32;
 /// Matched callers that must call a candidate directly (and none its would-be wrapper) before the wrapper rule
-/// is overruled. [Guess]: 1 let zstd 1.5.6's BIT_reloadDStreamFast through as a wrong match.
+/// is overruled. [Calibrated] 2026-11-08 over 64 corpus variants: 1 adds 27 correct but lets zstd 1.5.6's
+/// BIT_reloadDStreamFast through as a wrong match; 3 costs 12 correct. 2 is the lowest value with 0 wrong.
 pub const WRAPPER_MIN_DIRECT_CALLERS: usize = 2;
 /// How close an unmatched caller's score must be to the best before the old function may have been inlined into
 /// it. [Guess]: any score at all cost up to 31 correct per zstd variant; TinyXML-2's case is 0.07 behind.
