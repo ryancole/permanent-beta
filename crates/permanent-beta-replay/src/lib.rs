@@ -28,7 +28,7 @@ pub mod translate;
 pub use image::Image;
 pub use recording::{LoadedCase, LoadedGlobal, LoadedImport, LoadedRegion, Recording};
 
-use permanent_beta_model::{GlobalVar, HarnessSpec, Rva, TypeLayout, ValueType};
+use permanent_beta_model::{CaptureKind, GlobalVar, HarnessSpec, Rva, TypeLayout, ValueType};
 use serde::Serialize;
 use std::ops::Range;
 
@@ -108,6 +108,11 @@ struct Prepared {
     compare: Vec<Range<usize>>,
     label: String,
     translated: bool,
+    /// Reached through a pointer ([`CaptureKind::Pointee`]): something replay doesn't model (an import's
+    /// internals, another thread) may have written it during the recorded call, so a difference there makes the
+    /// case inconclusive, not a fail.
+    #[cfg_attr(not(feature = "emulator"), allow(dead_code))]
+    pointee: bool,
 }
 
 fn prepare(
@@ -123,8 +128,13 @@ fn prepare(
             before: r.before.clone(),
             expected_after: r.after.clone(),
             compare: std::iter::once(0..r.before.len()).collect(),
-            label: format!("arg{arg}"),
+            label: if r.region.kind == CaptureKind::Pointee {
+                format!("memory at {:#x} (through arg{arg})", r.region.address.0)
+            } else {
+                format!("arg{arg}")
+            },
             translated: false,
+            pointee: r.region.kind == CaptureKind::Pointee,
         };
         if let Some(name) = &r.region.layout {
             p.label = format!("arg{arg} ({name})");
@@ -396,11 +406,21 @@ fn compare(
         ValueType::Void => {}
         ValueType::Unknown => return CaseOutcome::inconclusive("unknown return type"),
     }
+    let mut pointee_difference = None;
     for (p, got) in prepared.iter().zip(&ran.regions) {
         for r in &p.compare {
             if let Some(i) =
                 first_difference(p.address, &p.expected_after, got, r.clone(), &mut pointers)
             {
+                if p.pointee {
+                    pointee_difference.get_or_insert_with(|| {
+                        format!(
+                            "{} byte {i:#x} is {:#04x} after the call, recorded {:#04x}: memory reached through a pointer, which an import or another thread may have written",
+                            p.label, got[i], p.expected_after[i]
+                        )
+                    });
+                    continue;
+                }
                 return CaseOutcome::Fail {
                     detail: format!(
                         "{} byte {i:#x} is {:#04x} after the call, expected {:#04x}",
@@ -434,6 +454,9 @@ fn compare(
         if g.before != g.expected_after {
             compared.push(format!("global {} writes", g.name));
         }
+    }
+    if let Some(why) = pointee_difference {
+        return CaseOutcome::inconclusive(why);
     }
     if let Some((expected, got)) = pointers.seen {
         return CaseOutcome::inconclusive(format!(

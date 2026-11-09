@@ -152,6 +152,8 @@ fn spec(ret: ValueType) -> HarnessSpec {
         build: BuildId("old".into()),
         max_cases: 8,
         import_memory: true,
+        pointer_depth: 0,
+        pointers: Vec::new(),
         hooks: vec![HookRecordSpec {
             name: "f".into(),
             rva: Rva(0x1000),
@@ -737,4 +739,93 @@ fn without_the_image_size_an_image_address_still_fails() {
         &NewBuild::default(),
     );
     assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
+}
+
+/// `c` with its region made a pointee (memory reached through a pointer inside an argument's memory).
+#[cfg(feature = "emulator")]
+fn as_pointee(mut c: LoadedCase) -> LoadedCase {
+    c.regions[0].region.kind = CaptureKind::Pointee;
+    c.case.regions[0].kind = CaptureKind::Pointee;
+    c
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_pointee_that_matches_passes() {
+    let after = [0, 0, 0, 0, 9, 0, 0, 0];
+    let c = as_pointee(case(STRUCT_AT, 9, 0, Some((&[0; 8], &after, None))));
+    let o = replay(
+        &image(),
+        Rva(u64::from(WRITE_FIELD)),
+        &spec(ValueType::Void),
+        &c,
+        &NewBuild::default(),
+    );
+    assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_pointee_that_differs_is_inconclusive_not_a_fail() {
+    // An import's internals or another thread may have written memory reached through a pointer during the
+    // recorded call (the hook loop's snprintf did, through stale bytes in format_receipt's buffer). Not a pass.
+    let after = [0, 0, 0, 0, 9, 0, 0, 0];
+    let c = as_pointee(case(STRUCT_AT, 5, 0, Some((&[0; 8], &after, None))));
+    let o = replay(
+        &image(),
+        Rva(u64::from(WRITE_FIELD)),
+        &spec(ValueType::Void),
+        &c,
+        &NewBuild::default(),
+    );
+    match o {
+        CaseOutcome::Inconclusive { reason } => {
+            assert!(reason.contains("through a pointer"), "{reason}")
+        }
+        other => panic!("expected inconclusive, got {other:?}"),
+    }
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn an_argument_difference_fails_even_when_a_pointee_differs_first() {
+    // Negative: a pointee listed first differs (inconclusive on its own), then the argument's memory differs for
+    // real: the case fails.
+    let blob = BlobRef(format!("{:064x}", 0));
+    let pointee_at = STRUCT_AT + 0x100;
+    let mut c = case(
+        STRUCT_AT,
+        5,
+        0,
+        Some((&[0; 8], &[0, 0, 0, 0, 9, 0, 0, 0], None)),
+    );
+    let region = Region {
+        arg: 0,
+        address: Word(pointee_at),
+        size: 8,
+        kind: CaptureKind::Pointee,
+        layout: None,
+        before: blob.clone(),
+        after: blob,
+    };
+    c.case.regions.insert(0, region.clone());
+    c.regions.insert(
+        0,
+        LoadedRegion {
+            region,
+            before: vec![0; 8],
+            after: vec![1; 8],
+        },
+    );
+    let o = replay(
+        &image(),
+        Rva(u64::from(WRITE_FIELD)),
+        &spec(ValueType::Void),
+        &c,
+        &NewBuild::default(),
+    );
+    match o {
+        CaseOutcome::Fail { detail } => assert!(detail.starts_with("arg0"), "{detail}"),
+        other => panic!("expected a fail, got {other:?}"),
+    }
 }

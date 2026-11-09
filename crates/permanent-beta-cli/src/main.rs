@@ -267,6 +267,10 @@ enum Command {
         /// reaches the recording through an import; replay can't stand in for imports that read memory).
         #[arg(long)]
         no_import_memory: bool,
+        /// Pointers to follow from the arguments' memory (design §7.3): heap blocks and buffers a struct points
+        /// to. 0 captures the arguments' memory only.
+        #[arg(long, default_value_t = permanent_beta_engine::permanent_beta_repair::harness::DEFAULT_POINTER_DEPTH)]
+        pointer_depth: u32,
     },
     /// Replay the cases recorded at an old RVA on a function of a new binary, by emulation (design §7.3). Exit
     /// code 0 if every replayable case matches (and one could be replayed), 1 if one differs or none could.
@@ -453,6 +457,7 @@ fn run(cli: Cli) -> Result<u8> {
             max_cases,
             redact,
             no_import_memory,
+            pointer_depth,
         } => cmd_harness_spec(
             &hooks,
             &analysis,
@@ -460,6 +465,7 @@ fn run(cli: Cli) -> Result<u8> {
             max_cases,
             &redact,
             !no_import_memory,
+            pointer_depth,
         ),
         Command::TraceDiff {
             old,
@@ -596,6 +602,7 @@ fn cmd_harness_spec(
     max_cases: u32,
     redact: &[String],
     import_memory: bool,
+    pointer_depth: u32,
 ) -> Result<u8> {
     use permanent_beta_engine::permanent_beta_repair::harness;
     use permanent_beta_model::CaptureKind;
@@ -603,6 +610,7 @@ fn cmd_harness_spec(
     let build = export::load(analysis)?;
     let mut spec = harness::spec(&manifest, &build, max_cases);
     spec.import_memory = import_memory;
+    spec.pointer_depth = pointer_depth;
     for r in redact {
         harness::redact(&mut spec, r).map_err(anyhow::Error::msg)?;
     }

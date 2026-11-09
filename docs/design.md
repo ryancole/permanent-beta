@@ -662,7 +662,32 @@ different number of times without behaving differently. Recorded calls to them a
 recorded sequence. Up to 16 MiB each **[Guess]**. `memcmp` and `strcmp` aren't: only their result's sign is
 defined, and a caller may keep the value.
 
-Not recorded: memory behind pointers inside structs (depth 1 only), the globals a callee reached only through a
+**Pointers inside structs (2026-11-08).** The recorder follows pointers by type, `pointer_depth` levels from the
+arguments (`pbeta harness-spec --pointer-depth`, default 2 **[Guess]**; 0 turns it off, and a spec without the key
+means 0). The spec lists every pointer field of its layouts (`[[pointer]]`), adding the layouts of the structs they
+point to (up to 64 **[Guess]**). A field pointing to a struct captures it with its layout (replay translates it by
+field name like an argument's) and is followed further; one pointing to bytes or `void` captures the whole heap
+block when the pointer is a process-heap block's start (up to 256 KiB **[Guess]**; also when the block is larger
+than the struct: an array), otherwise 4 KiB **[Guess]**, and isn't followed. Function pointers, types without a
+layout, pointers into the image and the recorder's own stack frames aren't followed. Regions never overlap (bytes
+are cut short, an overlapping struct isn't captured), at most 4 MiB per case **[Guess]**. Redacted memory is never
+captured; a pointee freed during the call is left out. These regions are `CaptureKind::Pointee`.
+
+A first version scanned every word of captured memory for pointers, and the hook loop caught a false failure:
+`format_receipt`'s output buffer starts out as stale bytes, which led to heap memory that `snprintf`'s internals
+wrote during the recorded call. Hence types, not bytes. And for the same reason a **difference in pointee memory is
+inconclusive, not a fail**: an import's internals or another thread may have written it during the recorded call.
+A pass still needs every byte to match; arguments' memory, globals and the return value still fail on a
+difference.
+
+Measured with `corpus/replay-measure.ps1`: **7 of 16** zlib hooks replay (was 1), 0 fail, on o2 v1.3 → v1.3.1
+and od v1.2.13 → v1.3: `crc32_z`, `deflate`, `longest_match` (32 of 32 cases), `fill_window`, `compress_block`,
+`updatewindow`, `send_tree`. The rest stop on old-image addresses in recorded memory (`tree_desc_s.stat_desc`
+pointing at static tables; `inflate` calling through a recorded function pointer), on a stack buffer larger than
+the 4 KiB block (`next_in` into minigzip's 16 KiB buffer), and on memory `inflate`'s state reaches through fields
+the layouts don't type. The hook loop is unchanged: 22 of 24, the negative control failing.
+
+Not recorded: memory behind pointers inside structs beyond `pointer_depth` or without a typed field, the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is
 inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks.
 

@@ -368,11 +368,20 @@ struct RecHook {
     std::vector<RecGlobal> globals;
 };
 
+// A pointer field of a layout (`[[pointer]]`), and the layout it points to ("" for bytes).
+struct RecPointer {
+    std::string layout, target;
+    unsigned long long offset = 0;
+};
+
 struct RecSpec {
     std::string build;
     unsigned max_cases = 32;
     bool import_memory = true;
+    unsigned pointer_depth = 0;
     std::vector<RecHook> hooks;
+    std::vector<RecPointer> pointers;
+    std::vector<std::pair<std::string, unsigned long long>> layouts;  // name, size
 };
 
 // The TOML subset `pbeta harness-spec` writes: top-level keys, [[hook]], [[hook.arg]], [[hook.global]]; other
@@ -408,6 +417,16 @@ bool parse_spec(const char* path, RecSpec& spec) {
             }
             continue;
         }
+        if (line == "[[pointer]]") {
+            spec.pointers.emplace_back();
+            section = "pointer";
+            continue;
+        }
+        if (line == "[[layout]]") {
+            spec.layouts.emplace_back();
+            section = "layout";
+            continue;
+        }
         if (line[0] == '[') {
             section = "other";
             continue;
@@ -426,6 +445,8 @@ bool parse_spec(const char* path, RecSpec& spec) {
                 spec.max_cases = static_cast<unsigned>(n);
             } else if (key == "import_memory") {
                 spec.import_memory = value != "false";
+            } else if (key == "pointer_depth") {
+                spec.pointer_depth = static_cast<unsigned>(n);
             }
         } else if (section == "hook") {
             RecHook& h = spec.hooks.back();
@@ -454,6 +475,21 @@ bool parse_spec(const char* path, RecSpec& spec) {
                 a.max = n;
             } else if (key == "redact") {
                 a.redact = value == "true";
+            }
+        } else if (section == "pointer") {
+            RecPointer& p = spec.pointers.back();
+            if (key == "layout") {
+                p.layout = value;
+            } else if (key == "offset") {
+                p.offset = n;
+            } else if (key == "target") {
+                p.target = value;
+            }
+        } else if (section == "layout") {
+            if (key == "name") {
+                spec.layouts.back().first = value;
+            } else if (key == "size") {
+                spec.layouts.back().second = n;
             }
         } else if (section == "global") {
             RecGlobal& g = spec.hooks.back().globals.back();
@@ -732,6 +768,132 @@ std::string import_json(const ImportRecord& r) {
     return out + "]}";
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Pointees (design §7.3, the spec's `pointer_depth` and `[[pointer]]` fields)
+//
+// Real code keeps its state behind pointers: zlib's z_stream points to its state, which points to the window.
+// Pointers are followed by type, never by guessing from bytes (an output buffer's stale bytes look like pointers):
+// only the pointer fields the spec lists for a captured struct's layout. A field pointing to a struct with a layout
+// captures that struct (with its layout, so replay can translate it) and is followed further, pointer_depth levels
+// in all; a field pointing to bytes captures the whole heap block when it's a process-heap block's start (up to
+// kPointeeHeapMax; also when it's larger than the struct, an array), otherwise kPointeeBlock bytes, and isn't
+// followed. Pointers into the image or the recorder's own stack frames aren't followed. A region never overlaps an
+// argument's region or another pointee (a bytes region is cut short where one begins; a struct that would overlap
+// isn't captured), within kPointeeCaseMax bytes per case. Memory overlapping a redacted argument is never
+// captured. A pointee unreadable after the call (freed) is left out of the case: a replay that touches it is
+// inconclusive.
+
+constexpr size_t kPointeeBlock = 4096;           // behind a byte pointer that isn't a heap block's start [Guess]
+constexpr size_t kPointeeHeapMax = 256 * 1024;   // of one heap block [Guess]
+constexpr size_t kPointeeCaseMax = 4 << 20;      // per case [Guess]
+unsigned g_pointer_depth = 0;
+std::vector<RecPointer> g_pointers;
+std::vector<std::pair<std::string, unsigned long long>> g_layout_sizes;
+
+unsigned long long layout_size(const std::string& name) {
+    for (const auto& l : g_layout_sizes) {
+        if (l.first == name) {
+            return l.second;
+        }
+    }
+    return 0;
+}
+
+// The size of the process-heap block starting at p, or 0 if p isn't one.
+size_t heap_block_size(unsigned long long p) {
+    HANDLE heap = GetProcessHeap();
+    __try {
+        if (!HeapValidate(heap, 0, reinterpret_cast<LPCVOID>(p))) {
+            return 0;
+        }
+        SIZE_T n = HeapSize(heap, 0, reinterpret_cast<LPCVOID>(p));
+        return n == static_cast<SIZE_T>(-1) ? 0 : static_cast<size_t>(n);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+void capture_pointees(RecordCall* call, const RecordFrame* f) {
+    if (g_pointer_depth == 0 || g_pointers.empty()) {
+        return;
+    }
+    ULONG_PTR stack_low = 0, stack_high = 0;
+    GetCurrentThreadStackLimits(&stack_low, &stack_high);
+    // Captured intervals, [start, end): the arguments' regions, then every pointee.
+    std::vector<std::pair<unsigned long long, unsigned long long>> taken;
+    std::vector<size_t> frontier;  // regions (indices into call->regions) with a layout, to follow
+    for (size_t i = 0; i < call->regions.size(); i++) {
+        const PendingRegion& r = call->regions[i];
+        taken.emplace_back(r.address, r.address + r.before.size());
+        if (!r.layout.empty()) {
+            frontier.push_back(i);
+        }
+    }
+    size_t total = 0;
+    for (unsigned depth = 0; depth < g_pointer_depth && !frontier.empty(); depth++) {
+        std::vector<size_t> next;
+        for (size_t index : frontier) {
+            // Copied: push_back below may move the region.
+            const PendingRegion from = call->regions[index];
+            for (const RecPointer& field : g_pointers) {
+                if (field.layout != from.layout || field.offset + 8 > from.before.size()) {
+                    continue;
+                }
+                unsigned long long p = 0;
+                std::memcpy(&p, from.before.data() + field.offset, 8);
+                if (p < 0x10000 || p > 0x7fffffffffffull || (p >= g_image_base && p < g_image_base + g_image_size) ||
+                    (p >= stack_low && p < f->entry_rsp)) {
+                    continue;  // null, not a user address, the image, or the recorder's own frames
+                }
+                bool inside = false;
+                unsigned long long limit = ~0ull;  // where the next captured interval begins
+                for (const auto& t : taken) {
+                    inside = inside || (p >= t.first && p < t.second);
+                    if (t.first > p && t.first < limit) {
+                        limit = t.first;
+                    }
+                }
+                if (inside) {
+                    continue;
+                }
+                size_t block = heap_block_size(p);
+                unsigned long long typed = field.target.empty() ? 0 : layout_size(field.target);
+                bool is_struct = typed != 0 && (block == 0 || block <= typed);
+                size_t want = is_struct ? static_cast<size_t>(typed)
+                                        : (block ? (block < kPointeeHeapMax ? block : kPointeeHeapMax) : kPointeeBlock);
+                if (limit - p < want) {
+                    if (is_struct) {
+                        continue;  // would overlap captured memory
+                    }
+                    want = static_cast<size_t>(limit - p);
+                }
+                if (total + want > kPointeeCaseMax) {
+                    return;
+                }
+                std::vector<unsigned char> got = readable_prefix(p, want);
+                if (got.empty() || (is_struct && got.size() != want) || overlaps_redacted(p, got.size())) {
+                    continue;
+                }
+                total += got.size();
+                taken.emplace_back(p, p + got.size());
+                PendingRegion r;
+                r.arg = from.arg;
+                r.address = p;
+                r.kind = "pointee";
+                if (is_struct) {
+                    r.layout = field.target;
+                }
+                r.before = std::move(got);
+                call->regions.push_back(std::move(r));
+                if (is_struct) {
+                    next.push_back(call->regions.size() - 1);
+                }
+            }
+        }
+        frontier = std::move(next);
+    }
+}
+
 void finish_case(RecordCall* call, const RecordFrame* f) {
     RecSite& site = *call->site;
     // Everything but the id, for spotting identical calls.
@@ -753,7 +915,10 @@ void finish_case(RecordCall* call, const RecordFrame* f) {
         r.after.resize(r.before.size());
         if (!r.before.empty() &&
             !safe_copy(r.after.data(), reinterpret_cast<const void*>(r.address), r.after.size())) {
-            return;  // freed during the call: the case can't say what was written
+            if (r.kind == "pointee") {
+                continue;  // freed during the call: left out, so a replay that touches it is inconclusive
+            }
+            return;  // an argument's memory freed during the call: the case can't say what was written
         }
         body += std::string(first ? "" : ",") + "{\"arg\":" + num(r.arg) + ",\"address\":" + word(r.address) +
                 ",\"size\":" + num(static_cast<long long>(r.before.size())) + ",\"kind\":" + quoted(r.kind) +
@@ -876,6 +1041,7 @@ extern "C" void* pbeta_record_before(RecordFrame* f) {
         }
         call->globals.push_back(std::move(pg));
     }
+    capture_pointees(call, f);
     f->call = call;
     t_active.push_back(call);
     return site.real;
@@ -1012,6 +1178,9 @@ void record_all(const std::string& build) {
     g_rec_build = build;
     g_rec_max = spec.max_cases;
     g_import_memory = spec.import_memory;
+    g_pointer_depth = spec.pointer_depth;
+    g_pointers = spec.pointers;
+    g_layout_sizes = spec.layouts;
     g_image_base = reinterpret_cast<unsigned long long>(GetModuleHandleW(nullptr));
     {
         auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_image_base);

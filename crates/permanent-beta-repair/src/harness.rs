@@ -27,7 +27,7 @@
 use crate::prototype::Prototype;
 use permanent_beta_model::{
     AnalysisExport, ArgSlot, ArgSpec, CaptureKind, GlobalSpec, HarnessSpec, HookManifest,
-    HookRecordSpec, Rva, SkippedHook, ValueType,
+    HookRecordSpec, PointerField, Rva, SkippedHook, ValueType,
 };
 use std::collections::BTreeSet;
 
@@ -36,6 +36,9 @@ const UNCAPTURED_GLOBALS: [&str; 1] = ["__security_cookie"];
 
 /// Default cap on distinct cases per hook. **[Guess]**
 pub const DEFAULT_MAX_CASES: u32 = 32;
+/// Pointers followed from the arguments' memory by default: a stream struct, its state, the state's buffers
+/// (zlib's `z_stream` → `internal_state` → window). **[Guess]**
+pub const DEFAULT_POINTER_DEPTH: u32 = 2;
 /// Most bytes captured for a C string. **[Guess]**
 pub const CSTRING_MAX: u64 = 4096;
 /// Most bytes captured for a buffer sized by another argument. **[Guess]**
@@ -48,9 +51,11 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
         build: build.build.id.clone(),
         max_cases,
         import_memory: true,
+        pointer_depth: DEFAULT_POINTER_DEPTH,
         hooks: Vec::new(),
         skipped: Vec::new(),
         layouts: Vec::new(),
+        pointers: Vec::new(),
     };
     for hook in &manifest.hooks {
         let skip = |reason: String| SkippedHook {
@@ -141,6 +146,7 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
             globals: reachable_globals(build, rva),
         });
     }
+    add_pointer_fields(&mut out, build);
     out
 }
 
@@ -173,6 +179,46 @@ fn reachable_globals(build: &AnalysisExport, rva: Rva) -> Vec<GlobalSpec> {
     }
     out.sort_by_key(|g| g.rva);
     out
+}
+
+/// Most struct layouts the spec follows pointers into. **[Guess]**
+pub const MAX_POINTER_LAYOUTS: usize = 64;
+
+/// The pointer fields of every layout in the spec, adding the layouts of the structs they point to (and theirs,
+/// up to [`MAX_POINTER_LAYOUTS`]). A field pointing to bytes, a scalar or `void` is followed but not scanned; a
+/// function pointer or a type without a layout isn't followed.
+fn add_pointer_fields(out: &mut HarnessSpec, build: &AnalysisExport) {
+    let mut i = 0;
+    while i < out.layouts.len() {
+        let layout = out.layouts[i].clone();
+        i += 1;
+        for f in &layout.fields {
+            if f.size != 8 || f.bits.is_some() || value_type(&f.ty) != ValueType::Pointer {
+                continue;
+            }
+            let target = match pointee(&f.ty) {
+                Pointee::Bytes { .. } | Pointee::Scalar(_) => None,
+                Pointee::Named(name) => match build.type_layout(&name) {
+                    Some(t) => {
+                        if out.layout(&name).is_none() {
+                            if out.layouts.len() >= MAX_POINTER_LAYOUTS {
+                                continue;
+                            }
+                            out.layouts.push(t.clone());
+                        }
+                        Some(name)
+                    }
+                    None => continue,
+                },
+                Pointee::Unknown => continue,
+            };
+            out.pointers.push(PointerField {
+                layout: layout.name.clone(),
+                offset: f.offset,
+                target,
+            });
+        }
+    }
 }
 
 /// Marks `what` as never recorded: `hook.param` (a parameter by name or 0-based position) or `hook.global` (a
@@ -573,13 +619,18 @@ mod tests {
         let text = toml::to_string_pretty(&s).unwrap();
         assert!(text.contains("redact = true"), "{text}");
         assert!(text.contains("import_memory = true"), "{text}");
+        let depth = format!("pointer_depth = {DEFAULT_POINTER_DEPTH}\n");
+        assert!(text.contains(&depth), "{text}");
         assert_eq!(toml::from_str::<HarnessSpec>(&text).unwrap(), s);
-        // A spec written before redaction existed reads as nothing redacted, import memory on.
+        // A spec written before redaction and pointer depth existed reads as nothing redacted, import memory on,
+        // no pointers followed (what those recorders did).
         let old = text
             .replace("redact = true", "redact = false")
-            .replace("import_memory = true\n", "");
+            .replace("import_memory = true\n", "")
+            .replace(&depth, "");
         let parsed: HarnessSpec = toml::from_str(&old).unwrap();
         assert!(parsed.import_memory);
+        assert_eq!(parsed.pointer_depth, 0);
         assert!(
             parsed
                 .hooks
@@ -595,5 +646,67 @@ mod tests {
         assert!(text.contains("[[hook.arg]]"), "{text}");
         assert!(text.contains("slot = \"rcx\""), "{text}");
         assert_eq!(toml::from_str::<HarnessSpec>(&text).unwrap(), s);
+    }
+
+    #[test]
+    fn pointer_fields_are_followed_by_type() {
+        let f = |name: &str, offset, size, ty: &str| FieldLayout {
+            name: name.into(),
+            offset,
+            size,
+            ty: ty.into(),
+            bits: None,
+        };
+        let stream = TypeLayout {
+            name: "stream".into(),
+            size: 0x30,
+            union: false,
+            fields: vec![
+                f("next_in", 0, 8, "unsigned char*"),
+                f("avail", 8, 4, "unsigned int"),
+                f("state", 0x10, 8, "struct state*"),
+                f("alloc", 0x18, 8, "void* (*)(void*, unsigned int)"),
+                f("other", 0x20, 8, "struct nobody*"),
+                f("opaque", 0x28, 8, "void*"),
+            ],
+        };
+        let state = TypeLayout {
+            name: "state".into(),
+            size: 0x10,
+            union: false,
+            fields: vec![
+                f("strm", 0, 8, "struct stream*"),
+                f("window", 8, 8, "unsigned char*"),
+            ],
+        };
+        let m = manifest(&[(
+            "deflate",
+            Some("int deflate(stream* strm, int flush)"),
+            "v1",
+        )]);
+        let s = spec(&m, &export("v1", vec![stream, state]), DEFAULT_MAX_CASES);
+        let names: Vec<&str> = s.layouts.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["stream", "state"],
+            "the state is reached through a pointer field"
+        );
+        let got: Vec<(&str, u64, Option<&str>)> = s
+            .pointers
+            .iter()
+            .map(|p| (p.layout.as_str(), p.offset, p.target.as_deref()))
+            .collect();
+        // Negative: the function pointer and the pointer to a type without a layout aren't followed; a byte
+        // buffer and void* are followed as bytes (captured, never scanned for more pointers).
+        assert_eq!(
+            got,
+            [
+                ("stream", 0, None),
+                ("stream", 0x10, Some("state")),
+                ("stream", 0x28, None),
+                ("state", 0, Some("stream")),
+                ("state", 8, None),
+            ]
+        );
     }
 }

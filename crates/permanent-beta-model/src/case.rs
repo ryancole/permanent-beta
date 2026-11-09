@@ -34,6 +34,16 @@ pub struct HarnessSpec {
     /// (a formatted string passed to `printf`), and replay can't stand in for imports that read memory.
     #[serde(default = "default_true")]
     pub import_memory: bool,
+    /// How many pointers deep the recorder follows from the arguments' memory: each 8-byte word in captured memory
+    /// that points to readable memory outside the image leads to a [`CaptureKind::Pointee`] region (a whole heap
+    /// block, or a fixed block from the pointer), and so on, this many times. 0 captures the arguments' memory
+    /// only (and is what a spec without the key means). Redacted memory is never captured.
+    #[serde(default)]
+    pub pointer_depth: u32,
+    /// The pointer fields of the layouts below, which the recorder follows (`pointer_depth`): only these, so a
+    /// buffer's stale bytes are never taken for pointers.
+    #[serde(rename = "pointer", default, skip_serializing_if = "Vec::is_empty")]
+    pub pointers: Vec<PointerField>,
     #[serde(rename = "hook", default)]
     pub hooks: Vec<HookRecordSpec>,
     /// Hooks that can't be recorded, with the reason (no prototype, one that can't be parsed, no RVA).
@@ -137,6 +147,21 @@ pub enum CaptureKind {
     Cstring,
     /// As many bytes as the argument in `len_slot` says, up to `max` (a buffer and its length).
     Sized,
+    /// Memory reached through a pointer inside captured memory (`HarnessSpec::pointer_depth`): untyped bytes, never
+    /// overlapping an argument's region. Its `arg` is the argument it was reached from.
+    Pointee,
+}
+
+/// A pointer field of a struct the recorder captures, and what it points to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerField {
+    /// The struct (a layout of the spec) and the field's offset in it.
+    pub layout: String,
+    pub offset: u64,
+    /// The struct it points to (a layout of the spec, captured with that layout and followed further), or none:
+    /// bytes, captured but not followed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// How a value travels (integer register, vector register) and its width in bytes.

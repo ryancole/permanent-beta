@@ -4,7 +4,7 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **replay measured on real code, and a false failure fixed** (design §7.3).
+Latest work: **replay measured on real code, a false failure fixed, and pointers inside structs** (design §7.3).
 - `corpus/replay-measure.ps1` (local): 16 zlib functions hooked in minigzip, compress and decompress recorded in one
   release, every case replayed on the same function (by symbol, so every pair is correct) in the next.
 - It found a **false failure**: `_tr_init` stores `&static_l_desc` in its state, and the new build's address isn't
@@ -14,9 +14,16 @@ Latest work: **replay measured on real code, and a false failure fixed** (design
   reverse fail; a real difference next to an address fails; recordings without the size compare as before).
 - `memcpy`, `memmove`, `memset` and `strlen` are now executed by replay rather than answered from the recording,
   and recorded calls to them are skipped (a build may inline them).
-- Result: 1 of 16 zlib hooks replays (`crc32_z`, 18/18), 0 fail, o2 v1.3 → v1.3.1 and od v1.2.13 → v1.3. The rest
-  stop on memory behind pointers inside structs (depth > 1), which is the next step. Hook loop unchanged: 22 of 24
-  replay, all passing, the negative control failing (o2 and od).
+- **Pointers inside structs**, followed by type: the spec lists each layout's pointer fields (`[[pointer]]`), and
+  the recorder captures what they point to, `pointer_depth` levels deep (default 2; `--pointer-depth 0` turns it
+  off). A struct is captured with its layout (translated by field name on replay), bytes as a whole heap block or 4
+  KiB. Limits are guesses (256 KiB per block, 4 MiB per case). A difference in that memory is inconclusive, not a
+  fail (an import's internals may have written it; the hook loop's `format_receipt` showed it with a first,
+  untyped version, which also made 2 of its passes inconclusive).
+- Result: **7 of 16** zlib hooks replay (was 1), 0 fail, o2 v1.3 → v1.3.1 and od v1.2.13 → v1.3. Left: old-image
+  addresses in recorded memory (static tables, function pointers), stack buffers over 4 KiB, untyped fields. Hook
+  loop unchanged: 22 of 24 replay, all passing, the negative control failing (o2 and od). Smart App Control
+  (Windows) blocked new emulator builds mid-session and is now off on this machine.
 
 Before that: **M6, the Ghidra review extension: built and verified end to end in the GUI** (design §11.3).
 - Evaluated first: Version Tracking ports markup between versions, with correlator scores and no independent
@@ -368,9 +375,9 @@ What's new:
    correct and one wrong match in zstd, 3 costs 12). The code-tables fail threshold (now the named constant
    `CODE_TABLE_FAIL_AGREEING`) stays a guess: the check never fails on the corpus at 1, 2 or 3.
 4. **Widen replay further** (§7.3): globals, the UCRT's printing imports and the CRT memory functions are done,
-   and replay is measured on zlib (`corpus/replay-measure.ps1`: 1 of 16 hooks replays). Next: pointers inside
-   structs (depth > 1), which stops all the others; then heap allocation, globals reached only through pointers,
-   old-image addresses in recorded memory (mapping them needs the old build's symbols), a target whose callee
+   pointers inside structs are followed by type, and replay is measured on zlib (`corpus/replay-measure.ps1`: 7 of
+   16 hooks replay). Next: old-image addresses in recorded memory (static tables, function pointers; mapping them
+   needs the old build's symbols), stack buffers over 4 KiB, heap allocation, globals reached only through pointers, a target whose callee
    changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
