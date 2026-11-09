@@ -277,9 +277,15 @@ What's new:
 
 ## Suggested next steps
 
-1. **zstd's `noDict_*` family stays with review:** prompt context made the AI guess wrongly inside it (design
-   §8). If anything, matching could separate `_0`/`_1` by which unmatched new callee (`ZSTD_match4Found_cmov` /
-   `_branch`) gets matched first; the AI shouldn't.
+1. **zstd's `noDict_*` family stays with review (examined 2026-11-08, closed).** In each 1.5.6 → 1.5.7 variant
+   the 8 `fast_noDict_*` and 4 `doubleFast_noDict_*` functions are ambiguous; match length (4–7) already
+   separates, only `_0`/`_1` don't. The new `_0` and `_1` are identical but for calling `ZSTD_match4Found_branch`
+   or `_cmov`. The old ones inlined that choice as `neg`/`sbb` code (no `cmov`), so the helpers have no old
+   counterpart to match first, and the old pair differs by about 5 instructions of ~2000 bytes: a best guess.
+   The only other evidence is call position (both dispatchers call the 8 in the same order in both builds), which
+   the call-sequence pass already attaches as the right suggestion. Position isn't adopted: the dispatcher's own
+   code changed, and a branch swap or block reorder would pair them backwards. The AI guessed wrongly inside this
+   family too (design §8).
 2. **Swapped inlining (zstd under /LTCG and PGO): examined 2026-11-08, left skipped.** The answer key is right
    in all three cases. (1) PGO 1.5.6 → 1.5.7: `ZSTD_entropyCompressSeqStore`'s body moved into a new
    `_wExtLitBuffer` (12 parameters, reordered) and the old function became an inlined wrapper. The survivor has
