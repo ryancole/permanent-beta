@@ -126,3 +126,48 @@ fn a_hook_on_a_function_whose_struct_changed_goes_to_review_with_the_new_offsets
         assert_eq!(item.struct_proposals, reader.struct_proposals, "[{flags}]");
     }
 }
+
+/// The fixture analyzed without its PDB: no names, no types, only the native analyzer.
+fn analyze_native(flags: &str, version: &str) -> AnalysisExport {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/fixtures/basic")
+        .join(flags)
+        .join(version);
+    NativePeAnalyzer
+        .analyze(&dir.join("fixture.exe"))
+        .unwrap_or_else(|e| panic!("{e}. Run `pwsh corpus/build-fixtures.ps1` first."))
+}
+
+#[test]
+#[ignore = "needs the fixture builds (pwsh corpus/build-fixtures.ps1)"]
+fn without_a_pdb_the_moved_field_is_inferred_from_the_accesses() {
+    for flags in FLAG_SETS {
+        // The PDB only says where the hook is in v1, as the hook author would know it.
+        let located = analyze(flags, "v1");
+        let (old, new) = (analyze_native(flags, "v1"), analyze_native(flags, "v2"));
+        assert!(old.types.is_empty() && new.types.is_empty());
+        let mut h = hook(
+            "pb_struct_reader",
+            "int pb_struct_reader(const Config* c)",
+            &located,
+        );
+        h.target.build = old.build.id.clone();
+        let manifest = HookManifest { hooks: vec![h] };
+        let r = Engine::with_defaults().repair(&manifest, &old, &new);
+        let reader = &r.repairs[0];
+        let [p] = reader.struct_proposals.as_slice() else {
+            panic!(
+                "[{flags}] {:?} {:?}",
+                reader.action, reader.struct_proposals
+            );
+        };
+        assert_eq!(p.name, "Config", "[{flags}]");
+        assert_eq!(
+            p.changes,
+            ["offset 0x4 -> 0x8 (4 bytes, 1 access)"],
+            "[{flags}]"
+        );
+        assert!(p.basis.is_some(), "[{flags}]");
+        assert!(!reader.is_resolved(), "[{flags}] {:?}", reader.action);
+    }
+}

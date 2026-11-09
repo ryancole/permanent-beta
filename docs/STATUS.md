@@ -4,7 +4,14 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **the hook-prototype check, heap allocation in replay, and buffers** (design §6.1, §7.3).
+Latest work: **struct changes inferred without a PDB** (design §7.2). The analyzer records each function's
+accesses through its pointer arguments; repair aligns the old function's and the candidate's and proposes the
+offsets that moved (`offset 0x4 -> 0x8`), as a guess for review. Measured on zlib, Lua and zstd with the PDB types
+hidden: 255 proposals on 3987 function pairs, 249 on structs that really changed; moves 1087 right, 11 wrong (a
+baseline gate). S5 of the `basic` fixture gets the PDB's answer at every flag set. The measurement also caught an
+analyzer crash on `sub rsp, rax` frames, fixed before it shipped. Hook loop and fixture scorecards unchanged.
+
+Before that: **the hook-prototype check, heap allocation in replay, and buffers** (design §6.1, §7.3).
 - **Prototype check** (§6.1, the last planned check), in repair: a verified match whose new function reads a
   register argument the hook's prototype doesn't declare, or reads one in the other register class, goes to review
   (`signature_changed`); only what the old function didn't already do counts. Hook loop outcomes identical.
@@ -358,7 +365,7 @@ What's new:
 |---|---|
 | 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2, yaml-cpp and JsonCpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
 | 2. Verify it's the same function | Done for symbol-less binaries, including C++ vtable slots (code-tables check); with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
-| 3. Adapt hooks (signature/struct changes) | Prototype + shim proposals: from both builds' PDB signatures any parameter change (added incl. stack, removed, reordered, retyped), otherwise added register parameters; changed struct layouts from PDB types (changes, new definition, offsets). Not without a PDB: struct changes, stack/removed parameters |
+| 3. Adapt hooks (signature/struct changes) | Prototype + shim proposals: from both builds' PDB signatures any parameter change (added incl. stack, removed, reordered, retyped), otherwise added register parameters; changed struct layouts from PDB types (changes, new definition, offsets). Without a PDB: struct field moves inferred from accesses (a guess for review); stack/removed parameters need PDBs |
 | 4. Behavioral tests from the old version | Done: scenario trace diff and trial runs (M4), and recorded per-call test cases replayed by emulation, with struct layouts translated by field name, globals placed by name and the UCRT's printing imports answered from the recording; on the hook loop 22 of 24 resolved hook repairs replay, all passing |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
@@ -402,7 +409,7 @@ What's new:
    16 hooks replay, 13 now with heap allocation and buffers). Next: pointer-to-scalar arguments that are arrays
    (`inflate_table`), `realloc`, globals reached only through pointers, a target whose callee
    changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
-   translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
+   translation outside unit tests.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
    Still to choose: contributor terms (DCO or CLA).
 6. **Outside the code:** talk to legacy-software teams (design §14).

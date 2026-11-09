@@ -24,7 +24,7 @@ use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
     OpKind, Register,
 };
-use permanent_beta_model::{ArgClass, CodeTable, EntryInfo, FunctionFeatures, Rva};
+use permanent_beta_model::{ArgAccess, ArgClass, CodeTable, EntryInfo, FunctionFeatures, Rva};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -529,6 +529,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         signature: None,
         inferred_args: (!insns.is_empty()).then_some(args.0),
         inferred_arg_classes: args.1,
+        arg_accesses: arg_accesses(&insns),
         entry: (!insns.is_empty()).then(|| entry_info(&insns, start_va, &internal_targets)),
         pseudocode: None,
         mnemonic_counts,
@@ -553,6 +554,153 @@ fn entry_info(insns: &[Instruction], start_va: u64, internal_targets: &BTreeSet<
             FlowControl::UnconditionalBranch | FlowControl::IndirectBranch
         ),
     }
+}
+
+/// Most argument accesses recorded per function. **[Guess]**
+const MAX_ARG_ACCESSES: usize = 64;
+/// Offsets above this aren't taken for struct fields. **[Guess]**
+const MAX_FIELD_OFFSET: i64 = 0x10000;
+
+/// Memory accessed through the pointer arguments (design §7.2): a linear scan that follows each argument register
+/// through register copies (`mov rbx, rcx`) and across calls in callee-saved registers, and drops it when the
+/// register is written otherwise. Accesses with an index register, or a negative or very large offset, aren't
+/// recorded. A heuristic: it ignores control flow, so a register reused on another path can be misread; struct
+/// changes inferred from it are proposals for review, never applied.
+fn arg_accesses(insns: &[Instruction]) -> Vec<ArgAccess> {
+    const VOLATILE: [Register; 7] = [
+        Register::RAX,
+        Register::RCX,
+        Register::RDX,
+        Register::R8,
+        Register::R9,
+        Register::R10,
+        Register::R11,
+    ];
+    let mut tracked: Vec<(Register, u8)> = ARG_SLOTS
+        .iter()
+        .enumerate()
+        .map(|(i, &(g, _))| (g, i as u8))
+        .collect();
+    let slot_of = |tracked: &[(Register, u8)], r: Register| {
+        tracked.iter().find(|(t, _)| *t == r).map(|(_, s)| *s)
+    };
+    let mut out = Vec::new();
+    // Stack slots holding an argument: (offset from the entry rsp, slot).
+    let mut spilled: Vec<(i64, u8)> = Vec::new();
+    let mut rsp_delta: i64 = 0;
+    let mut factory = InstructionInfoFactory::new();
+    for ins in insns {
+        if out.len() >= MAX_ARG_ACCESSES {
+            break;
+        }
+        let info = factory.info(ins);
+        for m in info.used_memory() {
+            let base = m.base().full_register();
+            let Some(slot) = slot_of(&tracked, base) else {
+                continue;
+            };
+            let size = m.memory_size().size();
+            let offset = m.displacement() as i64;
+            if m.index() != Register::None
+                || size == 0
+                || size > 16
+                || !(0..MAX_FIELD_OFFSET).contains(&offset)
+            {
+                continue;
+            }
+            let write = matches!(
+                m.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            );
+            out.push(ArgAccess {
+                slot,
+                offset: offset as u32,
+                size: size as u8,
+                write,
+            });
+        }
+        // A 64-bit register copy carries the argument along, and so does a stack slot (/Od spills arguments to
+        // their home slots and reloads them): slots are keyed by their offset from the entry rsp.
+        let stack_key = |ins: &Instruction, rsp_delta: i64| {
+            (ins.memory_base() == Register::RSP && ins.memory_index() == Register::None)
+                .then(|| ins.memory_displacement64() as i64 - rsp_delta)
+        };
+        let is_mov64 = ins.mnemonic() == Mnemonic::Mov && ins.op_count() == 2;
+        let mut copied = (is_mov64
+            && ins.op0_kind() == OpKind::Register
+            && ins.op1_kind() == OpKind::Register
+            && ins.op0_register().size() == 8)
+            .then(|| slot_of(&tracked, ins.op1_register()))
+            .flatten();
+        if is_mov64 && ins.op0_kind() == OpKind::Memory && ins.op1_kind() == OpKind::Register {
+            if let Some(key) = stack_key(ins, rsp_delta) {
+                spilled.retain(|(k, _)| *k != key);
+                if ins.op1_register().size() == 8
+                    && let Some(slot) = slot_of(&tracked, ins.op1_register())
+                {
+                    spilled.push((key, slot));
+                }
+            }
+        }
+        if is_mov64
+            && ins.op0_kind() == OpKind::Register
+            && ins.op0_register().size() == 8
+            && ins.op1_kind() == OpKind::Memory
+            && let Some(key) = stack_key(ins, rsp_delta)
+        {
+            copied = spilled.iter().find(|(k, _)| *k == key).map(|(_, s)| *s);
+        }
+        // Where rsp is relative to the entry, for the stack slots.
+        match ins.mnemonic() {
+            Mnemonic::Sub | Mnemonic::Add
+                if ins.op0_kind() == OpKind::Register && ins.op0_register() == Register::RSP =>
+            {
+                if matches!(
+                    ins.op1_kind(),
+                    OpKind::Immediate8
+                        | OpKind::Immediate8to64
+                        | OpKind::Immediate32
+                        | OpKind::Immediate32to64
+                ) {
+                    let imm = ins.immediate(1) as i64;
+                    rsp_delta += if ins.mnemonic() == Mnemonic::Sub {
+                        imm
+                    } else {
+                        -imm
+                    };
+                } else {
+                    // `sub rsp, rax` (a __chkstk frame): rsp is no longer known, nor are the slots.
+                    spilled.clear();
+                }
+            }
+            Mnemonic::Push => rsp_delta += 8,
+            Mnemonic::Pop => rsp_delta -= 8,
+            _ => {}
+        }
+        for used in info.used_registers() {
+            let writes = matches!(
+                used.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            );
+            if writes {
+                let full = used.register().full_register();
+                tracked.retain(|(t, _)| *t != full);
+            }
+        }
+        if let Some(slot) = copied {
+            tracked.push((ins.op0_register(), slot));
+        }
+        if ins.flow_control() == FlowControl::Call {
+            tracked.retain(|(t, _)| !VOLATILE.contains(t));
+        }
+    }
+    out
 }
 
 /// Win64 argument registers by slot: (integer register, vector register).
@@ -1004,6 +1152,83 @@ mod tests {
         // call +0; mov eax, ecx; ret  → rcx after a call is a clobbered value, not a parameter
         let f = analyze(&[0xe8, 0x00, 0x00, 0x00, 0x00, 0x8b, 0xc1, 0xc3]);
         assert_eq!(f.inferred_args, Some(0));
+    }
+
+    fn accesses(code: &[u8]) -> Vec<(u8, u32, u8, bool)> {
+        analyze(code)
+            .arg_accesses
+            .iter()
+            .map(|a| (a.slot, a.offset, a.size, a.write))
+            .collect()
+    }
+
+    #[test]
+    fn accesses_through_pointer_arguments_are_recorded() {
+        // mov eax, [rcx+4]; add eax, eax; add eax, [rcx]; mov [rdx+0x10], eax; ret
+        assert_eq!(
+            accesses(&[
+                0x8b, 0x41, 0x04, 0x01, 0xc0, 0x03, 0x01, 0x89, 0x42, 0x10, 0xc3
+            ]),
+            [(0, 4, 4, false), (0, 0, 4, false), (1, 0x10, 4, true)]
+        );
+    }
+
+    #[test]
+    fn an_argument_kept_in_a_callee_saved_register_survives_a_call() {
+        // mov rbx, rcx; call $+5; mov eax, [rbx+8]; mov ecx, [rcx+8]; ret
+        // rbx carries slot 0 across the call; rcx is volatile, so its access after the call isn't recorded.
+        assert_eq!(
+            accesses(&[
+                0x48, 0x8b, 0xd9, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x8b, 0x43, 0x08, 0x8b, 0x49, 0x08,
+                0xc3
+            ]),
+            [(0, 8, 4, false)]
+        );
+    }
+
+    #[test]
+    fn an_argument_spilled_to_its_home_slot_is_followed() {
+        // /Od: mov [rsp+8], rcx; sub rsp, 28h; mov rax, [rsp+30h]; mov eax, [rax+4]; add rsp, 28h; ret
+        assert_eq!(
+            accesses(&[
+                0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x44, 0x24, 0x30,
+                0x8b, 0x40, 0x04, 0x48, 0x83, 0xc4, 0x28, 0xc3
+            ]),
+            [(0, 4, 4, false)]
+        );
+        // Negative: the reload is from another slot ([rsp+38h] is the second home slot, never written).
+        assert_eq!(
+            accesses(&[
+                0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x44, 0x24, 0x38,
+                0x8b, 0x40, 0x04, 0x48, 0x83, 0xc4, 0x28, 0xc3
+            ]),
+            []
+        );
+    }
+
+    #[test]
+    fn a_register_rsp_adjustment_doesnt_crash_the_scan() {
+        // mov [rsp+8], rcx; sub rsp, rax (a __chkstk frame); mov rax, [rsp+8]; mov eax, [rax+4]; ret
+        // Negative: after rsp moves by an unknown amount, the slot isn't trusted.
+        assert_eq!(
+            accesses(&[
+                0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x2b, 0xe0, 0x48, 0x8b, 0x44, 0x24, 0x08, 0x8b,
+                0x40, 0x04, 0xc3
+            ]),
+            []
+        );
+    }
+
+    #[test]
+    fn an_overwritten_argument_or_an_indexed_access_isnt_a_field() {
+        // Negative: mov rcx, [rcx] (a read of field 0, then rcx is something else); mov eax, [rcx+8];
+        // mov eax, [rdx+r8*4]; ret
+        assert_eq!(
+            accesses(&[
+                0x48, 0x8b, 0x09, 0x8b, 0x41, 0x08, 0x42, 0x8b, 0x04, 0x82, 0xc3
+            ]),
+            [(0, 0, 8, false)]
+        );
     }
 
     #[test]

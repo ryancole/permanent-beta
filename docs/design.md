@@ -525,6 +525,22 @@ Generators (all output goes to review unless purely mechanical):
   hook's prototype names (`const Config* c` → `Config`) differs between the builds, the hook goes to review
   (`struct_layout_changed`; a verified match stays the item's candidate, no mapping is recorded) with what
   changed, the new C definition with offsets, and `offsetof` constants with `static_assert`s for the detour.
+- **Struct changes without a PDB** (2026-11-08, inferred): the native analyzer records each function's accesses
+  through its pointer arguments (`arg_accesses`: argument slot, offset, size, read or write; the argument followed
+  through register copies, callee-saved registers across calls and its stack home slot, a heuristic linear scan).
+  For each struct-pointer parameter of the hook's prototype that the PDBs don't lay out in both builds, the old
+  function's and the candidate's (the verified one, or the only one in review: a moved field is why its code
+  differs) accesses are aligned in order on size and read/write, and an offset whose aligned accesses all moved to
+  one new offset is proposed: `offset 0x4 -> 0x8 (4 bytes, 1 access)`, with `basis` saying it's a guess. No
+  proposal when an offset's accesses disagree, when offsets don't keep their order (an inserted or removed field
+  shifts the ones after it; a crossing is reordered code), when under half of either side aligns **[Guess]**, or
+  when nothing moved. Like the PDB proposal it sends the hook to review (`struct_layout_changed`). On the `basic`
+  fixture's S5 without its PDB it proposes `0x4 -> 0x8` at /O2, /O2+ICF, /Od and /LTCG, the PDB's answer.
+  Measured on zlib, Lua and zstd (o2, od) with the PDB types hidden and the PDBs judging
+  (`crates/permanent-beta-corpus/tests/struct_inference.rs`): 3987 function pairs with a struct-pointer parameter;
+  255 proposals, 249 on structs whose layout did change (6 false alarms, 0.15% of pairs); moves 1087 right, 11
+  wrong (single accesses paired with another field), 16 on renamed fields that matching by name can't judge. The
+  test is a baseline gate (at most 11 wrong).
   Fields correspond **by name**, the PDB being the evidence: a renamed field shows as removed plus added, never as
   a guess. A hook already in review gets the proposal attached. No layouts on both sides (no PDB) means no
   proposal. **[Validate]** feasibility without PDBs (Ghidra types).

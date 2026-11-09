@@ -181,6 +181,11 @@ pub struct FunctionFeatures {
     /// (integer or vector) the code read. Empty if the analyzer didn't compute it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inferred_arg_classes: Vec<ArgClass>,
+    /// Memory the function reads or writes through its pointer arguments, in address order: where a struct's
+    /// fields are, as the code sees them (design §7.2, struct changes without a PDB). Empty if the analyzer
+    /// didn't compute it. Optional, so adding it didn't change the schema version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_accesses: Vec<ArgAccess>,
     /// How often each instruction mnemonic occurs (e.g. `"Mov" → 12`). Order-free, so it survives small
     /// edits and reordering; used by similarity matching. Empty if the analyzer didn't compute it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -193,6 +198,18 @@ pub struct FunctionFeatures {
     /// the schema version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pseudocode: Option<String>,
+}
+
+/// One access through a pointer argument: `[rcx+0x8]`, 4 bytes, read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgAccess {
+    /// The argument slot (0–3: rcx, rdx, r8, r9) whose pointer the address is based on.
+    pub slot: u8,
+    pub offset: u32,
+    /// Bytes accessed.
+    pub size: u8,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write: bool,
 }
 
 /// Which register of a Win64 argument slot carries a value: rcx/rdx/r8/r9 or xmm0–3.

@@ -8,8 +8,13 @@
 
 use crate::prototype::Prototype;
 use permanent_beta_model::{
-    AnalysisExport, FieldLayout, HookSpec, StructLayoutProposal, TypeLayout,
+    AnalysisExport, ArgAccess, FieldLayout, FunctionFeatures, HookSpec, StructLayoutProposal,
+    TypeLayout,
 };
+
+/// The aligned accesses must cover at least this share of both functions' accesses through the argument, or the
+/// code changed too much to tell a moved field from new code. **[Guess]**
+pub const MIN_ALIGNED_SHARE: f64 = 0.5;
 
 /// The struct names a prototype's parameters and return type use: `const Config* c` → `Config`, `struct
 /// Order*` → `Order`. Built-in types come out too; callers keep only names a PDB defines.
@@ -105,9 +110,180 @@ pub fn propose(
                 changes,
                 definition: definition(n),
                 offsets: offsets(n),
+                basis: None,
             })
         })
         .collect()
+}
+
+/// Struct changes inferred without PDB types (design §7.2): for each struct-pointer parameter of the hook's
+/// prototype (the first four, passed in registers) whose struct isn't in both builds' PDB types, the old and new
+/// function's accesses through it (`FunctionFeatures::arg_accesses`) are aligned in order on (size, read or
+/// write), and every offset whose aligned accesses all moved to one new offset is a proposed move: `offset 0x4 ->
+/// 0x8`. No proposal when an offset's accesses disagree, the offsets don't keep their order (a field inserted or
+/// removed shifts the ones after it; a crossing is reordered code), the aligned accesses cover less than
+/// [`MIN_ALIGNED_SHARE`] of either side, or nothing moved. Field names and sizes are
+/// unknown, so it says offsets only; it's a guess for review (`basis`), never applied.
+pub fn infer(
+    hook: &HookSpec,
+    old_build: &AnalysisExport,
+    new_build: &AnalysisExport,
+    old: &FunctionFeatures,
+    new: &FunctionFeatures,
+) -> Vec<StructLayoutProposal> {
+    let Some(proto) = hook.prototype.as_deref().and_then(Prototype::parse) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (slot, p) in proto.params.iter().enumerate().take(4) {
+        if p.ty.matches('*').count() != 1 {
+            continue;
+        }
+        let Some(name) = base_name(&p.ty) else {
+            continue;
+        };
+        let builtin = matches!(
+            name.as_str(),
+            "void"
+                | "char"
+                | "short"
+                | "int"
+                | "long"
+                | "float"
+                | "double"
+                | "bool"
+                | "unsigned"
+                | "signed"
+                | "wchar_t"
+                | "size_t"
+                | "uint8_t"
+                | "int8_t"
+                | "uint16_t"
+                | "int16_t"
+                | "uint32_t"
+                | "int32_t"
+                | "uint64_t"
+                | "int64_t"
+                | "BYTE"
+                | "WORD"
+                | "DWORD"
+                | "__int64"
+        );
+        if builtin
+            || (old_build.type_layout(&name).is_some() && new_build.type_layout(&name).is_some())
+        {
+            continue; // not a struct, or the PDB knows it exactly (`propose`)
+        }
+        let through = |f: &FunctionFeatures| -> Vec<ArgAccess> {
+            f.arg_accesses
+                .iter()
+                .filter(|a| usize::from(a.slot) == slot)
+                .copied()
+                .collect()
+        };
+        let (a, b) = (through(old), through(new));
+        if let Some(moves) = moved_offsets(&a, &b) {
+            let changes: Vec<String> = moves
+                .iter()
+                .map(|(o, n, size, count)| {
+                    format!(
+                        "offset {o:#x} -> {n:#x} ({size} bytes, {count} access{})",
+                        if *count == 1 { "" } else { "es" }
+                    )
+                })
+                .collect();
+            let constants: String = moves
+                .iter()
+                .map(|(o, n, ..)| {
+                    format!(
+                        "constexpr size_t {}_at_{o:#x} = {n:#x};  // was {o:#x}\n",
+                        ident(&name)
+                    )
+                })
+                .collect();
+            out.push(StructLayoutProposal {
+                name: name.clone(),
+                old_size: 0,
+                new_size: 0,
+                definition: format!(
+                    "// {name}: inferred from where the old and new function access it through argument {} (no PDB \
+                     types): field names and sizes are unknown.\n{}",
+                    slot + 1,
+                    changes
+                        .iter()
+                        .map(|c| format!("// {c}\n"))
+                        .collect::<String>()
+                ),
+                offsets: constants,
+                changes,
+                basis: Some(format!(
+                    "inferred from the functions' accesses through argument {} (no PDB layout of {name} in both \
+                     builds): a guess for review",
+                    slot + 1
+                )),
+            });
+        }
+    }
+    out
+}
+
+/// Aligns two access sequences (longest common subsequence on size and read/write) and returns the offsets that
+/// moved: (old, new, size, aligned accesses). `None` when they disagree, cover too little, or nothing moved.
+fn moved_offsets(a: &[ArgAccess], b: &[ArgAccess]) -> Option<Vec<(u32, u32, u8, usize)>> {
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let same = |x: &ArgAccess, y: &ArgAccess| x.size == y.size && x.write == y.write;
+    let (n, m) = (a.len(), b.len());
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if same(&a[i], &b[j]) {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if same(&a[i], &b[j]) && lcs[i][j] == lcs[i + 1][j + 1] + 1 {
+            pairs.push((a[i], b[j]));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    let share = |k: usize| pairs.len() as f64 / k as f64;
+    if share(n) < MIN_ALIGNED_SHARE || share(m) < MIN_ALIGNED_SHARE {
+        return None;
+    }
+    // Old offset -> (new offset, size, count); every aligned access of an old offset must agree.
+    let mut map: std::collections::BTreeMap<u32, (u32, u8, usize)> = Default::default();
+    for (x, y) in &pairs {
+        let e = map.entry(x.offset).or_insert((y.offset, x.size, 0));
+        if e.0 != y.offset {
+            return None;
+        }
+        e.2 += 1;
+    }
+    // A field inserted or removed shifts the fields after it but keeps their order: across every aligned pair,
+    // moved or not, a later old offset must have a later new offset. A crossing (two fields swapping, one moving
+    // past another, two landing on one) is the compiler reordering accesses, not a layout change.
+    let order: Vec<u32> = map.values().map(|v| v.0).collect();
+    if order.windows(2).any(|w| w[0] >= w[1]) {
+        return None;
+    }
+    let moves: Vec<(u32, u32, u8, usize)> = map
+        .into_iter()
+        .filter(|(o, (n, ..))| o != n)
+        .map(|(o, (n, size, count))| (o, n, size, count))
+        .collect();
+    (!moves.is_empty()).then_some(moves)
 }
 
 /// A C identifier for a (possibly qualified) type name: `tinyxml2::XMLNode` → `tinyxml2_XMLNode`.
@@ -333,6 +509,124 @@ mod tests {
         assert_eq!(
             changes(&v1(), &renamed),
             vec!["b: removed (was at 0x4)", "bee: added at 0x4"]
+        );
+    }
+
+    /// A function reading `accesses` (slot, offset, size, write).
+    fn reads(accesses: &[(u8, u32, u8, bool)]) -> FunctionFeatures {
+        let mut f: FunctionFeatures =
+            serde_json::from_value(serde_json::json!({ "rva": 0x10, "size": 32 })).unwrap();
+        f.arg_accesses = accesses
+            .iter()
+            .map(|&(slot, offset, size, write)| ArgAccess {
+                slot,
+                offset,
+                size,
+                write,
+            })
+            .collect();
+        f
+    }
+
+    #[test]
+    fn a_moved_field_is_inferred_from_the_accesses() {
+        // S5: `return c->b * 2 + c->a`, with b moving from 0x4 to 0x8.
+        let (o, n) = (export("a", vec![]), export("b", vec![]));
+        let p = infer(
+            &hook("int reader(const Config* c)"),
+            &o,
+            &n,
+            &reads(&[(0, 4, 4, false), (0, 0, 4, false)]),
+            &reads(&[(0, 8, 4, false), (0, 0, 4, false)]),
+        );
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].name, "Config");
+        assert_eq!(p[0].changes, ["offset 0x4 -> 0x8 (4 bytes, 1 access)"]);
+        assert!(p[0].basis.as_deref().unwrap().contains("guess"));
+        assert!(
+            p[0].offsets.contains("Config_at_0x4 = 0x8"),
+            "{}",
+            p[0].offsets
+        );
+    }
+
+    #[test]
+    fn no_inference_when_the_accesses_disagree_or_say_nothing() {
+        let (o, n) = (export("a", vec![]), export("b", vec![]));
+        let h = hook("int reader(const Config* c)");
+        let infer = |old: &[(u8, u32, u8, bool)], new: &[(u8, u32, u8, bool)]| {
+            infer(&h, &o, &n, &reads(old), &reads(new))
+        };
+        // Negative: nothing moved.
+        assert!(infer(&[(0, 4, 4, false)], &[(0, 4, 4, false)]).is_empty());
+        // Negative: one old offset's accesses go to two new offsets.
+        assert!(
+            infer(
+                &[(0, 4, 4, false), (0, 4, 4, false)],
+                &[(0, 8, 4, false), (0, 12, 4, false)]
+            )
+            .is_empty()
+        );
+        // Negative: two old offsets land on one new offset.
+        assert!(
+            infer(
+                &[(0, 0, 4, false), (0, 4, 4, false)],
+                &[(0, 8, 4, false), (0, 8, 4, false)]
+            )
+            .is_empty()
+        );
+        // Negative: the code changed too much (one of four accesses aligns).
+        assert!(
+            infer(
+                &[
+                    (0, 4, 4, false),
+                    (0, 8, 8, false),
+                    (0, 16, 8, false),
+                    (0, 24, 8, false)
+                ],
+                &[
+                    (0, 8, 4, false),
+                    (0, 8, 2, true),
+                    (0, 16, 1, false),
+                    (0, 24, 2, false)
+                ]
+            )
+            .is_empty()
+        );
+        // Negative: accesses through another argument, or a pointer to a built-in type.
+        assert!(infer(&[(1, 4, 4, false)], &[(1, 8, 4, false)]).is_empty());
+        let int = hook("int reader(const int* c)");
+        let o2 = export("a", vec![]);
+        assert!(
+            super::infer(
+                &int,
+                &o2,
+                &n,
+                &reads(&[(0, 4, 4, false)]),
+                &reads(&[(0, 8, 4, false)])
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_inference_when_both_pdbs_know_the_struct() {
+        let config = TypeLayout {
+            name: "Config".into(),
+            size: 8,
+            union: false,
+            fields: vec![field("a", 0), field("b", 4)],
+        };
+        let (o, n) = (export("a", vec![config.clone()]), export("b", vec![config]));
+        assert!(
+            infer(
+                &hook("int reader(const Config* c)"),
+                &o,
+                &n,
+                &reads(&[(0, 4, 4, false)]),
+                &reads(&[(0, 8, 4, false)])
+            )
+            .is_empty()
         );
     }
 }

@@ -216,6 +216,7 @@ mod tests {
             mnemonic_counts: Default::default(),
             pseudocode: None,
             entry: None,
+            arg_accesses: vec![],
         }
     }
 

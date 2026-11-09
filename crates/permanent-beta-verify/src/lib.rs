@@ -653,6 +653,7 @@ mod tests {
                     })
                     .collect(),
             }),
+            arg_accesses: vec![],
         }
     }
 

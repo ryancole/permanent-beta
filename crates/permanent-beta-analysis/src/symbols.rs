@@ -305,6 +305,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
                 mnemonic_counts: Default::default(),
                 pseudocode: None,
                 entry: None,
+                arg_accesses: vec![],
             }
         })
         .collect();

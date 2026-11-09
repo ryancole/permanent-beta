@@ -332,6 +332,19 @@ impl Engine {
         // goes to review, since the detour may read the wrong fields. The function match itself still stands
         // as the review item's candidate; no mapping is recorded until a reviewer accepts it.
         repair.struct_proposals = layout::propose(hook, pair.old, new);
+        // Without both builds' PDB types: offsets inferred from where the candidate accesses the struct, against
+        // the old function (a guess for review; design §7.2). The verified candidate, or the only one in review
+        // (a moved field is why its code differs); never one of several.
+        let only = match (&repair.verification, repair.alternatives.as_slice()) {
+            (Some(v), _) => Some(v.candidate.new),
+            (None, [a]) => Some(a.candidate.new),
+            _ => None,
+        };
+        if repair.struct_proposals.is_empty()
+            && let (Some(o), Some(n)) = (old_fn, only.and_then(|r| new.function(r)))
+        {
+            repair.struct_proposals = layout::infer(hook, pair.old, new, o, n);
+        }
         if !repair.struct_proposals.is_empty() {
             let what: Vec<String> = repair
                 .struct_proposals
@@ -460,6 +473,7 @@ mod tests {
             signature: None,
             mnemonic_counts: Default::default(),
             pseudocode: None,
+            arg_accesses: vec![],
         }
     }
 

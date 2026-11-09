@@ -85,4 +85,8 @@ pub struct StructLayoutProposal {
     /// `offsetof` constants for the new layout, with `static_assert`s a detour built against the new header can
     /// keep, for code that reads fields by offset.
     pub offsets: String,
+    /// Where the proposal comes from when it isn't both builds' PDB types: inferred from where the old and new
+    /// function access the struct (sizes unknown, field names unknown). A guess for a reviewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
 }
