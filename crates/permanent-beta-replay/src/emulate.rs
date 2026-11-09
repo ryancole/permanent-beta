@@ -127,6 +127,10 @@ fn new_vm() -> Result<icicle_vm::Vm, String> {
     let config = Config {
         // Returns go to our traps, which no call pushed: icicle's shadow stack would flag them.
         enable_shadow_stack: false,
+        // Memory is readable only where something was placed or written (INIT): a heap block replay hands out
+        // becomes readable byte by byte as the function writes it, so reading what it never wrote is
+        // inconclusive, not garbage. Everything else is granted INIT with its read permission.
+        track_uninitialized: true,
         ..Config::from_target_triple("x86_64-none")
     };
     icicle_vm::build_with_path(&config, &processors)
@@ -202,14 +206,37 @@ fn reg(vm: &icicle_vm::Vm, name: &str) -> Result<pcode::VarNode, String> {
 
 fn read_mem(vm: &mut icicle_vm::Vm, address: u64, len: usize) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    vm.cpu.mem.read_bytes(address, &mut buf, perm::READ).ok()?;
+    vm.cpu
+        .mem
+        .read_bytes(address, &mut buf, perm::READ | perm::INIT)
+        .ok()?;
     Some(buf)
 }
 
 /// The candidate's import call as the stand-ins see it: argument registers, stack arguments above the return
-/// address, and memory it may read.
+/// address, and memory it may read: only memory something put there (`exact`: the recorded memory, the globals,
+/// the image, the stack, handed-out heap blocks), never the zeros around recorded regions that let vectorized
+/// code over-read: an executed `memcpy` would take them for data.
 struct EmuView<'v> {
     vm: RefCell<&'v mut icicle_vm::Vm>,
+    exact: &'v [Range<u64>],
+}
+
+/// Whether `ranges` cover every byte of `want`.
+fn covered(ranges: &[Range<u64>], want: Range<u64>) -> bool {
+    let mut at = want.start;
+    while at < want.end {
+        match ranges
+            .iter()
+            .filter(|r| r.contains(&at))
+            .map(|r| r.end)
+            .max()
+        {
+            Some(end) => at = end,
+            None => return false,
+        }
+    }
+    true
 }
 
 impl CallView for EmuView<'_> {
@@ -227,6 +254,9 @@ impl CallView for EmuView<'_> {
     }
 
     fn read(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+        if !covered(self.exact, address..address.checked_add(len as u64)?) {
+            return None;
+        }
         read_mem(&mut self.vm.borrow_mut(), address, len)
     }
 }
@@ -268,7 +298,20 @@ fn map(vm: &mut icicle_vm::Vm, start: u64, len: u64, perm: u8, value: u8) -> Res
 
 fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     let image = setup.image;
-    let region_pages = page_ranges(setup.regions);
+    // The recorded heap blocks the stand-ins will hand out, reserved like the recorded memory.
+    let allocations = setup
+        .imports
+        .as_ref()
+        .map(StandIns::allocations)
+        .unwrap_or_default();
+    let reserved: Vec<Placed> = allocations
+        .iter()
+        .map(|r| Placed {
+            address: r.start,
+            bytes: vec![0; (r.end - r.start) as usize],
+        })
+        .collect();
+    let region_pages = page_ranges(&[setup.regions, &reserved].concat());
     let mut taken = region_pages.clone();
     let base = place(
         image.size(),
@@ -364,28 +407,28 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     let mem = &mut vm.cpu.mem;
     mem.write_bytes(base, &memory, perm::NONE)
         .map_err(mem_err)?;
-    mem.update_perm(base, PAGE.min(image.size()), perm::READ)
+    mem.update_perm(base, PAGE.min(image.size()), perm::READ | perm::INIT)
         .map_err(mem_err)?;
     for s in image.sections.iter().filter(|s| s.size > 0) {
         let p = if s.executable {
-            perm::READ | perm::EXEC
+            perm::READ | perm::EXEC | perm::INIT
         } else if s.writable {
             perm::NONE
         } else {
-            perm::READ
+            perm::READ | perm::INIT
         };
         mem.update_perm(base + u64::from(s.rva), u64::from(s.size), p)
             .map_err(mem_err)?;
     }
     if let Some(r) = image.security_cookie {
-        mem.update_perm(base + u64::from(r), 8, perm::READ)
+        mem.update_perm(base + u64::from(r), 8, perm::READ | perm::INIT)
             .map_err(mem_err)?;
     }
     for g in setup.globals.iter().filter(|g| !g.bytes.is_empty()) {
         mem.update_perm(
             base + g.address,
             g.bytes.len() as u64,
-            perm::READ | perm::WRITE,
+            perm::READ | perm::WRITE | perm::INIT,
         )
         .map_err(mem_err)?;
     }
@@ -393,8 +436,20 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     // Traps (each one a breakpoint), the stack, and the recorded memory: its pages mapped unreadable and zeroed,
     // the 32-byte blocks around each region readable (vectorized over-reads read zeros), the region itself
     // readable and writable.
-    map(vm, traps, page_up(traps_len), perm::READ | perm::EXEC, 0xcc)?;
-    map(vm, stack_base, STACK_SIZE, perm::READ | perm::WRITE, 0)?;
+    map(
+        vm,
+        traps,
+        page_up(traps_len),
+        perm::READ | perm::EXEC | perm::INIT,
+        0xcc,
+    )?;
+    map(
+        vm,
+        stack_base,
+        STACK_SIZE,
+        perm::READ | perm::WRITE | perm::INIT,
+        0,
+    )?;
     for p in &region_pages {
         map(vm, p.start, p.end - p.start, perm::NONE, 0)?;
     }
@@ -402,15 +457,19 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     for r in setup.regions.iter().filter(|r| !r.bytes.is_empty()) {
         let start = r.address & !(SLACK - 1);
         let end = (r.address + r.bytes.len() as u64).div_ceil(SLACK) * SLACK;
-        mem.update_perm(start, end - start, perm::READ)
+        mem.update_perm(start, end - start, perm::READ | perm::INIT)
             .map_err(mem_err)?;
     }
     for (r, bytes) in setup.regions.iter().zip(&region_bytes) {
         if bytes.is_empty() {
             continue;
         }
-        mem.update_perm(r.address, bytes.len() as u64, perm::READ | perm::WRITE)
-            .map_err(mem_err)?;
+        mem.update_perm(
+            r.address,
+            bytes.len() as u64,
+            perm::READ | perm::WRITE | perm::INIT,
+        )
+        .map_err(mem_err)?;
         mem.write_bytes(r.address, bytes, perm::NONE)
             .map_err(mem_err)?;
     }
@@ -459,6 +518,15 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     vm.icount_limit = started_at.saturating_add(MAX_INSTRUCTIONS);
     vm.cpu.write_pc(base + setup.rva);
     let mut stand_ins = setup.imports.clone();
+    let mut heap_blocks: Vec<Range<u64>> = Vec::new();
+    // What an import may read: what something put there (see EmuView).
+    let exact: Vec<Range<u64>> = setup
+        .regions
+        .iter()
+        .map(|r| r.address..r.address + r.bytes.len() as u64)
+        .chain(std::iter::once(base..base + image.size()))
+        .chain(std::iter::once(stack_base..stack_base + STACK_SIZE))
+        .collect();
     let mut import_calls = 0;
     loop {
         match vm.run() {
@@ -473,8 +541,11 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
                     .cloned()
                     .unwrap_or_else(|| "?".into());
                 let effect = {
+                    let mut exact = exact.clone();
+                    exact.extend(heap_blocks.iter().cloned());
                     let view = EmuView {
                         vm: RefCell::new(vm),
+                        exact: &exact,
                     };
                     match imports::execute(&name, &view) {
                         Some(ran) => ran?,
@@ -494,6 +565,38 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
                              the stack"
                         )
                     })?;
+                }
+                match effect.heap {
+                    Some(imports::Heap::Allocate {
+                        address,
+                        size,
+                        zeroed,
+                    }) => {
+                        // Not yet written: unreadable until the function writes it (INIT), unless zeroed.
+                        let p =
+                            perm::READ | perm::WRITE | if zeroed { perm::INIT } else { perm::NONE };
+                        vm.cpu.mem.update_perm(address, size, p).map_err(|_| {
+                            format!("{name}: couldn't hand out {size:#x} bytes at {address:#x}")
+                        })?;
+                        if zeroed {
+                            vm.cpu
+                                .mem
+                                .write_bytes(address, &vec![0; size as usize], perm::NONE)
+                                .map_err(mem_err)?;
+                        }
+                        heap_blocks.push(address..address + size);
+                    }
+                    Some(imports::Heap::Free { address }) => {
+                        // Only a block this run handed out, or recorded memory the function was given.
+                        if let Some(b) = heap_blocks.iter().position(|b| b.start == address) {
+                            let b = heap_blocks.remove(b);
+                            vm.cpu
+                                .mem
+                                .update_perm(b.start, b.end - b.start, perm::NONE)
+                                .map_err(mem_err)?;
+                        }
+                    }
+                    None => {}
                 }
                 let (rax, rsp) = (reg(vm, "RAX")?, reg(vm, "RSP")?);
                 vm.cpu.write_reg(rax, effect.rax);
@@ -555,4 +658,19 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         image: base..base + image.size(),
         rewritten,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::covered;
+
+    #[test]
+    fn imports_read_only_memory_something_put_there() {
+        let exact = [0x1000..0x1010, 0x1010..0x1020, 0x2000..0x2100];
+        assert!(covered(&exact, 0x1008..0x1018), "across adjacent ranges");
+        assert!(covered(&exact, 0x2000..0x2100));
+        // Negative: one byte past a region (where the readable zeros for over-reads are), or a gap.
+        assert!(!covered(&exact, 0x1018..0x1021));
+        assert!(!covered(&exact, 0x1fff..0x2001));
+    }
 }

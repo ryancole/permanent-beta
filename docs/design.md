@@ -700,6 +700,23 @@ can't fail, only be inconclusive. Unmapped old-image addresses are treated as be
 replay (was 7), 0 fail, both steps: `_tr_init`, `build_tree` and `_tr_flush_block` now pass; `inflate` now runs
 through its mapped `zalloc` into `malloc`, which replay doesn't model. Hook loop and fixture scorecards unchanged.
 
+**Heap allocation and buffers (2026-11-08).** `malloc`, `calloc` and `free` are answered from the recording, in
+the recorded order, for the same request: the recorded block at its recorded address (replay reserves every
+recorded block's address before placing anything), writable, and **readable only byte by byte as the function
+writes it** (icicle's uninitialized-memory tracking, now on; everything else is granted readable as before), so
+reading what the function never wrote is inconclusive, not a guess; `calloc` blocks are zeroed and readable; `free`
+of a handed-out block unmaps it. Another size is inconclusive (a struct may have grown). Up to 64 MiB a block
+**[Guess]**. `realloc` isn't modelled.
+The recorder now follows structs by type through every level first and captures byte buffers after (a 64 KiB block
+behind a pointer into the middle of a heap buffer had swallowed zlib's state, which then wasn't followed). A byte
+pointer that doesn't start a heap block captures up to 64 KiB **[Guess]** (was 4 KiB), and one into the caller's
+stack also up to 64 KiB behind it (zlib's `updatewindow` copies from `next_out - copy`). And the CRT functions replay
+runs itself (`memcpy`, ...) read only memory something put there: the recorded memory, the image, the stack, handed-out
+blocks, never the zeros around recorded regions that exist for vectorized over-reads; 6 `deflate` cases had passed
+by copying those zeros, and are inconclusive now. zlib: **13 of 16** hooks replay, 0 fail, both steps: everything
+called but `inflate_table` (its `unsigned short*` arguments capture one element). zlib's structs have the same layout
+in all three releases, so translation still isn't measured on real code. Hook loop and fixture scorecards unchanged.
+
 Not recorded: memory behind pointers inside structs beyond `pointer_depth` or without a typed field, the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is
 inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks.

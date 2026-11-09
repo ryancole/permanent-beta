@@ -27,6 +27,7 @@
 #include <bcrypt.h>
 #include <detours.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -776,14 +777,15 @@ std::string import_json(const ImportRecord& r) {
 // only the pointer fields the spec lists for a captured struct's layout. A field pointing to a struct with a layout
 // captures that struct (with its layout, so replay can translate it) and is followed further, pointer_depth levels
 // in all; a field pointing to bytes captures the whole heap block when it's a process-heap block's start (up to
-// kPointeeHeapMax; also when it's larger than the struct, an array), otherwise kPointeeBlock bytes, and isn't
-// followed. Pointers into the image or the recorder's own stack frames aren't followed. A region never overlaps an
+// kPointeeHeapMax; also when it's larger than the struct, an array), otherwise up to kPointeeBlock readable bytes
+// (a stack buffer, a pointer into a block; behind a pointer into the caller's stack too), and isn't followed.
+// Structs are followed through every level first, buffers captured after, so a buffer never swallows a struct. Pointers into the image or the recorder's own stack frames aren't followed. A region never overlaps an
 // argument's region or another pointee (a bytes region is cut short where one begins; a struct that would overlap
 // isn't captured), within kPointeeCaseMax bytes per case. Memory overlapping a redacted argument is never
 // captured. A pointee unreadable after the call (freed) is left out of the case: a replay that touches it is
 // inconclusive.
 
-constexpr size_t kPointeeBlock = 4096;           // behind a byte pointer that isn't a heap block's start [Guess]
+constexpr size_t kPointeeBlock = 64 * 1024;      // behind a byte pointer that isn't a heap block's start [Guess]
 constexpr size_t kPointeeHeapMax = 256 * 1024;   // of one heap block [Guess]
 constexpr size_t kPointeeCaseMax = 4 << 20;      // per case [Guess]
 unsigned g_pointer_depth = 0;
@@ -821,6 +823,37 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
     GetCurrentThreadStackLimits(&stack_low, &stack_high);
     // Captured intervals, [start, end): the arguments' regions, then every pointee.
     std::vector<std::pair<unsigned long long, unsigned long long>> taken;
+    auto inside = [&](unsigned long long p) {
+        for (const auto& t : taken) {
+            if (p >= t.first && p < t.second) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Where the next captured interval at or after p begins.
+    auto limit_after = [&](unsigned long long p) {
+        unsigned long long limit = ~0ull;
+        for (const auto& t : taken) {
+            if (t.first > p && t.first < limit) {
+                limit = t.first;
+            }
+        }
+        return limit;
+    };
+    size_t total = 0;
+    auto add = [&](int arg, unsigned long long at, std::vector<unsigned char> bytes, const std::string& layout) {
+        total += bytes.size();
+        taken.emplace_back(at, at + bytes.size());
+        PendingRegion r;
+        r.arg = arg;
+        r.address = at;
+        r.kind = "pointee";
+        r.layout = layout;
+        r.before = std::move(bytes);
+        call->regions.push_back(std::move(r));
+        return call->regions.size() - 1;
+    };
     std::vector<size_t> frontier;  // regions (indices into call->regions) with a layout, to follow
     for (size_t i = 0; i < call->regions.size(); i++) {
         const PendingRegion& r = call->regions[i];
@@ -829,11 +862,19 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
             frontier.push_back(i);
         }
     }
-    size_t total = 0;
+    // Byte buffers found on the way, captured after every struct so a buffer never swallows one.
+    struct Bytes {
+        int arg;
+        unsigned long long p;
+        size_t block;  // the heap block's size when p starts one, else 0
+    };
+    std::vector<Bytes> buffers;
+
+    // 1. Structs, by type, pointer_depth levels.
     for (unsigned depth = 0; depth < g_pointer_depth && !frontier.empty(); depth++) {
         std::vector<size_t> next;
         for (size_t index : frontier) {
-            // Copied: push_back below may move the region.
+            // Copied: add() may move the region.
             const PendingRegion from = call->regions[index];
             for (const RecPointer& field : g_pointers) {
                 if (field.layout != from.layout || field.offset + 8 > from.before.size()) {
@@ -842,55 +883,67 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
                 unsigned long long p = 0;
                 std::memcpy(&p, from.before.data() + field.offset, 8);
                 if (p < 0x10000 || p > 0x7fffffffffffull || (p >= g_image_base && p < g_image_base + g_image_size) ||
-                    (p >= stack_low && p < f->entry_rsp)) {
-                    continue;  // null, not a user address, the image, or the recorder's own frames
-                }
-                bool inside = false;
-                unsigned long long limit = ~0ull;  // where the next captured interval begins
-                for (const auto& t : taken) {
-                    inside = inside || (p >= t.first && p < t.second);
-                    if (t.first > p && t.first < limit) {
-                        limit = t.first;
-                    }
-                }
-                if (inside) {
-                    continue;
+                    (p >= stack_low && p < f->entry_rsp) || inside(p)) {
+                    continue;  // null, not a user address, the image, the recorder's own frames, or captured
                 }
                 size_t block = heap_block_size(p);
                 unsigned long long typed = field.target.empty() ? 0 : layout_size(field.target);
-                bool is_struct = typed != 0 && (block == 0 || block <= typed);
-                size_t want = is_struct ? static_cast<size_t>(typed)
-                                        : (block ? (block < kPointeeHeapMax ? block : kPointeeHeapMax) : kPointeeBlock);
-                if (limit - p < want) {
-                    if (is_struct) {
-                        continue;  // would overlap captured memory
-                    }
-                    want = static_cast<size_t>(limit - p);
-                }
-                if (total + want > kPointeeCaseMax) {
-                    return;
-                }
-                std::vector<unsigned char> got = readable_prefix(p, want);
-                if (got.empty() || (is_struct && got.size() != want) || overlaps_redacted(p, got.size())) {
+                if (typed == 0 || (block != 0 && block > typed)) {
+                    buffers.push_back({from.arg, p, block});  // bytes, or an array of structs
                     continue;
                 }
-                total += got.size();
-                taken.emplace_back(p, p + got.size());
-                PendingRegion r;
-                r.arg = from.arg;
-                r.address = p;
-                r.kind = "pointee";
-                if (is_struct) {
-                    r.layout = field.target;
+                if (limit_after(p) - p < typed || total + typed > kPointeeCaseMax) {
+                    continue;  // would overlap captured memory, or over the budget
                 }
-                r.before = std::move(got);
-                call->regions.push_back(std::move(r));
-                if (is_struct) {
-                    next.push_back(call->regions.size() - 1);
+                std::vector<unsigned char> got = readable_prefix(p, static_cast<size_t>(typed));
+                if (got.size() != typed || overlaps_redacted(p, got.size())) {
+                    continue;
                 }
+                next.push_back(add(from.arg, p, std::move(got), field.target));
             }
         }
         frontier = std::move(next);
+    }
+
+    // 2. Byte buffers: whole heap blocks first (their size is known), then kPointeeBlock around a pointer into the
+    // caller's stack (code reads behind such a pointer too: zlib's updatewindow copies from next_out - copy) or
+    // from any other pointer, each cut short where captured memory begins.
+    std::stable_sort(buffers.begin(), buffers.end(), [](const Bytes& x, const Bytes& y) {
+        return (x.block != 0) > (y.block != 0);
+    });
+    for (const Bytes& want : buffers) {
+        unsigned long long p = want.p;
+        if (inside(p)) {
+            continue;
+        }
+        unsigned long long lo = p;
+        unsigned long long hi;
+        if (want.block) {
+            hi = p + (want.block < kPointeeHeapMax ? want.block : kPointeeHeapMax);
+        } else if (p >= f->entry_rsp && p < stack_high) {
+            lo = p - f->entry_rsp < kPointeeBlock ? f->entry_rsp : p - kPointeeBlock;
+            for (const auto& t : taken) {
+                if (t.second <= p && t.second > lo) {
+                    lo = t.second;
+                }
+            }
+            hi = p + kPointeeBlock < stack_high ? p + kPointeeBlock : stack_high;
+        } else {
+            hi = p + kPointeeBlock;
+        }
+        unsigned long long limit = limit_after(p);
+        if (hi > limit) {
+            hi = limit;
+        }
+        if (total + (hi - lo) > kPointeeCaseMax) {
+            return;
+        }
+        // From the pointer forward first: what's behind it on the stack is only added if readable too.
+        std::vector<unsigned char> got = readable_prefix(lo, static_cast<size_t>(hi - lo));
+        if (got.size() <= p - lo || overlaps_redacted(lo, got.size())) {
+            continue;
+        }
+        add(want.arg, lo, std::move(got), "");
     }
 }
 

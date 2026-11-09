@@ -33,10 +33,26 @@ pub const MAX_STRING: usize = 4096;
 pub type Refusal = String;
 
 /// What the stand-in does in place of the import: the value it returns, and the bytes it writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Effect {
     pub rax: u64,
     pub writes: Vec<(u64, Vec<u8>)>,
+    /// A heap block the call allocated or freed.
+    pub heap: Option<Heap>,
+}
+
+/// What a heap call did, for the emulator to mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heap {
+    /// A block at `address`: writable, and readable byte by byte once written (`zeroed`: readable at once, all
+    /// zeros, as `calloc` gives it).
+    Allocate {
+        address: u64,
+        size: u64,
+        zeroed: bool,
+    },
+    /// The block at `address` is gone: touching it is inconclusive.
+    Free { address: u64 },
 }
 
 /// An import call's arguments and the memory they point to.
@@ -87,11 +103,17 @@ pub fn base_name(import: &str) -> &str {
 }
 
 /// The imports [`StandIns`] can answer for.
-pub const MODELLED: [&str; 3] = [
+pub const MODELLED: [&str; 6] = [
     "__acrt_iob_func",
     "__stdio_common_vfprintf",
     "__stdio_common_vsprintf",
+    "malloc",
+    "calloc",
+    "free",
 ];
+
+/// Largest heap block replay hands out. **[Guess]**
+pub const MAX_ALLOCATION: u64 = 1 << 26;
 
 /// CRT functions replay runs itself instead of answering from the recording: their effect follows from their
 /// arguments and the memory they read, which the emulator checks like any other access (unrecorded memory is
@@ -140,6 +162,7 @@ fn execute_named(name: &str, now: &dyn CallView) -> Result<Effect, Refusal> {
                 } else {
                     vec![(dst, bytes)]
                 },
+                heap: None,
             })
         }
         "memset" => {
@@ -151,6 +174,7 @@ fn execute_named(name: &str, now: &dyn CallView) -> Result<Effect, Refusal> {
                 } else {
                     vec![(dst, vec![c; n])]
                 },
+                heap: None,
             })
         }
         "strlen" => {
@@ -164,6 +188,7 @@ fn execute_named(name: &str, now: &dyn CallView) -> Result<Effect, Refusal> {
             Ok(Effect {
                 rax: s.len() as u64,
                 writes: Vec::new(),
+                heap: None,
             })
         }
         _ => unreachable!("EXECUTED lists {name}"),
@@ -212,6 +237,7 @@ impl StandIns {
                 Ok(Effect {
                     rax,
                     writes: Vec::new(),
+                    heap: None,
                 })
             }
             "__stdio_common_vfprintf" => {
@@ -222,6 +248,7 @@ impl StandIns {
                 Ok(Effect {
                     rax,
                     writes: Vec::new(),
+                    heap: None,
                 })
             }
             "__stdio_common_vsprintf" => {
@@ -241,6 +268,7 @@ impl StandIns {
                     return Ok(Effect {
                         rax,
                         writes: Vec::new(),
+                        heap: None,
                     });
                 }
                 let (Some(old_buf), Some(new_buf)) = (r.arg(1), now.arg(1)) else {
@@ -258,10 +286,65 @@ impl StandIns {
                 Ok(Effect {
                     rax,
                     writes: vec![(new_buf, written[..n].to_vec())],
+                    heap: None,
+                })
+            }
+            // Heap calls (design §7.3): the recorded block, at its recorded address, for the same request. Replay
+            // reserves every recorded block's address before placing anything else, so it's free.
+            "malloc" | "calloc" => {
+                let size = if name == "malloc" {
+                    same_value(name, now, &r, 0, 8, "size")?;
+                    arg_of(&r, 0, name)?
+                } else {
+                    same_value(name, now, &r, 0, 8, "count")?;
+                    same_value(name, now, &r, 1, 8, "size")?;
+                    arg_of(&r, 0, name)?
+                        .checked_mul(arg_of(&r, 1, name)?)
+                        .ok_or_else(|| format!("{name}: the size overflows"))?
+                };
+                if size > MAX_ALLOCATION {
+                    return Err(format!(
+                        "{name} of {size} bytes: more than replay hands out"
+                    ));
+                }
+                Ok(Effect {
+                    rax,
+                    writes: Vec::new(),
+                    heap: (rax != 0 && size > 0).then_some(Heap::Allocate {
+                        address: rax,
+                        size,
+                        zeroed: name == "calloc",
+                    }),
+                })
+            }
+            "free" => {
+                same_value(name, now, &r, 0, 8, "pointer")?;
+                let address = arg_of(&r, 0, name)?;
+                Ok(Effect {
+                    rax: 0,
+                    writes: Vec::new(),
+                    heap: (address != 0).then_some(Heap::Free { address }),
                 })
             }
             _ => unreachable!("checked against MODELLED"),
         }
+    }
+
+    /// The blocks the recorded `malloc` and `calloc` calls returned, so the emulator can keep their addresses free.
+    pub fn allocations(&self) -> Vec<std::ops::Range<u64>> {
+        self.calls
+            .iter()
+            .filter_map(|c| {
+                let r = Recorded(c);
+                let size = match base_name(&c.call.import) {
+                    "malloc" => r.arg(0)?,
+                    "calloc" => r.arg(0)?.checked_mul(r.arg(1)?)?,
+                    _ => return None,
+                };
+                let at = c.call.observed.rax.0;
+                (at != 0 && size > 0 && size <= MAX_ALLOCATION).then(|| at..at + size)
+            })
+            .collect()
     }
 
     /// After the candidate returned: it must have made every recorded import call.

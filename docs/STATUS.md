@@ -4,7 +4,18 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **replay maps old-image addresses** (design §7.3). Recorded memory holds addresses into the old
+Latest work: **the hook-prototype check, heap allocation in replay, and buffers** (design §6.1, §7.3).
+- **Prototype check** (§6.1, the last planned check), in repair: a verified match whose new function reads a
+  register argument the hook's prototype doesn't declare, or reads one in the other register class, goes to review
+  (`signature_changed`); only what the old function didn't already do counts. Hook loop outcomes identical.
+- **Heap allocation:** `malloc`/`calloc`/`free` answered from the recording for the same request, the block at its
+  recorded address and readable only as the function writes it (uninitialized-memory tracking).
+- **Buffers:** the recorder follows structs first, then captures byte buffers (64 KiB behind a mid-block or stack
+  pointer, and behind a stack pointer too). CRT functions replay runs itself read only memory something put there
+  (6 `deflate` cases had passed by copying the zeros kept around regions for over-reads; now inconclusive).
+- zlib: **13 of 16** hooks replay (was 10), 0 fail, o2 and od. Hook loop unchanged (22 of 24), fixtures 0 wrong.
+
+Before that: **replay maps old-image addresses** (design §7.3). Recorded memory holds addresses into the old
 image (static tables, function pointers); replay now maps them to the new image: data symbols by unique name and
 size (the analysis keeps every PDB data symbol now, `data_symbols`, optional), functions through the run's
 accepted matches (`repair --cases`, `pbeta replay --old-analysis`). A mapped input is rewritten before the run; a
@@ -385,8 +396,8 @@ What's new:
    `CODE_TABLE_FAIL_AGREEING`) stays a guess: the check never fails on the corpus at 1, 2 or 3.
 4. **Widen replay further** (§7.3): globals, the UCRT's printing imports and the CRT memory functions are done,
    pointers inside structs are followed by type, and replay is measured on zlib (`corpus/replay-measure.ps1`: 7 of
-   16 hooks replay; 10 since old-image addresses are mapped). Next: heap allocation (`malloc`), stack buffers over
-   4 KiB, globals reached only through pointers, a target whose callee
+   16 hooks replay, 13 now with heap allocation and buffers). Next: pointer-to-scalar arguments that are arrays
+   (`inflate_table`), `realloc`, globals reached only through pointers, a target whose callee
    changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).

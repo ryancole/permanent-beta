@@ -26,6 +26,8 @@ const TRIPLE: u32 = 0x1090; // lea eax, [rcx+rcx*2]; ret
 const CALL_IOB: u32 = 0x10a0; // sub rsp, 28h; mov ecx, 1; call [rip -> IAT+8]; add rsp, 28h; ret
 const WRITE_GLOBAL: u32 = 0x10c0; // mov [rip -> .data], ecx; ret
 const WRITE_IMAGE_PTR: u32 = 0x10d0; // lea rax, [rip -> .rdata+0x100]; mov [rcx], rax; ret
+const MALLOC_WRITE_READ: u32 = 0x10e0; // p = malloc(16); *(int*)p = 7; return *(int*)p
+const MALLOC_READ: u32 = 0x1100; // p = malloc(16); return *(int*)p (never written)
 
 /// Where the recording process had the old image loaded (cases record `image_size` 0x4000).
 const OLD_BASE: u64 = 0x7ff6_0000_0000;
@@ -76,6 +78,21 @@ fn text() -> Vec<u8> {
     p.extend(rel32(WRITE_IMAGE_PTR, 7, RDATA + 0x100));
     p.extend([0x48, 0x89, 0x01, 0xc3]);
     put(WRITE_IMAGE_PTR, &p);
+    // sub rsp, 28h; mov ecx, 16; call [rip -> IAT+0x10] (malloc)
+    let malloc_call = |at: u32| {
+        let mut m = vec![
+            0x48, 0x83, 0xec, 0x28, 0xb9, 0x10, 0x00, 0x00, 0x00, 0xff, 0x15,
+        ];
+        m.extend(rel32(at + 9, 6, RDATA + 0x70));
+        m
+    };
+    let mut m = malloc_call(MALLOC_WRITE_READ);
+    m.extend([0xc7, 0x00, 0x07, 0x00, 0x00, 0x00]); // mov dword [rax], 7
+    m.extend([0x8b, 0x00, 0x48, 0x83, 0xc4, 0x28, 0xc3]); // mov eax, [rax]; add rsp, 28h; ret
+    put(MALLOC_WRITE_READ, &m);
+    let mut m = malloc_call(MALLOC_READ);
+    m.extend([0x8b, 0x00, 0x48, 0x83, 0xc4, 0x28, 0xc3]);
+    put(MALLOC_READ, &m);
     t
 }
 
@@ -88,11 +105,14 @@ fn rdata() -> Vec<u8> {
     put(0x10, &(RDATA + 0x60).to_le_bytes());
     put(0x40, &u64::from(RDATA + 0xa0).to_le_bytes()); // INT
     put(0x48, &u64::from(RDATA + 0xc0).to_le_bytes());
+    put(0x50, &u64::from(RDATA + 0xe0).to_le_bytes());
     put(0x60, &u64::from(RDATA + 0xa0).to_le_bytes()); // IAT
     put(0x68, &u64::from(RDATA + 0xc0).to_le_bytes());
+    put(0x70, &u64::from(RDATA + 0xe0).to_le_bytes());
     put(0x80, b"kernel32.dll\0");
     put(0xa2, b"Sleep\0");
     put(0xc2, b"__acrt_iob_func\0");
+    put(0xe2, b"malloc\0");
     put(0x100, &1234u32.to_le_bytes());
     r
 }
@@ -312,7 +332,8 @@ fn the_test_image_parses() {
         img.imports,
         vec![
             (RDATA + 0x60, "kernel32.dll!Sleep".to_owned()),
-            (RDATA + 0x68, "kernel32.dll!__acrt_iob_func".to_owned())
+            (RDATA + 0x68, "kernel32.dll!__acrt_iob_func".to_owned()),
+            (RDATA + 0x70, "kernel32.dll!malloc".to_owned())
         ]
     );
     let data = img.section_at(u64::from(DATA)).unwrap();
@@ -926,4 +947,89 @@ fn an_old_image_address_in_an_argument_is_rewritten() {
         &NewBuild::default(),
     );
     assert!(matches!(o, CaseOutcome::Inconclusive { .. }), "{o:?}");
+}
+
+/// Where the recorded process's `malloc(16)` put its block.
+#[cfg(feature = "emulator")]
+const HEAP_BLOCK: u64 = 0x6_0000_0040;
+
+/// `c` with its import calls recorded: one `malloc(size)` that returned `HEAP_BLOCK`.
+#[cfg(feature = "emulator")]
+fn with_malloc(mut c: LoadedCase, size: u64) -> LoadedCase {
+    c.case.imports_recorded = true;
+    let call = permanent_beta_model::ImportCall {
+        import: "kernel32.dll!malloc".into(),
+        entry: EntryState {
+            rcx: Word(size),
+            rdx: Word(0),
+            r8: Word(0),
+            r9: Word(0),
+            xmm: [Xmm::default(); 4],
+            stack: Vec::new(),
+        },
+        observed: Observed {
+            rax: Word(HEAP_BLOCK),
+            xmm0: Xmm::default(),
+        },
+        memory: Vec::new(),
+    };
+    c.case.imports.push(call.clone());
+    c.imports.push(LoadedImport {
+        call,
+        memory: Vec::new(),
+    });
+    c
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_heap_block_is_handed_out_where_it_was_recorded() {
+    // The function writes its block, then reads it back: 7.
+    let c = with_malloc(case(0, 0, 7, None), 16);
+    let o = replay(
+        &image(),
+        Rva(u64::from(MALLOC_WRITE_READ)),
+        &spec(ValueType::Int(4)),
+        &c,
+        &NewBuild::default(),
+    );
+    assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn reading_a_heap_block_before_writing_it_is_inconclusive() {
+    // Negative: what an uninitialized block held in the recorded process isn't known; zeros would be a guess.
+    let c = with_malloc(case(0, 0, 0, None), 16);
+    let o = replay(
+        &image(),
+        Rva(u64::from(MALLOC_READ)),
+        &spec(ValueType::Int(4)),
+        &c,
+        &NewBuild::default(),
+    );
+    match o {
+        CaseOutcome::Inconclusive { reason } => {
+            assert!(reason.contains(&format!("{HEAP_BLOCK:#x}")), "{reason}")
+        }
+        other => panic!("expected inconclusive, got {other:?}"),
+    }
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_heap_request_of_another_size_is_inconclusive() {
+    // Negative: the old build asked for 32 bytes, the candidate for 16 (a struct may have changed size).
+    let c = with_malloc(case(0, 0, 7, None), 32);
+    let o = replay(
+        &image(),
+        Rva(u64::from(MALLOC_WRITE_READ)),
+        &spec(ValueType::Int(4)),
+        &c,
+        &NewBuild::default(),
+    );
+    match o {
+        CaseOutcome::Inconclusive { reason } => assert!(reason.contains("size"), "{reason}"),
+        other => panic!("expected inconclusive, got {other:?}"),
+    }
 }
