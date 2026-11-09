@@ -4,7 +4,16 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **replay measured on real code, a false failure fixed, and pointers inside structs** (design §7.3).
+Latest work: **replay maps old-image addresses** (design §7.3). Recorded memory holds addresses into the old
+image (static tables, function pointers); replay now maps them to the new image: data symbols by unique name and
+size (the analysis keeps every PDB data symbol now, `data_symbols`, optional), functions through the run's
+accepted matches (`repair --cases`, `pbeta replay --old-analysis`). A mapped input is rewritten before the run; a
+mapped output must be the same thing (a different data address fails, a different function address is
+inconclusive), and a case that ran through a function pointer mapped by another function's match can't fail. zlib:
+**10 of 16** hooks replay (was 7), 0 fail, o2 and od. Hook loop unchanged (22 of 24, negative control failing);
+fixture scorecards identical, 0 wrong. Next on zlib: `malloc` (heap allocation) and stack buffers over 4 KiB.
+
+Before that: **replay measured on real code, a false failure fixed, and pointers inside structs** (design §7.3).
 - `corpus/replay-measure.ps1` (local): 16 zlib functions hooked in minigzip, compress and decompress recorded in one
   release, every case replayed on the same function (by symbol, so every pair is correct) in the next.
 - It found a **false failure**: `_tr_init` stores `&static_l_desc` in its state, and the new build's address isn't
@@ -376,8 +385,8 @@ What's new:
    `CODE_TABLE_FAIL_AGREEING`) stays a guess: the check never fails on the corpus at 1, 2 or 3.
 4. **Widen replay further** (§7.3): globals, the UCRT's printing imports and the CRT memory functions are done,
    pointers inside structs are followed by type, and replay is measured on zlib (`corpus/replay-measure.ps1`: 7 of
-   16 hooks replay). Next: old-image addresses in recorded memory (static tables, function pointers; mapping them
-   needs the old build's symbols), stack buffers over 4 KiB, heap allocation, globals reached only through pointers, a target whose callee
+   16 hooks replay; 10 since old-image addresses are mapped). Next: heap allocation (`malloc`), stack buffers over
+   4 KiB, globals reached only through pointers, a target whose callee
    changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).

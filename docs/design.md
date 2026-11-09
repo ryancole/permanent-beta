@@ -687,6 +687,19 @@ pointing at static tables; `inflate` calling through a recorded function pointer
 the 4 KiB block (`next_in` into minigzip's 16 KiB buffer), and on memory `inflate`'s state reaches through fields
 the layouts don't type. The hook loop is unchanged: 22 of 24, the negative control failing.
 
+**Old-image addresses (2026-11-08).** Recorded memory holds addresses into the old image: a pointer to a static
+table, a function pointer. Replay maps them to the new image (`permanent_beta_replay::address`): **data** by a
+symbol name unique in both PDBs with the same size (`AnalysisExport::data_symbols`, every PDB data symbol,
+read-only ones included; optional, no schema bump), any offset inside it; **functions** by entry, through the run's
+accepted matches (`pbeta repair --cases` maps each old build it repairs from; `pbeta replay --old-analysis`).
+Overlapping entries map neither. Inputs (registers, stack arguments, regions, globals) holding a mapped address
+get the new one before the run; after it, an expected old-image address must equal the mapped new one: a
+different data address fails, a different function address is inconclusive. And because a function pointer is
+mapped through *another* function's match, which could be wrong, a case whose inputs had a function pointer mapped
+can't fail, only be inconclusive. Unmapped old-image addresses are treated as before. zlib: **10 of 16** hooks
+replay (was 7), 0 fail, both steps: `_tr_init`, `build_tree` and `_tr_flush_block` now pass; `inflate` now runs
+through its mapped `zalloc` into `malloc`, which replay doesn't model. Hook loop and fixture scorecards unchanged.
+
 Not recorded: memory behind pointers inside structs beyond `pointer_depth` or without a typed field, the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is
 inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks.

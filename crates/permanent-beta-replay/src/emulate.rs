@@ -25,6 +25,7 @@
 //! zeros): vectorized string and memory code reads whole aligned blocks past the end of its data, which can't
 //! change a correct result. **[Guess]** at 32 (AVX2's width).
 
+use crate::address::{AddressMap, Rebase, Rewritten};
 use crate::image::{Image, PAGE, page_up};
 use crate::imports::{self, CallView, StandIns};
 use icicle_vm::cpu::mem::{Mapping, perm};
@@ -56,6 +57,8 @@ pub struct Setup<'a> {
     pub globals: &'a [Placed],
     /// The case's recorded import calls, if the recorder intercepted the module's imports.
     pub imports: Option<StandIns>,
+    /// The recorded image's range and the address map: inputs holding a mapped old-image address get the new one.
+    pub addresses: Option<(&'a Range<u64>, &'a AddressMap)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +73,8 @@ pub struct Ran {
     pub import_calls: usize,
     /// Where the new image was mapped: a pointer into it is the new build's address of something.
     pub image: Range<u64>,
+    /// Old-image addresses in the inputs rewritten to the new image.
+    pub rewritten: Rewritten,
     pub instructions: u64,
 }
 
@@ -297,6 +302,45 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         return_trap: traps,
     };
 
+    // Old-image addresses in the inputs, rewritten to the new image where the map knows them.
+    let rebase = setup.addresses.map(|(old_image, map)| Rebase {
+        map,
+        old_image,
+        new_base: base,
+    });
+    let mut rewritten = Rewritten::default();
+    let mut word = |v: u64| match rebase.and_then(|r| r.address(v)) {
+        Some((new, kind)) => {
+            rewritten.count(kind);
+            new
+        }
+        None => v,
+    };
+    let entry_regs = [
+        word(setup.entry.rcx.0),
+        word(setup.entry.rdx.0),
+        word(setup.entry.r8.0),
+        word(setup.entry.r9.0),
+    ];
+    let stack_args: Vec<u64> = setup.entry.stack.iter().map(|w| word(w.0)).collect();
+    let rebased = |address: u64, bytes: &[u8], n: &mut Rewritten| {
+        let mut b = bytes.to_vec();
+        if let Some(r) = rebase {
+            n.add(r.rewrite(address, &mut b));
+        }
+        b
+    };
+    let global_bytes: Vec<Vec<u8>> = setup
+        .globals
+        .iter()
+        .map(|g| rebased(base + g.address, &g.bytes, &mut rewritten))
+        .collect();
+    let region_bytes: Vec<Vec<u8>> = setup
+        .regions
+        .iter()
+        .map(|r| rebased(r.address, &r.bytes, &mut rewritten))
+        .collect();
+
     // The image: mapped unreadable, then each part given what the function may do with it.
     let mut memory = image.loaded_at(base);
     for (i, (slot, _)) in image.imports.iter().enumerate() {
@@ -309,12 +353,12 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         let r = r as usize;
         memory[r..r + 8].copy_from_slice(&SECURITY_COOKIE.to_le_bytes());
     }
-    for g in setup.globals {
+    for (g, bytes) in setup.globals.iter().zip(&global_bytes) {
         let at = g.address as usize;
         memory
-            .get_mut(at..at + g.bytes.len())
+            .get_mut(at..at + bytes.len())
             .ok_or("a recorded global is outside the new image")?
-            .copy_from_slice(&g.bytes);
+            .copy_from_slice(bytes);
     }
     map(vm, base, image.size(), perm::NONE, 0)?;
     let mem = &mut vm.cpu.mem;
@@ -361,10 +405,13 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         mem.update_perm(start, end - start, perm::READ)
             .map_err(mem_err)?;
     }
-    for r in setup.regions.iter().filter(|r| !r.bytes.is_empty()) {
-        mem.update_perm(r.address, r.bytes.len() as u64, perm::READ | perm::WRITE)
+    for (r, bytes) in setup.regions.iter().zip(&region_bytes) {
+        if bytes.is_empty() {
+            continue;
+        }
+        mem.update_perm(r.address, bytes.len() as u64, perm::READ | perm::WRITE)
             .map_err(mem_err)?;
-        mem.write_bytes(r.address, &r.bytes, perm::NONE)
+        mem.write_bytes(r.address, bytes, perm::NONE)
             .map_err(mem_err)?;
     }
 
@@ -372,8 +419,8 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     let rsp0 = ((stack_base + STACK_SIZE - 0x1000) & !0xf) - 8; // as after a `call`
     mem.write_bytes(rsp0, &layout.return_trap.to_le_bytes(), perm::NONE)
         .map_err(mem_err)?;
-    for (i, w) in setup.entry.stack.iter().enumerate() {
-        mem.write_bytes(rsp0 + 0x28 + 8 * i as u64, &w.0.to_le_bytes(), perm::NONE)
+    for (i, w) in stack_args.iter().enumerate() {
+        mem.write_bytes(rsp0 + 0x28 + 8 * i as u64, &w.to_le_bytes(), perm::NONE)
             .map_err(mem_err)?;
     }
     for name in [
@@ -384,10 +431,10 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     }
     for (name, v) in [
         ("RSP", rsp0),
-        ("RCX", setup.entry.rcx.0),
-        ("RDX", setup.entry.rdx.0),
-        ("R8", setup.entry.r8.0),
-        ("R9", setup.entry.r9.0),
+        ("RCX", entry_regs[0]),
+        ("RDX", entry_regs[1]),
+        ("R8", entry_regs[2]),
+        ("R9", entry_regs[3]),
         ("MXCSR", 0x1f80),
     ] {
         let r = reg(vm, name)?;
@@ -506,5 +553,6 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         import_calls,
         instructions: vm.cpu.icount - started_at,
         image: base..base + image.size(),
+        rewritten,
     })
 }

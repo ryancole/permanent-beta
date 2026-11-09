@@ -398,6 +398,7 @@ fn a_global_the_new_build_lacks_is_inconclusive() {
         &NewBuild {
             layouts: &[],
             globals: &g_x(8),
+            addresses: None,
         },
     );
     assert!(
@@ -419,6 +420,7 @@ mod emulated {
             &NewBuild {
                 layouts,
                 globals: &g_x(4),
+                addresses: None,
             },
         )
     }
@@ -828,4 +830,100 @@ fn an_argument_difference_fails_even_when_a_pointee_differs_first() {
         CaseOutcome::Fail { detail } => assert!(detail.starts_with("arg0"), "{detail}"),
         other => panic!("expected a fail, got {other:?}"),
     }
+}
+
+/// An analysis with one data symbol `k` at `rva` (`size` bytes).
+#[cfg(feature = "emulator")]
+fn with_symbol(rva: u64, size: u64) -> permanent_beta_model::AnalysisExport {
+    let mut e: permanent_beta_model::AnalysisExport = serde_json::from_value(serde_json::json!({
+        "schema_version": permanent_beta_model::ANALYSIS_SCHEMA_VERSION,
+        "build": { "id": "b", "file_name": "t.exe", "version": null, "machine": "x64", "pdb": null },
+        "producer": { "tool": "test", "version": "0" },
+        "functions": [],
+    }))
+    .unwrap();
+    e.data_symbols = vec![GlobalVar {
+        name: "k".into(),
+        rva: Rva(rva),
+        size,
+        ty: String::new(),
+    }];
+    e
+}
+
+#[cfg(feature = "emulator")]
+fn replay_mapped(
+    fun: u32,
+    c: &LoadedCase,
+    map: &address::AddressMap,
+    ret: ValueType,
+) -> CaseOutcome {
+    replay(
+        &image(),
+        Rva(u64::from(fun)),
+        &spec(ret),
+        c,
+        &NewBuild {
+            addresses: Some(map),
+            ..NewBuild::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_written_image_address_that_maps_to_the_same_symbol_passes() {
+    // The old build's &k (at .rdata+0x100 then) is the new build's &k: the same thing, so the same behavior.
+    let map = address::AddressMap::new(&with_symbol(0x2100, 8), &with_symbol(0x2100, 8), &[]);
+    let c = case(STRUCT_AT, 0, 0, Some((&[0; 8], &old_image_ptr(), None)));
+    let o = replay_mapped(WRITE_IMAGE_PTR, &c, &map, ValueType::Void);
+    assert!(
+        matches!(&o, CaseOutcome::Pass { detail } if detail.contains("mapped")),
+        "{o:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_written_image_address_of_another_symbol_fails() {
+    // Negative: the old build stored &k, but the new build's k is at .rdata+0x180, and the function stores
+    // .rdata+0x100: something else.
+    let map = address::AddressMap::new(&with_symbol(0x2100, 8), &with_symbol(0x2180, 8), &[]);
+    let c = case(STRUCT_AT, 0, 0, Some((&[0; 8], &old_image_ptr(), None)));
+    let o = replay_mapped(WRITE_IMAGE_PTR, &c, &map, ValueType::Void);
+    assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_function_address_mapped_elsewhere_is_inconclusive_not_a_fail() {
+    // The map says old 0x2100 is the function now at 0x2180 (through another function's match, which could be
+    // wrong): a difference there can't fail the case.
+    let map = address::AddressMap::new(
+        &with_symbol(0, 0),
+        &with_symbol(0, 0),
+        &[(Rva(0x2100), Rva(0x2180))],
+    );
+    let c = case(STRUCT_AT, 0, 0, Some((&[0; 8], &old_image_ptr(), None)));
+    let o = replay_mapped(WRITE_IMAGE_PTR, &c, &map, ValueType::Void);
+    assert!(matches!(o, CaseOutcome::Inconclusive { .. }), "{o:?}");
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn an_old_image_address_in_an_argument_is_rewritten() {
+    // rcx holds the old build's address of .rdata+0xf8; the function reads [rcx+8], the constant 1234.
+    let c = case(OLD_BASE + 0x20f8, 0, 1234, None);
+    let map = address::AddressMap::new(&with_symbol(0x20f8, 0x10), &with_symbol(0x20f8, 0x10), &[]);
+    let o = replay_mapped(READ_AT_8, &c, &map, ValueType::Int(4));
+    assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
+    // Negative: without the map the old address means nothing here, and reading it is inconclusive.
+    let o = replay(
+        &image(),
+        Rva(u64::from(READ_AT_8)),
+        &spec(ValueType::Int(4)),
+        &c,
+        &NewBuild::default(),
+    );
+    assert!(matches!(o, CaseOutcome::Inconclusive { .. }), "{o:?}");
 }

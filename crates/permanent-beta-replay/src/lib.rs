@@ -16,6 +16,7 @@
 //! Depends on `permanent-beta-model` only (design §3.1). Emulation needs the `emulator` feature (icicle, MIT or
 //! Apache-2.0, running Ghidra's x86-64 SLEIGH specification, Apache-2.0); without it every case is inconclusive.
 
+pub mod address;
 #[cfg(feature = "emulator")]
 pub mod emulate;
 pub mod image;
@@ -58,6 +59,8 @@ pub struct NewBuild<'a> {
     pub layouts: &'a [TypeLayout],
     /// Globals, for placing recorded globals by name.
     pub globals: &'a [GlobalVar],
+    /// Old-image addresses mapped to the new image ([`address`]); without it they stay as recorded.
+    pub addresses: Option<&'a address::AddressMap>,
 }
 
 /// A recorded global as placed for the replay: at the new build's RVA for its name.
@@ -222,20 +225,39 @@ pub fn replay(
         Ok(g) => g,
         Err(why) => return CaseOutcome::inconclusive(why),
     };
-    // A returned pointer only means something inside the recorded memory, which keeps its addresses.
+    let old_image = c
+        .image_size
+        .map(|s| c.image_base.0..c.image_base.0.saturating_add(s.0));
+    // A returned pointer only means something inside the recorded memory, which keeps its addresses, or at an
+    // old-image address the map knows.
     if hook.ret == ValueType::Pointer {
         let v = c.observed.rax.0;
         let in_regions = prepared
             .iter()
             .any(|p| !p.translated && (p.address..=p.address + p.before.len() as u64).contains(&v));
-        if v != 0 && !in_regions {
+        let mapped = old_image
+            .as_ref()
+            .zip(new.addresses)
+            .is_some_and(|(img, m)| img.contains(&v) && m.rva(v - img.start).is_some());
+        if v != 0 && !in_regions && !mapped {
             return CaseOutcome::inconclusive(format!(
                 "returns a pointer ({v:#x}) outside the recorded memory"
             ));
         }
     }
-    run_and_compare(image, new_rva, hook.ret, case, &prepared, &globals)
+    run_and_compare(
+        image,
+        new_rva,
+        hook.ret,
+        case,
+        &prepared,
+        &globals,
+        old_image.as_ref().zip(new.addresses),
+    )
 }
+
+/// The recorded image's range and the address map, when both are known.
+type Addresses<'a> = Option<(&'a Range<u64>, &'a address::AddressMap)>;
 
 #[cfg(not(feature = "emulator"))]
 fn run_and_compare(
@@ -245,6 +267,7 @@ fn run_and_compare(
     _: &LoadedCase,
     _: &[Prepared],
     _: &[PreparedGlobal],
+    _: Addresses,
 ) -> CaseOutcome {
     CaseOutcome::inconclusive(
         "built without the emulator (permanent-beta-replay's `emulator` feature)",
@@ -259,6 +282,7 @@ fn run_and_compare(
     case: &LoadedCase,
     prepared: &[Prepared],
     globals: &[PreparedGlobal],
+    addresses: Addresses,
 ) -> CaseOutcome {
     let placed: Vec<emulate::Placed> = prepared
         .iter()
@@ -284,6 +308,7 @@ fn run_and_compare(
             .case
             .imports_recorded
             .then(|| imports::StandIns::new(case.imports.clone())),
+        addresses,
     }) {
         Ok(r) => r,
         Err(why) => return CaseOutcome::inconclusive(why),
@@ -292,7 +317,31 @@ fn run_and_compare(
         .case
         .image_size
         .map(|s| case.case.image_base.0..case.case.image_base.0.saturating_add(s.0));
-    compare(ret, &case.case.observed, prepared, globals, &ran, old_image)
+    let rebase = addresses.map(|(img, map)| address::Rebase {
+        map,
+        old_image: img,
+        new_base: ran.image.start,
+    });
+    match compare(
+        ret,
+        &case.case.observed,
+        prepared,
+        globals,
+        &ran,
+        old_image,
+        rebase,
+    ) {
+        // A function pointer mapped through another function's match: if that match is wrong, the difference is
+        // its doing, so a correct candidate mustn't fail on it.
+        CaseOutcome::Fail { detail } if ran.rewritten.functions > 0 => {
+            CaseOutcome::inconclusive(format!(
+                "{detail}; but the case ran through {} function pointer(s) mapped by other functions' matches, which \
+             may be what differs",
+                ran.rewritten.functions
+            ))
+        }
+        other => other,
+    }
 }
 
 /// Where `expected` and `got` differ, except words that hold an address into each run's own image (see
@@ -329,26 +378,47 @@ fn first_difference(
 }
 
 /// Addresses into the image differ between builds: the old build's `&static_table` isn't the new build's. A word
-/// that held an address into the recorded image and holds one into the new image after the replay is therefore
-/// not a difference in behavior, but replay can't tell whether both point at the same thing (that would need
-/// the old build's symbols), so the case is inconclusive, never a pass. Without the recorded image's size
-/// (older recordings) no word is treated this way.
+/// that held an address into the recorded image is compared through the address map ([`address`]) when it knows
+/// the address: the same thing is the same, a different data address is a difference, a different function
+/// address is inconclusive (it was mapped through another function's match). Otherwise, a word that holds an
+/// address into the new image after the replay isn't a difference in behavior, but replay can't tell whether both
+/// point at the same thing, so the case is inconclusive, never a pass. Without the recorded image's size (older
+/// recordings) no word is treated this way.
 #[cfg(feature = "emulator")]
-struct ImagePointers {
+struct ImagePointers<'a> {
     old: Option<Range<u64>>,
     new: Range<u64>,
-    /// The first such word: (expected, got).
+    rebase: Option<address::Rebase<'a>>,
+    /// The first unmapped such word: (expected, got).
     seen: Option<(u64, u64)>,
+    /// The first mapped function address that differs: (expected, got).
+    function_differs: Option<(u64, u64)>,
+    /// Words the map showed to be the same thing.
+    mapped: usize,
 }
 
 #[cfg(feature = "emulator")]
-impl ImagePointers {
+impl ImagePointers<'_> {
+    /// Whether this differing word is not a difference in behavior (or not one replay may call a fail).
     fn both_in_image(&mut self, expected: &[u8], got: &[u8]) -> bool {
         let Some(old) = &self.old else {
             return false;
         };
         let word = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
         let (e, g) = (word(expected), word(got));
+        if let Some((new, kind)) = self.rebase.and_then(|r| r.address(e)) {
+            if g == new {
+                self.mapped += 1;
+                return true;
+            }
+            return match kind {
+                address::Kind::Data => false,
+                address::Kind::Function => {
+                    self.function_differs.get_or_insert((e, g));
+                    true
+                }
+            };
+        }
         let yes = old.contains(&e) && self.new.contains(&g);
         if yes && self.seen.is_none() {
             self.seen = Some((e, g));
@@ -365,11 +435,15 @@ fn compare(
     globals: &[PreparedGlobal],
     ran: &emulate::Ran,
     old_image: Option<Range<u64>>,
+    rebase: Option<address::Rebase>,
 ) -> CaseOutcome {
     let mut pointers = ImagePointers {
         old: old_image,
         new: ran.image.clone(),
+        rebase,
         seen: None,
+        function_differs: None,
+        mapped: 0,
     };
     let mut compared = Vec::new();
     match ret {
@@ -383,7 +457,8 @@ fn compare(
             compared.push(format!("return {want:#x}"));
         }
         ValueType::Pointer => {
-            if observed.rax.0 != ran.rax {
+            let (want, got) = (observed.rax.0.to_le_bytes(), ran.rax.to_le_bytes());
+            if want != got && !pointers.both_in_image(&want, &got) {
                 return CaseOutcome::Fail {
                     detail: format!("returned {:#x}, expected {:#x}", ran.rax, observed.rax.0),
                 };
@@ -458,6 +533,12 @@ fn compare(
     if let Some(why) = pointee_difference {
         return CaseOutcome::inconclusive(why);
     }
+    if let Some((expected, got)) = pointers.function_differs {
+        return CaseOutcome::inconclusive(format!(
+            "holds the function address {got:#x} where the recording held {expected:#x}, which maps to another \
+             function through the matches"
+        ));
+    }
     if let Some((expected, got)) = pointers.seen {
         return CaseOutcome::inconclusive(format!(
             "writes an address into the image ({got:#x}; recorded {expected:#x}): the builds' addresses differ, \
@@ -466,6 +547,10 @@ fn compare(
     }
     if ran.import_calls > 0 {
         compared.push(format!("{} import call(s) as recorded", ran.import_calls));
+    }
+    let mapped = pointers.mapped + ran.rewritten.data + ran.rewritten.functions;
+    if mapped > 0 {
+        compared.push(format!("{mapped} old-image address(es) mapped"));
     }
     CaseOutcome::Pass {
         detail: format!(

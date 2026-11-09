@@ -7,8 +7,10 @@
 //! build is no evidence, its RVA being another function there.
 
 use permanent_beta_model::{
-    BuildId, Candidate, CheckOutcome, CheckResult, FunctionFeatures, GlobalVar, Rva, TypeLayout,
+    AnalysisExport, BuildId, Candidate, CheckOutcome, CheckResult, FunctionFeatures, GlobalVar,
+    Rva, TypeLayout,
 };
+use permanent_beta_replay::address::AddressMap;
 use permanent_beta_replay::{CaseOutcome, Image, NewBuild, Recording, replay};
 use permanent_beta_verify::{BehavioralRunner, VerifyContext};
 use serde::Serialize;
@@ -19,6 +21,8 @@ pub struct RecordedCasesRunner {
     image: Image,
     new_layouts: Vec<TypeLayout>,
     new_globals: Vec<GlobalVar>,
+    /// Per old build, its image's addresses mapped to the new image (design §7.3).
+    addresses: Vec<(BuildId, AddressMap)>,
 }
 
 /// Every case for one old function, replayed on one new function.
@@ -50,7 +54,22 @@ impl RecordedCasesRunner {
             image,
             new_layouts,
             new_globals,
+            addresses: Vec::new(),
         }
+    }
+
+    /// Maps addresses into `old`'s image to the new image: its data symbols by name (both analyses with `--pdb`)
+    /// and its functions through `functions` (old entry, new entry: the run's accepted matches).
+    pub fn with_addresses(
+        mut self,
+        old: &AnalysisExport,
+        new: &AnalysisExport,
+        functions: &[(Rva, Rva)],
+    ) -> Self {
+        self.addresses.retain(|(b, _)| b != &old.build.id);
+        self.addresses
+            .push((old.build.id.clone(), AddressMap::new(old, new, functions)));
+        self
     }
 
     pub fn image_build(&self) -> &BuildId {
@@ -76,6 +95,11 @@ impl RecordedCasesRunner {
                         &NewBuild {
                             layouts: &self.new_layouts,
                             globals: &self.new_globals,
+                            addresses: self
+                                .addresses
+                                .iter()
+                                .find(|(b, _)| b == &rec.spec.build)
+                                .map(|(_, m)| m),
                         },
                     ),
                 });

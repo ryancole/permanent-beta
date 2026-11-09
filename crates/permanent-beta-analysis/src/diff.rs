@@ -237,6 +237,7 @@ mod tests {
             code_tables: Vec::new(),
             types: Vec::new(),
             globals: Vec::new(),
+            data_symbols: Vec::new(),
         }
     }
 

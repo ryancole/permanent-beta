@@ -30,6 +30,11 @@ pub struct AnalysisExport {
     /// version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub globals: Vec<GlobalVar>,
+    /// Every data symbol with a name unique in the PDB, read-only data included (`static const` tables), from
+    /// `pbeta analyze --pdb`: replay maps an address into the old image to the same symbol in the new one (design
+    /// §7.3). Optional, like `globals`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_symbols: Vec<GlobalVar>,
 }
 
 impl AnalysisExport {

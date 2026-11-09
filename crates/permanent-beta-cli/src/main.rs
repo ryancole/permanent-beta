@@ -291,6 +291,10 @@ enum Command {
         /// it, cases with struct memory are inconclusive.
         #[arg(long)]
         new_analysis: Option<PathBuf>,
+        /// Analysis of the recorded build with `--pdb`: addresses into its image held in recorded memory are mapped
+        /// to the new image (data symbols by name, functions through the accepted matches).
+        #[arg(long)]
+        old_analysis: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -441,6 +445,7 @@ fn run(cli: Cli) -> Result<u8> {
             old_rva,
             new_rva,
             new_analysis,
+            old_analysis,
             json,
         } => cmd_replay(ReplayArgs {
             cases: &cases,
@@ -448,6 +453,7 @@ fn run(cli: Cli) -> Result<u8> {
             old_rva,
             new_rva,
             new_analysis: new_analysis.as_deref(),
+            old_analysis: old_analysis.as_deref(),
             json,
         }),
         Command::HarnessSpec {
@@ -542,12 +548,28 @@ fn recorded_runner(
     ))
 }
 
+/// The accepted matches of `old` → `new` (old entry, new entry): replay maps function pointers in recorded
+/// memory through them (design §7.3).
+fn accepted_pairs(
+    old: &permanent_beta_model::AnalysisExport,
+    new: &permanent_beta_model::AnalysisExport,
+) -> Vec<(Rva, Rva)> {
+    Engine::with_defaults()
+        .match_builds(old, new)
+        .reports
+        .into_iter()
+        .filter(|r| r.verdict == permanent_beta_model::Verdict::Accepted)
+        .map(|r| (r.candidate.old, r.candidate.new))
+        .collect()
+}
+
 struct ReplayArgs<'a> {
     cases: &'a [PathBuf],
     binary: &'a Path,
     old_rva: Rva,
     new_rva: Rva,
     new_analysis: Option<&'a Path>,
+    old_analysis: Option<&'a Path>,
     json: bool,
 }
 
@@ -569,7 +591,15 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
             }))?
         }
     };
-    let runner = recorded_runner(a.cases, a.binary, &new)?;
+    let mut runner = recorded_runner(a.cases, a.binary, &new)?;
+    if let Some(p) = a.old_analysis {
+        anyhow::ensure!(
+            a.new_analysis.is_some(),
+            "--old-analysis needs --new-analysis (addresses are mapped between the two)"
+        );
+        let old = export::load(p)?;
+        runner = runner.with_addresses(&old, &new, &accepted_pairs(&old, &new));
+    }
     let j = runner.judge(None, a.old_rva, a.new_rva);
     if a.json {
         println!("{}", serde_json::to_string_pretty(&j)?);
@@ -846,7 +876,11 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
     }
     if !a.cases.is_empty() {
         let bin = a.new_binary.context("--cases needs --new-binary")?;
-        runners.push(Box::new(recorded_runner(a.cases, bin, &new)?));
+        let mut runner = recorded_runner(a.cases, bin, &new)?;
+        for o in std::iter::once(&old).chain(&earlier) {
+            runner = runner.with_addresses(o, &new, &accepted_pairs(o, &new));
+        }
+        runners.push(Box::new(runner));
     }
     let engine = match runners.len() {
         0 => Engine::with_defaults(),

@@ -90,7 +90,7 @@ $names = Get-Content "$out\hooks.toml" | Select-String '^name = "(.+)"' | ForEac
 foreach ($h in $names) {
     if (-not $newRva[$h]) { $rows += [pscustomobject]@{ Hook = $h; Outcome = "not in $New" }; continue }
     $j = & $pbeta (@('replay') + $caseArgs + @('--binary', "$builds\$New\minigzip.exe", '--old-rva', $oldRva[$h],
-            '--new-rva', $newRva[$h], '--new-analysis', "$out\$New.json", '--json'))
+            '--new-rva', $newRva[$h], '--new-analysis', "$out\$New.json", '--old-analysis', "$out\$Old.json", '--json'))
     $o = ($j | Out-String) | ConvertFrom-Json
     $all += [pscustomobject]@{ Hook = $h; Result = $o }
     $rows += [pscustomobject]@{

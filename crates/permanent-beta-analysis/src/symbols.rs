@@ -269,6 +269,7 @@ pub fn apply(export: &mut AnalysisExport, symbols: &PdbSymbols) -> Result<ApplyR
         .cloned()
         .collect();
     report.globals = export.globals.len();
+    export.data_symbols = symbols.globals.clone();
     Ok(report)
 }
 
@@ -318,6 +319,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
         code_tables: Vec::new(),
         types: Vec::new(),
         globals: Vec::new(),
+        data_symbols: Vec::new(),
     }
 }
 
@@ -767,6 +769,8 @@ mod tests {
         // Negative: the unreferenced global isn't recorded, and nothing claims an address past the struct.
         assert!(e.global("g_unused").is_none());
         assert!(e.global_at(Rva(0x4010)).is_none());
+        // Every data symbol is kept for mapping old-image addresses in replay, referenced or not.
+        assert_eq!(e.data_symbols, s.globals);
     }
 
     #[test]
