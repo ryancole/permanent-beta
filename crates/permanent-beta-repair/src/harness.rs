@@ -17,6 +17,11 @@
 //! left out, replay gives it a fixed value). Calls through pointers aren't followed, so a global only such a
 //! callee reads isn't listed and a replay that reads it is inconclusive.
 //!
+//! Redaction ([`redact`], `pbeta harness-spec --redact hook.param`): an argument or global marked `redact` is never
+//! recorded, nor any import call's memory that overlaps it. `import_memory = false` records import calls without
+//! their memory, so data derived from the hook's (a receipt formatted from a customer name) can't reach the
+//! recording through one either.
+//!
 //! The spec is TOML, meant to be read and edited before recording.
 
 use crate::prototype::Prototype;
@@ -42,6 +47,7 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
     let mut out = HarnessSpec {
         build: build.build.id.clone(),
         max_cases,
+        import_memory: true,
         hooks: Vec::new(),
         skipped: Vec::new(),
         layouts: Vec::new(),
@@ -87,6 +93,7 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
                 layout: None,
                 len_slot: None,
                 max: None,
+                redact: false,
             };
             if value == ValueType::Pointer {
                 let next = proto.params.get(i + 1);
@@ -158,6 +165,7 @@ fn reachable_globals(build: &AnalysisExport, rva: Rva) -> Vec<GlobalSpec> {
                     name: g.name.clone(),
                     rva: g.rva,
                     size: g.size,
+                    redact: false,
                 });
             }
         }
@@ -165,6 +173,35 @@ fn reachable_globals(build: &AnalysisExport, rva: Rva) -> Vec<GlobalSpec> {
     }
     out.sort_by_key(|g| g.rva);
     out
+}
+
+/// Marks `what` as never recorded: `hook.param` (a parameter by name or 0-based position) or `hook.global` (a
+/// global the hook's spec captures, by name). `Err` if no hook has it.
+pub fn redact(spec: &mut HarnessSpec, what: &str) -> Result<(), String> {
+    let (hook, item) = what
+        .split_once('.')
+        .ok_or_else(|| format!("{what:?}: expected hook.param or hook.global"))?;
+    let h = spec
+        .hooks
+        .iter_mut()
+        .find(|h| h.name == hook)
+        .ok_or_else(|| format!("{what:?}: no hook {hook} in the spec"))?;
+    let index: Option<u32> = item.parse().ok();
+    if let Some(a) = h
+        .args
+        .iter_mut()
+        .find(|a| a.name.as_deref() == Some(item) || Some(a.index) == index)
+    {
+        a.redact = true;
+        return Ok(());
+    }
+    if let Some(g) = h.globals.iter_mut().find(|g| g.name == item) {
+        g.redact = true;
+        return Ok(());
+    }
+    Err(format!(
+        "{what:?}: {hook} has no parameter or captured global {item}"
+    ))
 }
 
 fn return_type(proto: &Prototype) -> ValueType {
@@ -508,6 +545,47 @@ mod tests {
         let text = toml::to_string_pretty(&s).unwrap();
         assert!(text.contains("[[hook.global]]"), "{text}");
         assert_eq!(toml::from_str::<HarnessSpec>(&text).unwrap(), s);
+    }
+
+    #[test]
+    fn redaction_marks_parameters_and_globals() {
+        let mut s = the_hook_apps_spec();
+        redact(&mut s, "format_receipt.customer").unwrap();
+        redact(&mut s, "format_receipt.0").unwrap();
+        let fr = s.hook("format_receipt").unwrap();
+        let redacted: Vec<u32> = fr
+            .args
+            .iter()
+            .filter(|a| a.redact)
+            .map(|a| a.index)
+            .collect();
+        assert_eq!(redacted, [0, 3]);
+        // Negative: other hooks and parameters are untouched; unknown names are refused, not ignored.
+        assert!(
+            s.hooks
+                .iter()
+                .filter(|h| h.name != "format_receipt")
+                .all(|h| h.args.iter().all(|a| !a.redact))
+        );
+        for bad in ["format_receipt.nobody", "nobody.customer", "format_receipt"] {
+            assert!(redact(&mut s, bad).is_err(), "{bad}");
+        }
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(text.contains("redact = true"), "{text}");
+        assert!(text.contains("import_memory = true"), "{text}");
+        assert_eq!(toml::from_str::<HarnessSpec>(&text).unwrap(), s);
+        // A spec written before redaction existed reads as nothing redacted, import memory on.
+        let old = text
+            .replace("redact = true", "redact = false")
+            .replace("import_memory = true\n", "");
+        let parsed: HarnessSpec = toml::from_str(&old).unwrap();
+        assert!(parsed.import_memory);
+        assert!(
+            parsed
+                .hooks
+                .iter()
+                .all(|h| h.args.iter().all(|a| !a.redact))
+        );
     }
 
     #[test]

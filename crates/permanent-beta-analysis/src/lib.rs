@@ -44,6 +44,8 @@ pub enum AnalysisError {
     InvalidPdb { path: String, reason: String },
     #[error("{path}: unsupported binary: {reason}")]
     Unsupported { path: String, reason: String },
+    #[error("{path}: refused: {reason}")]
+    Protected { path: String, reason: String },
 }
 
 /// Anything that can turn a binary on disk into an [`AnalysisExport`].

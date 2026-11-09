@@ -143,6 +143,7 @@ fn spec(ret: ValueType) -> HarnessSpec {
     HarnessSpec {
         build: BuildId("old".into()),
         max_cases: 8,
+        import_memory: true,
         hooks: vec![HookRecordSpec {
             name: "f".into(),
             rva: Rva(0x1000),

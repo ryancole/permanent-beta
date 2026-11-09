@@ -92,6 +92,10 @@ libclang, found by `corpus/lib/emulator.ps1` (see `third_party/README.md`). On t
    are correct (the answer key), so none may fail; inconclusive is allowed. The script prints how many replayed.
 4. **Negative control:** v1's `price_lookup` cases replayed on the function the swapped manifest gives it
    (`stock_level`'s), and the reverse, must fail.
+5. **Redaction:** v1 recorded again with the arguments that hold the customer names, or text made from them,
+   redacted (`format_receipt.customer`, `format_receipt.buf`, `ship_order.customer`, `checksum.data`) and
+   import memory off. No file of that recording may contain "Ada", "Grace" or "Linus"; the ordinary recording
+   must, or the check proves nothing.
 
 Which hooks replay: all resolved ones (22 of 24 per run). The printing ones (`format_receipt`, `ship_order`)
 replay through the stand-ins for the UCRT's `printf` and `snprintf` imports, with the CRT's options global and

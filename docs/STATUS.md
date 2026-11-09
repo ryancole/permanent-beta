@@ -4,7 +4,19 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **a third C++ project (JsonCpp) and the C++ guesses calibrated** (design §5.1, §6.1). JsonCpp
+Latest work: **protected binaries refused, recordings redactable** (design §4.2, §7.3, §12).
+- The analyzer refuses protected and packed binaries before reading any code: a protector's or packer's default
+  section name (UPX, VMProtect, Themida/WinLicense, Enigma, ASPack, MPRESS, PECompact, Petite, NsPack), an entry
+  point in a writable and executable section, or executable space with no file data. No override; analysis,
+  patterns and replay all go through it. 0 of the corpus's 106 binaries and 0 of 150 System32 executables are
+  refused; a copy of the hook app with `.text` made writable is (exit 2). (A copy with a `.vmp0` section was
+  quarantined by Windows Defender before `pbeta` could read it; unit tests cover the names.)
+- `pbeta harness-spec --redact hook.param` (or `redact = true` in the spec) never records an argument or global,
+  nor import memory overlapping a redacted argument seen so far (best effort); `--no-import-memory` records no
+  import memory (the guarantee). The hook loop records v1 with the customer names redacted and import memory off
+  and checks no file contains a name (0, against 83–97 in the ordinary recording). Replay is unchanged (22 of 24).
+
+Before that: **a third C++ project (JsonCpp) and the C++ guesses calibrated** (design §5.1, §6.1). JsonCpp
 1.9.6 → 1.9.7 → 1.9.8 scored 0 wrong on all 10 variants on its first run. With it, two of the three C++
 guesses are calibrated over 64 variants: `TABLE_MIN_ANCHORS` (1) and `WRAPPER_MIN_DIRECT_CALLERS` (2) are the
 lowest clean values. The code-tables fail threshold can't be: the check never fails on the corpus. No matching

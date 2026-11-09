@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #pragma comment(linker, "/export:DetourFinishHelperProcess,@1,NONAME")
@@ -310,6 +311,11 @@ std::string lower(std::string s) {
 //
 // With each call it also captures the spec's globals for the hook (`[[hook.global]]`) before and after, and the
 // import calls made while the call runs ("Import calls" below).
+//
+// Redaction: an argument or global with `redact = true` is never captured, and neither is any import call's memory
+// that overlaps a redacted argument seen so far in the run. That's best effort: an import can still be handed
+// data derived from a redacted argument (a receipt formatted from a name), or a redacted value at an address no
+// redacted argument pointed to. `import_memory = false` captures no import memory at all, which is the guarantee.
 
 const char kRecorder[] = "permanent-beta-hookdll 0.2";
 constexpr int kThunks = 16;
@@ -345,12 +351,14 @@ struct RecArg {
     int index = -1;
     std::string slot, capture, layout, len_slot;
     unsigned long long size = 0, max = 0;
+    bool redact = false;
 };
 
 // A global to capture with each call (`[[hook.global]]`).
 struct RecGlobal {
     std::string name, rva;
     unsigned long long size = 0;
+    bool redact = false;
 };
 
 struct RecHook {
@@ -363,6 +371,7 @@ struct RecHook {
 struct RecSpec {
     std::string build;
     unsigned max_cases = 32;
+    bool import_memory = true;
     std::vector<RecHook> hooks;
 };
 
@@ -415,6 +424,8 @@ bool parse_spec(const char* path, RecSpec& spec) {
                 spec.build = value;
             } else if (key == "max_cases") {
                 spec.max_cases = static_cast<unsigned>(n);
+            } else if (key == "import_memory") {
+                spec.import_memory = value != "false";
             }
         } else if (section == "hook") {
             RecHook& h = spec.hooks.back();
@@ -441,6 +452,8 @@ bool parse_spec(const char* path, RecSpec& spec) {
                 a.len_slot = value;
             } else if (key == "max") {
                 a.max = n;
+            } else if (key == "redact") {
+                a.redact = value == "true";
             }
         } else if (section == "global") {
             RecGlobal& g = spec.hooks.back().globals.back();
@@ -450,6 +463,8 @@ bool parse_spec(const char* path, RecSpec& spec) {
                 g.rva = value;
             } else if (key == "size") {
                 g.size = n;
+            } else if (key == "redact") {
+                g.redact = value == "true";
             }
         }
     }
@@ -618,6 +633,7 @@ struct ImpSite {
 
 ImpSite g_imp_sites[kImportThunks];
 bool g_imports_complete = false;
+bool g_import_memory = true;
 // The recorded calls running on this thread, innermost last.
 thread_local std::vector<RecordCall*> t_active;
 
@@ -641,6 +657,21 @@ std::vector<unsigned char> readable_prefix(unsigned long long address, size_t ma
     return out;
 }
 
+// Whether [address, address + n) overlaps a redacted argument of any recorded call so far.
+// Every redacted argument's memory seen so far in the run: a pointer left on the stack by an earlier call can
+// still lead an import's capture to it.
+std::vector<std::pair<unsigned long long, unsigned long long>> g_redacted;
+
+bool overlaps_redacted(unsigned long long address, size_t n) {
+    EnterCriticalSection(&g_lock);
+    bool hit = false;
+    for (const auto& range : g_redacted) {
+        hit = hit || (address < range.second && address + n > range.first);
+    }
+    LeaveCriticalSection(&g_lock);
+    return hit;
+}
+
 void snap_add(std::vector<Snap>& memory, unsigned long long address, size_t max, bool outer) {
     for (const Snap& s : memory) {
         if (s.address == address) {
@@ -651,7 +682,7 @@ void snap_add(std::vector<Snap>& memory, unsigned long long address, size_t max,
     s.address = address;
     s.outer = outer;
     s.before = readable_prefix(address, max);
-    if (!s.before.empty()) {
+    if (!s.before.empty() && !overlaps_redacted(address, s.before.size())) {
         memory.push_back(std::move(s));
     }
 }
@@ -811,6 +842,14 @@ extern "C" void* pbeta_record_before(RecordFrame* f) {
                 }
             }
         }
+        if (a.redact) {
+            if (n) {
+                EnterCriticalSection(&g_lock);
+                g_redacted.emplace_back(address, address + n);
+                LeaveCriticalSection(&g_lock);
+            }
+            continue;  // never captured
+        }
         PendingRegion r;
         r.arg = a.index;
         r.address = address;
@@ -823,6 +862,9 @@ extern "C" void* pbeta_record_before(RecordFrame* f) {
         call->regions.push_back(std::move(r));
     }
     for (const RecGlobal& g : site.hook.globals) {
+        if (g.redact) {
+            continue;  // never captured
+        }
         PendingGlobal pg;
         pg.global = &g;
         pg.before.resize(static_cast<size_t>(g.size));
@@ -867,7 +909,7 @@ extern "C" void* pbeta_import_before(RecordFrame* f) {
     }
     std::vector<unsigned long long> args(r->gpr, r->gpr + 4);
     args.insert(args.end(), r->stack, r->stack + kImportStackArgs);
-    for (unsigned long long a : args) {
+    for (unsigned long long a : g_import_memory ? args : std::vector<unsigned long long>()) {
         snap_add(r->memory, a, kImportBlock, true);
     }
     size_t outer = r->memory.size();
@@ -967,6 +1009,7 @@ void record_all(const std::string& build) {
     }
     g_rec_build = build;
     g_rec_max = spec.max_cases;
+    g_import_memory = spec.import_memory;
     g_image_base = reinterpret_cast<unsigned long long>(GetModuleHandleW(nullptr));
     CreateDirectoryA(g_rec_dir.c_str(), nullptr);
     CreateDirectoryA((g_rec_dir + "\\cases").c_str(), nullptr);

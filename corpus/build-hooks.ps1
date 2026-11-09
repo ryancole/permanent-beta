@@ -163,14 +163,17 @@ function Invoke-Loop([string] $flagName) {
     }
 
     # Records every call of the hooks bound to this version (its manifest) as test cases, in a run of its own.
+    # `$name` names the recording directory and its spec; `$specArgs` go to harness-spec (redaction).
     $record = {
-        param([string] $version)
-        $rec = "$dir\$version\rec"
+        param([string] $version, [string] $name = 'rec', [string[]] $specArgs = @())
+        $rec = "$dir\$version\$name"
+        $spec = "$dir\$version\$name-spec.toml"
+        if ($name -eq 'rec') { $spec = "$dir\$version\spec.toml" }
         if (Test-Path $rec) { Remove-Item -Recurse -Force $rec }
-        Invoke-Native $pbeta @('harness-spec', '--hooks', "$dir\$version\hooks.toml", '--analysis', "$dir\$version\analysis-pdb.json",
-            '--out', "$dir\$version\spec.toml")
+        Invoke-Native $pbeta (@('harness-spec', '--hooks', "$dir\$version\hooks.toml", '--analysis', "$dir\$version\analysis-pdb.json",
+            '--out', $spec) + $specArgs)
         $env:PBETA_RECORD = $rec
-        $env:PBETA_SPEC = "$dir\$version\spec.toml"
+        $env:PBETA_SPEC = $spec
         try {
             & "$bin\launcher.exe" "$bin\hookdll.dll" "$dir\$version\hooks.toml" "$dir\$version\rec-trace.jsonl" "$dir\$version\app.exe" | Out-Null
             $code = $LASTEXITCODE
@@ -179,14 +182,40 @@ function Invoke-Loop([string] $flagName) {
         }
         if ($code -ne 0) { $script:failures += "$version exited with $code under the recorder" }
         $n = @(Get-ChildItem "$rec\cases" -Recurse -Filter *.json).Count
-        Write-Host "[$flagName] recorded $n test cases of $version"
+        Write-Host "[$flagName] recorded $n test cases of $version ($name)"
+    }
+
+    # Redaction (design §7.3): v1 recorded again with the customer names marked never to record (the arguments
+    # that hold them or text made from them) and import memory off. No file of that recording may contain a name;
+    # the ordinary recording must (or the check proves nothing).
+    $checkRedaction = {
+        $names = @('Ada', 'Grace', 'Linus')
+        & $record 'v1' 'rec-redacted' @('--redact', 'format_receipt.customer', '--redact', 'format_receipt.buf',
+            '--redact', 'ship_order.customer', '--redact', 'checksum.data', '--no-import-memory')
+        $found = {
+            param([string] $root)
+            $hits = @()
+            foreach ($f in Get-ChildItem $root -Recurse -File) {
+                $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($f.FullName))
+                foreach ($n in $names) { if ($text.Contains($n)) { $hits += "$($f.Name): $n" } }
+            }
+            , $hits
+        }
+        $leaks = & $found "$dir\v1\rec-redacted"
+        $control = & $found "$dir\v1\rec"
+        if ($leaks.Count) { $script:failures += "[$flagName] redacted recording contains: $($leaks -join ', ')" }
+        if (-not $control.Count) { $script:failures += "[$flagName] the ordinary recording has no customer name: the redaction check proves nothing" }
+        Write-Host "[$flagName] redaction: $($leaks.Count) customer names in the redacted recording, $($control.Count) in the ordinary one"
     }
 
     Write-Host "`n== [$flagName] v1 baseline"
     $code = & $runApp 'v1' "$dir\v1\hooks.toml" "$dir\v1\trace.jsonl"
     if ($code -ne 0) { throw "v1 exited with $code under the hooks" }
     Invoke-Native $pbeta @('trace-diff', '--baseline', "$dir\v1\trace.jsonl", '--hooks', "$dir\v1\hooks.toml")
-    if ($Replay) { & $record 'v1' }
+    if ($Replay) {
+        & $record 'v1'
+        & $checkRedaction
+    }
 
     for ($i = 1; $i -lt $versions.Count; $i++) {
         $old, $new = $versions[$i - 1], $versions[$i]

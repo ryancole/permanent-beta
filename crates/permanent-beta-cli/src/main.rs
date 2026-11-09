@@ -259,6 +259,14 @@ enum Command {
         /// Distinct cases recorded per hook at most.
         #[arg(long, default_value_t = permanent_beta_engine::permanent_beta_repair::harness::DEFAULT_MAX_CASES)]
         max_cases: u32,
+        /// Never record this (repeatable): `hook.param` (a parameter by name or 0-based position) or
+        /// `hook.global`. Nor any import call's memory that overlaps it.
+        #[arg(long)]
+        redact: Vec<String>,
+        /// Record import calls without the memory behind their arguments (nothing derived from the hooks' data
+        /// reaches the recording through an import; replay can't stand in for imports that read memory).
+        #[arg(long)]
+        no_import_memory: bool,
     },
     /// Replay the cases recorded at an old RVA on a function of a new binary, by emulation (design §7.3). Exit
     /// code 0 if every replayable case matches (and one could be replayed), 1 if one differs or none could.
@@ -443,7 +451,16 @@ fn run(cli: Cli) -> Result<u8> {
             analysis,
             out,
             max_cases,
-        } => cmd_harness_spec(&hooks, &analysis, &out, max_cases),
+            redact,
+            no_import_memory,
+        } => cmd_harness_spec(
+            &hooks,
+            &analysis,
+            &out,
+            max_cases,
+            &redact,
+            !no_import_memory,
+        ),
         Command::TraceDiff {
             old,
             new,
@@ -572,15 +589,27 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
     })
 }
 
-fn cmd_harness_spec(hooks: &Path, analysis: &Path, out: &Path, max_cases: u32) -> Result<u8> {
+fn cmd_harness_spec(
+    hooks: &Path,
+    analysis: &Path,
+    out: &Path,
+    max_cases: u32,
+    redact: &[String],
+    import_memory: bool,
+) -> Result<u8> {
+    use permanent_beta_engine::permanent_beta_repair::harness;
     use permanent_beta_model::CaptureKind;
     let manifest = load_manifest(hooks)?;
     let build = export::load(analysis)?;
-    let spec =
-        permanent_beta_engine::permanent_beta_repair::harness::spec(&manifest, &build, max_cases);
+    let mut spec = harness::spec(&manifest, &build, max_cases);
+    spec.import_memory = import_memory;
+    for r in redact {
+        harness::redact(&mut spec, r).map_err(anyhow::Error::msg)?;
+    }
     let text = format!(
         "# Record spec for the recording hook DLL (pbeta harness-spec; design §7.3). Edit `capture` to change what\n\
-         # is recorded. Recordings can contain customer data: keep them local.\n{}",
+         # is recorded, `redact` to never record an argument or global. Recordings can contain customer data: keep\n\
+         # them local.\n{}",
         toml::to_string_pretty(&spec)?
     );
     std::fs::write(out, text).with_context(|| format!("writing {}", out.display()))?;

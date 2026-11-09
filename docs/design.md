@@ -179,6 +179,13 @@ compared.
 
 Target: PE x64. Implemented in `permanent-beta-analysis/src/native` (M1, first version):
 
+- **Refuses protected and packed binaries** before reading any code (`native/protection.rs`, §12): a section
+  with a common protector's or packer's default name (UPX, VMProtect, Themida/WinLicense, Enigma, ASPack, MPRESS,
+  PECompact, Petite, NsPack), an entry point in a writable and executable section, or an executable section with
+  no data in the file. No override. Every path to an analysis, a pattern or a replay goes through it. None of the
+  corpus's 106 binaries or 150 System32 executables is refused (2026-11-08). A protector that renames its
+  sections and avoids both shapes isn't caught.
+
 - Parse headers and sections with `object`; `.pdata` and the import table are parsed by hand from section bytes.
 - Function starts: non-chained `.pdata` entries, the entry point, exports and code pointers stored in data
   (`DIR64` base relocations in non-executable sections whose value points into code outside any `.pdata` range:
@@ -639,8 +646,15 @@ pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one
 inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks. Unicorn is
 GPL-2.0 and an optional feature (§11.5).
 
-**Privacy:** recorded memory can contain customer data. Recordings stay local by default, with redaction rules in
-the harness config. **[Validate]** with target customers.
+**Privacy:** recorded memory can contain customer data. Recordings stay local by default. **Redaction**
+(implemented 2026-11-08): an argument or global marked `redact` in the spec (`pbeta harness-spec --redact
+hook.param`) is never recorded, nor any import call's memory that overlaps a redacted argument seen so far in the
+run. That part is best effort: an import can be handed text derived from a redacted value (a receipt formatted
+from a name), or the value at an address no redacted argument pointed to. `import_memory = false`
+(`--no-import-memory`) captures no import memory at all, which is the guarantee. The hook loop checks it: v1
+recorded with the customer names' arguments redacted and import memory off contains no customer name in any
+file, while the ordinary recording contains 83–97 (with import memory on, redaction alone leaves 36 blobs with a
+name, down from 77). A replay that reads redacted memory is inconclusive. **[Validate]** with target customers.
 
 ---
 
@@ -984,14 +998,14 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 |---|---|---|
 | **False-positive matches** (silent wrong repair) | Hook patches the wrong function: crashes, data corruption, and loss of trust. Worse than a broken hook. | Uniqueness rule, independent verification, criticality policy, behavioral gate for high-criticality hooks, corpus precision gate, default to review. |
 | **Legal: reverse-engineering restrictions** | EULAs may prohibit reverse engineering. Statutory interoperability exceptions are narrow and vary by jurisdiction (e.g. US DMCA §1201(f), EU Software Directive Art. 6). | Not legal advice: get counsel before launch. Product terms require users to have the right to analyze and instrument the target. Position the product as interoperability and maintenance of software the customer owns or licenses. |
-| **Legal: circumvention** | DRM, anti-tamper and anti-cheat circumvention is prohibited in many jurisdictions regardless of purpose. | Non-goal. No features for unpacking, defeating integrity checks or evading detection. Refuse to process known-protected targets (detect common protectors and stop). |
+| **Legal: circumvention** | DRM, anti-tamper and anti-cheat circumvention is prohibited in many jurisdictions regardless of purpose. | Non-goal. No features for unpacking, defeating integrity checks or evading detection. Refuse to process known-protected targets (detect common protectors and stop): implemented in the analyzer (§4.2). |
 | **Dual use: cheat maintenance** | Keeping hooks working across game patches is exactly what cheat developers need. That's reputational, legal and platform risk (e.g. GitHub takedowns, anti-cheat vendor hostility). | Game segment = studios and anti-cheat teams analyzing their *own* builds. Authorization attestation, customer vetting for paid tiers, no public signature DB for third-party games. **[Validate]** whether the open-source core itself attracts this use and how to respond. |
 | **Authorization** | Users analyzing third-party software without the right to. | Explicit authorization statement in docs and ToS. Hosted service records the claimed basis per product. On-prem can't be enforced technically. |
 | **Shared signature database** | Distributing data derived from third-party copyrighted binaries. | Counsel review before building the paid DB. Prefer customer-private databases. **[Validate]** |
 | **Compiler effects** | ICF folding, inlining, LTO, PGO and hot/cold splitting make "the same function" ill-defined. | Model fold, inline and split outcomes explicitly. Corpus builds cover these flags. Hookability check. |
 | **Analysis gaps** | Leaf functions without `.pdata`, tail calls, jump tables. Ghidra and the native analyzer disagree on boundaries. | Hybrid analysis. Rust computes all hashes. Disagreement is reported, not silently resolved. |
 | **Behavioral test flakiness** | Nondeterminism (time, threads, ASLR, global state) causes false failures. | Comparison rules per test (`compare.ignore`), multiple recordings, emulation for leaf functions, failures go to review. |
-| **Recorded data is sensitive** | Traces capture customer data. | Local-only by default, redaction config, encrypted blob store option. |
+| **Recorded data is sensitive** | Traces capture customer data. | Local-only by default, redaction in the record spec (§7.3, implemented), encrypted blob store option (not built). |
 | **AI-specific** | Hallucinated matches; prompt injection via binary strings; binaries leaving the premises. | Proposer-only role, same gates, strict output schemas, local models by default, remote opt-in with logging. |
 | **AI-written codebase** | Plausible but wrong logic that compiles and passes weak tests. Slower owner review in Rust. | Corpus metrics gate in CI, small crates with enforced dependency rules, property tests for matchers, review checklist in `CLAUDE.md`. |
 | **Market** | Ghidra Version Tracking, BinDiff and Diaphora are free. Willingness to pay for repair is unproven. | Validate with the target segments before the hosted service is built (§14). **[Validate]** |

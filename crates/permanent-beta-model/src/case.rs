@@ -7,7 +7,8 @@
 //! - `blobs/<sha256>`: the memory behind pointer arguments, the globals the hook reads and what imports touched,
 //!   content-addressed ([`BlobRef`]).
 //!
-//! Recordings can contain customer data and stay local (design §7.3, privacy).
+//! Recordings can contain customer data and stay local (design §7.3, privacy). What mustn't be recorded at all is
+//! marked in the spec: `redact` on an argument or a global, `import_memory = false` for what import calls see.
 
 use crate::analysis::TypeLayout;
 use crate::ids::{BuildId, Rva};
@@ -28,6 +29,11 @@ pub struct HarnessSpec {
     /// At most this many distinct cases per hook. Identical calls (same registers, stack and memory) are
     /// recorded once.
     pub max_cases: u32,
+    /// Capture the memory behind import calls' arguments. `false` records import calls without it (their
+    /// arguments and results only): nothing derived from the hooks' data reaches the recording through an import
+    /// (a formatted string passed to `printf`), and replay can't stand in for imports that read memory.
+    #[serde(default = "default_true")]
+    pub import_memory: bool,
     #[serde(rename = "hook", default)]
     pub hooks: Vec<HookRecordSpec>,
     /// Hooks that can't be recorded, with the reason (no prototype, one that can't be parsed, no RVA).
@@ -80,6 +86,9 @@ pub struct GlobalSpec {
     pub name: String,
     pub rva: Rva,
     pub size: u64,
+    /// Never record it. A replay that reads it is inconclusive.
+    #[serde(default)]
+    pub redact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +115,14 @@ pub struct ArgSpec {
     /// `cstring` and `sized`: never capture more than this many bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<u64>,
+    /// Never record what it points to: not as the argument's memory, and not in any import call's memory that
+    /// overlaps it. A replay that reads it is inconclusive.
+    #[serde(default)]
+    pub redact: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// What a pointer argument's memory is, for capturing it.

@@ -17,6 +17,7 @@ const UNW_FLAG_CHAININFO: u8 = 0x4;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Section {
+    pub name: String,
     pub rva: u32,
     pub virtual_size: u32,
     pub data: Vec<u8>,
@@ -57,7 +58,17 @@ pub(crate) struct Image {
 }
 
 impl Image {
+    /// Parse a PE x64 file, refusing a protected or packed one (`protection`).
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let image = Self::parse_any(bytes)?;
+        match super::protection::detect(&image) {
+            Some(why) => Err(super::protection::refusal(&why)),
+            None => Ok(image),
+        }
+    }
+
+    /// Parse a PE x64 file without the protection check: callers must make it themselves.
+    pub fn parse_any(bytes: &[u8]) -> Result<Self, String> {
         let pe = PeFile64::parse(bytes).map_err(|e| e.to_string())?;
         if pe.architecture() != Architecture::X86_64 {
             return Err(format!(
@@ -75,6 +86,7 @@ impl Image {
                     if characteristics & bit != 0)
             };
             sections.push(Section {
+                name: String::from_utf8_lossy(s.name_bytes().unwrap_or_default()).into_owned(),
                 rva: header.virtual_address.get(LE),
                 virtual_size: header.virtual_size.get(LE),
                 data: s.data().map(<[u8]>::to_vec).unwrap_or_default(),
@@ -384,6 +396,7 @@ pub(crate) mod tests {
             size_of_image: 0x3000,
             sections: vec![
                 Section {
+                    name: ".text".into(),
                     rva: 0x1000,
                     virtual_size: 0x1000,
                     data: code.to_vec(),
@@ -391,6 +404,7 @@ pub(crate) mod tests {
                     writable: false,
                 },
                 Section {
+                    name: ".data".into(),
                     rva: 0x2000,
                     virtual_size: 0x1000,
                     data: data.to_vec(),

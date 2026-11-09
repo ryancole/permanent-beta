@@ -10,6 +10,7 @@
 pub(crate) mod function;
 pub(crate) mod image;
 pub mod pattern;
+pub(crate) mod protection;
 
 use crate::{AnalysisError, Analyzer};
 use permanent_beta_model::{
@@ -40,6 +41,7 @@ impl Analyzer for NativePeAnalyzer {
             .unwrap_or_else(|| path.clone());
         analyze_bytes(&bytes, &file_name).map_err(|e| match e {
             BytesError::Invalid(reason) => AnalysisError::InvalidPe { path, reason },
+            BytesError::Protected(reason) => AnalysisError::Protected { path, reason },
         })
     }
 }
@@ -47,6 +49,17 @@ impl Analyzer for NativePeAnalyzer {
 #[derive(Debug)]
 pub enum BytesError {
     Invalid(String),
+    /// A protected or packed binary, refused (design §12).
+    Protected(String),
+}
+
+/// Parse `bytes`, refusing a protected or packed binary.
+fn parse_checked(bytes: &[u8]) -> Result<image::Image, BytesError> {
+    let image = image::Image::parse_any(bytes).map_err(BytesError::Invalid)?;
+    match protection::detect(&image) {
+        Some(why) => Err(BytesError::Protected(protection::refusal(&why))),
+        None => Ok(image),
+    }
 }
 
 /// A build's id: the SHA-256 of the file, lowercase hex.
@@ -61,7 +74,7 @@ pub fn build_id(bytes: &[u8]) -> BuildId {
 
 /// Analyze an in-memory PE x64 image.
 pub fn analyze_bytes(bytes: &[u8], file_name: &str) -> Result<AnalysisExport, BytesError> {
-    let image = image::Image::parse(bytes).map_err(BytesError::Invalid)?;
+    let image = parse_checked(bytes)?;
     let ranges = function::discover(&image);
     Ok(analyze_ranges(
         &image,
@@ -81,7 +94,7 @@ pub type FunctionBody = (Rva, Vec<(Rva, Rva)>);
 /// Each function the native analyzer discovers, as its entry and code ranges `[start, end)`: the main range
 /// first, then its chained `.pdata` fragments. The same shape as a Ghidra export's bodies.
 pub fn function_bodies(bytes: &[u8]) -> Result<Vec<FunctionBody>, BytesError> {
-    let image = image::Image::parse(bytes).map_err(BytesError::Invalid)?;
+    let image = parse_checked(bytes)?;
     Ok(function::discover(&image)
         .iter()
         .map(|r| {
