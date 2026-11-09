@@ -214,6 +214,21 @@ pub fn decide(
                     Some(report),
                 );
             }
+            // And does the hook's prototype still fit how the new function takes its arguments?
+            if let Some(why) = hook
+                .prototype
+                .as_deref()
+                .and_then(|p| prototype_misfit(p, old_fn, new_fn))
+            {
+                return review(
+                    ReviewReason::SignatureChanged,
+                    format!(
+                        "matched {}, but the hook's prototype doesn't fit it: {why}",
+                        new_fn.rva
+                    ),
+                    Some(report),
+                );
+            }
             let action = if old_fn.rva == new_fn.rva {
                 RepairAction::Unchanged { rva: new_fn.rva }
             } else {
@@ -228,6 +243,73 @@ pub fn decide(
             }
         }
     }
+}
+
+/// Win64 argument registers by slot: (integer, vector).
+const ARG_REGISTERS: [(&str, &str); 4] = [
+    ("rcx", "xmm0"),
+    ("rdx", "xmm1"),
+    ("r8", "xmm2"),
+    ("r9", "xmm3"),
+];
+
+/// How the new function takes its register arguments, against the hook's prototype (design §6.1, calling
+/// convention): a register argument the function reads that the prototype doesn't declare (the detour would pass
+/// whatever is in it), or a slot read in the other register class than the prototype passes it (an `int` in rdx
+/// where the function reads xmm1). Only what the old function didn't already do counts: a prototype that was
+/// already loose for the old build isn't the repair's news. The inferred arguments are a lower bound (the analyzer
+/// scans to the first call), so fewer than declared is never a misfit. `None` when it fits, or when there's
+/// nothing to judge by (no inferred arguments, a prototype that doesn't parse, a variadic one).
+pub fn prototype_misfit(
+    prototype: &str,
+    old: &FunctionFeatures,
+    new: &FunctionFeatures,
+) -> Option<String> {
+    use permanent_beta_model::{ArgClass, ValueType};
+    let proto = prototype::Prototype::parse(prototype)?;
+    let declared: Vec<Option<ArgClass>> = proto
+        .params
+        .iter()
+        .take(4)
+        .map(|p| match harness::value_type(&p.ty) {
+            ValueType::Float(_) => Some(ArgClass::Vector),
+            ValueType::Int(_) | ValueType::Pointer => Some(ArgClass::Integer),
+            // A struct by value or an unknown type: no class to compare.
+            _ => None,
+        })
+        .collect();
+    let problems = |f: &FunctionFeatures| -> Option<Vec<String>> {
+        let n = usize::from(f.inferred_args?);
+        let mut out = Vec::new();
+        for (slot, &(int, vec)) in ARG_REGISTERS.iter().enumerate().take(n) {
+            let class = f.inferred_arg_classes.get(slot).copied();
+            let reg = |c: Option<ArgClass>| match c {
+                Some(ArgClass::Vector) => vec,
+                _ => int,
+            };
+            match declared.get(slot) {
+                None => out.push(format!(
+                    "it reads {} (argument {}), which the prototype doesn't declare",
+                    reg(class),
+                    slot + 1
+                )),
+                Some(Some(want)) if class.is_some_and(|c| c != *want) => out.push(format!(
+                    "it reads argument {} from {}, where the prototype passes it in {}",
+                    slot + 1,
+                    reg(class),
+                    reg(Some(*want))
+                )),
+                _ => {}
+            }
+        }
+        Some(out)
+    };
+    let before = problems(old).unwrap_or_default();
+    let news: Vec<String> = problems(new)?
+        .into_iter()
+        .filter(|p| !before.contains(p))
+        .collect();
+    (!news.is_empty()).then(|| news.join("; "))
 }
 
 /// A hook whose locator is bound to another build than `old_build`. Its RVA is an address in that other build,
@@ -770,5 +852,116 @@ mod tests {
             vec![],
         );
         assert!(r.is_resolved());
+    }
+
+    /// `f` reading `classes` as its register arguments (the analyzer's inference).
+    fn reads(
+        mut f: FunctionFeatures,
+        classes: &[permanent_beta_model::ArgClass],
+    ) -> FunctionFeatures {
+        f.inferred_args = Some(classes.len() as u8);
+        f.inferred_arg_classes = classes.to_vec();
+        f.signature = None;
+        f
+    }
+
+    fn with_prototype(p: &str) -> HookSpec {
+        HookSpec {
+            prototype: Some(p.into()),
+            ..hook()
+        }
+    }
+
+    #[test]
+    fn a_prototype_that_fits_is_relocated() {
+        use permanent_beta_model::ArgClass::{Integer, Vector};
+        let h = with_prototype("int f(int a, double b)");
+        let r = decide(
+            &h,
+            Some(&reads(func(0x10, 0), &[Integer, Vector])),
+            Some(report(Verdict::Accepted)),
+            Some(&reads(func(0x20, 0), &[Integer, Vector])),
+            vec![],
+        );
+        assert!(r.is_resolved(), "{:?}", r.action);
+        // Fewer registers read than declared: the inference is a lower bound, never a misfit.
+        let r = decide(
+            &h,
+            Some(&reads(func(0x10, 0), &[Integer, Vector])),
+            Some(report(Verdict::Accepted)),
+            Some(&reads(func(0x20, 0), &[Integer])),
+            vec![],
+        );
+        assert!(r.is_resolved(), "{:?}", r.action);
+    }
+
+    #[test]
+    fn a_new_argument_register_the_prototype_lacks_needs_review() {
+        // Negative: the new function reads r8, which the two-parameter prototype doesn't pass.
+        use permanent_beta_model::ArgClass::Integer;
+        let r = decide(
+            &with_prototype("int f(int a, int b)"),
+            Some(&reads(func(0x10, 0), &[Integer, Integer])),
+            Some(report(Verdict::Accepted)),
+            Some(&reads(func(0x20, 0), &[Integer, Integer, Integer])),
+            vec![],
+        );
+        match &r.action {
+            RepairAction::NeedsReview {
+                reason: ReviewReason::SignatureChanged,
+                detail,
+            } => assert!(detail.contains("r8"), "{detail}"),
+            other => panic!("expected review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_argument_in_the_other_register_class_needs_review() {
+        // Negative: the prototype passes an int in rdx; the new function reads xmm1.
+        use permanent_beta_model::ArgClass::{Integer, Vector};
+        let r = decide(
+            &with_prototype("int f(int a, int b)"),
+            Some(&reads(func(0x10, 0), &[Integer, Integer])),
+            Some(report(Verdict::Accepted)),
+            Some(&reads(func(0x20, 0), &[Integer, Vector])),
+            vec![],
+        );
+        match &r.action {
+            RepairAction::NeedsReview {
+                reason: ReviewReason::SignatureChanged,
+                detail,
+            } => assert!(
+                detail.contains("xmm1") && detail.contains("rdx"),
+                "{detail}"
+            ),
+            other => panic!("expected review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_misfit_the_old_function_already_had_isnt_news() {
+        // The prototype never declared the third argument; both builds read r8. Not the repair's business.
+        use permanent_beta_model::ArgClass::Integer;
+        let r = decide(
+            &with_prototype("int f(int a, int b)"),
+            Some(&reads(func(0x10, 0), &[Integer, Integer, Integer])),
+            Some(report(Verdict::Accepted)),
+            Some(&reads(func(0x20, 0), &[Integer, Integer, Integer])),
+            vec![],
+        );
+        assert!(r.is_resolved(), "{:?}", r.action);
+        // Nothing to judge by: no inference, or a variadic prototype.
+        assert_eq!(
+            prototype_misfit("int f(int a)", &func(0x10, 0), &func(0x20, 0)),
+            None
+        );
+        assert_eq!(
+            prototype_misfit(
+                "int f(const char* fmt, ...)",
+                &reads(func(0x10, 0), &[Integer]),
+                &reads(func(0x20, 0), &[Integer, Integer])
+            ),
+            None
+        );
     }
 }
