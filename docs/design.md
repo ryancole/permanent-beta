@@ -59,7 +59,7 @@ Detecting breakage is easy. **Repairing** it is the valuable part, and it requir
 | Hook libraries | Detours first, via a library-neutral hook manifest | **[Provisional]** |
 | Hook manifest format | New TOML manifest (§7.1) | **[Provisional]**. Existing hooks' locator style is still unknown |
 | Local storage | SQLite (the skeleton uses a JSON file as a stand-in) | **[Provisional]** |
-| Open-source license | Apache-2.0 for core and Ghidra extension | **[Provisional]**. See §11 |
+| Open-source license | Apache-2.0 for everything in this repository | **[Decided]** 2026-11-08. See §11.5 |
 | Development model | Code is AI-written; the owner reviews | **[Decided]** |
 
 ### 2.1 Why Rust (summary)
@@ -980,20 +980,18 @@ be clear. **[Validate]**
 Via PyO3 bindings (`permanent-beta-py`) from IDAPython, or the same CLI/RPC route. Start after the repair pipeline is
 validated on the corpus.
 
-### 11.5 Licensing **[Provisional]**
+### 11.5 Licensing
 
-| Component | License intent |
+| Component | License |
 |---|---|
-| Core crates, CLI, MCP server, Ghidra extension, harness | Open source. Apache-2.0 recommended for its patent grant and compatibility with Ghidra. |
+| Core crates, CLI, MCP server, Ghidra extension, harness | **Apache-2.0** (decided 2026-11-08): its patent grant, and the same license as Ghidra and icicle. `LICENSE`, `NOTICE`, `license = "Apache-2.0"` on every crate. |
 | Signature database, test corpus (beyond the public ground-truth set), hosted history service | Proprietary, in **separate repositories**. |
-
-The repo currently has a placeholder `LICENSE`. Until a license is chosen, nothing is licensed for reuse.
 
 **No GPL code** (2026-11-08). Replay first emulated with Unicorn (GPL-2.0), which made any `pbeta` built with
 replay GPL-2.0 as a whole; GPL-2.0 and Apache-2.0 are generally considered incompatible. It now uses icicle (MIT or
 Apache-2.0) with Ghidra's x86 SLEIGH specification (Apache-2.0, embedded with Ghidra's license in
 `permanent-beta-replay/sleigh/`), so every build can carry an Apache-2.0 license. Keep it that way: add no GPL
-dependency. Not legal advice; part of the license decision.
+dependency. Not legal advice.
 Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing options open but deters contributors.
 
 ---
@@ -1055,7 +1053,7 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 **Product and business**
 14. Target-segment priority. Which segment do you interview first?
 15. Hosted service: is it worth building if most paying customers require on-prem anyway?
-16. Open-source license (Apache-2.0 vs MIT vs MPL-2.0) and contributor terms (DCO vs CLA).
+16. Open-source license: decided 2026-11-08, Apache-2.0. Still open: contributor terms (DCO vs CLA).
 17. Product name: decided as Permanent Beta (CLI `pbeta`). Trademark and crates.io availability not yet checked. **[Validate]**
 18. Who reviews AI-written code besides you, and what review is required to merge (e.g. corpus gate + owner
     approval)?

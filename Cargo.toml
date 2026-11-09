@@ -7,7 +7,7 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
 publish = false
-# License not chosen yet (see LICENSE and docs/design.md §11.5). Add `license = "..."` once decided.
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # Internal crates. Dependency rules are documented in docs/design.md §3.1 and CLAUDE.md.

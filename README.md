@@ -96,4 +96,5 @@ document.
 
 ## License
 
-Not yet chosen. See [LICENSE](LICENSE) and [licenses/README.md](licenses/README.md).
+Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party material keeps its own license
+([licenses/README.md](licenses/README.md)).

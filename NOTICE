@@ -1,0 +1,8 @@
+Permanent Beta
+Copyright 2026 Ryan Cole
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This product includes Ghidra's x86 SLEIGH processor specification (Ghidra 12.2,
+crates/permanent-beta-replay/sleigh/), developed by the National Security Agency
+and released under the Apache License, Version 2.0.

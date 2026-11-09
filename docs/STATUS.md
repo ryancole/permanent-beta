@@ -4,7 +4,10 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **replay emulates with icicle instead of Unicorn** (design §7.3, §11.5). icicle (MIT or
+Latest work: **licensed Apache-2.0** (design §11.5): `LICENSE`, `NOTICE` (crediting Ghidra's vendored x86
+specification), `license = "Apache-2.0"` on every crate. Contributor terms (DCO or CLA) are still open.
+
+Before that: **replay emulates with icicle instead of Unicorn** (design §7.3, §11.5). icicle (MIT or
 Apache-2.0) executes Ghidra's SLEIGH specification of x86-64, embedded from Ghidra 12.2 (Apache-2.0) in
 `permanent-beta-replay/sleigh/`, so replay and Ghidra share the instruction semantics and no build contains GPL
 code. Same results: all 23 replay unit tests, and the hook loop's 22 of 24 replaying hook repairs with the
@@ -300,7 +303,8 @@ What's new:
 | Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; UI extension (M6) not started |
 | Hosted service, IDA plugin | Not started (designed) |
 | AI fallback | Built and measured (M5), in `propose` and `repair --propose`: 75 of 77 proposals correct on Lua and zstd, /O2 and /Od (remeasured 2026-11-07); `none` on 11 of 12 deleted functions; no wrong proposal passes verification (design §8) |
-| License choice, market validation | Open |
+| License choice | Apache-2.0 (2026-11-08); contributor terms open |
+| Market validation | Open |
 
 ## Suggested next steps
 
@@ -336,9 +340,9 @@ What's new:
    pointers inside structs (depth > 1), a target whose callee changed telling "this function changed" from "a
    callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests. Struct proposals without a PDB (Ghidra types) are open.
-5. **License decision** (design §11.5): no GPL code is left (icicle replaced Unicorn), so Apache-2.0 for
-   everything is open again. Still to choose: the license itself and contributor terms (DCO or CLA).
-6. **Outside the code:** choose the license; talk to legacy-software teams (design §14).
+5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
+   Still to choose: contributor terms (DCO or CLA).
+6. **Outside the code:** talk to legacy-software teams (design §14).
 
 ## Known rough edges
 
