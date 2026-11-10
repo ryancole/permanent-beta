@@ -147,6 +147,11 @@ pub enum CaptureKind {
     Cstring,
     /// As many bytes as the argument in `len_slot` says, up to `max` (a buffer and its length).
     Sized,
+    /// A scalar of `size` bytes (or a pointer, for `T**`) that may be one element of an array, or a field of a
+    /// struct the prototype doesn't name: the whole heap block holding it, from the block's start (zlib's
+    /// `inflate_table` gets pointers into the middle of inflate's state), up to the recorder's cap; otherwise
+    /// (the stack, a block too large) `size` bytes at the pointer, as `fixed`.
+    Array,
     /// Memory reached through a pointer inside captured memory (`HarnessSpec::pointer_depth`): untyped bytes, never
     /// overlapping an argument's region. Its `arg` is the argument it was reached from.
     Pointee,
@@ -501,7 +506,9 @@ impl EntryState {
 /// Memory one pointer argument pointed to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
-    /// The argument (0-based parameter position) whose value is `address`.
+    /// The argument (0-based parameter position) whose value is `address`: for an
+    /// [`CaptureKind::Array`] region, inside `address..address + size` (the start of the heap block holding it);
+    /// for a [`CaptureKind::Pointee`], the argument it was reached from.
     pub arg: u32,
     pub address: Word,
     pub size: u64,

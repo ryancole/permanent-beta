@@ -815,6 +815,26 @@ size_t heap_block_size(unsigned long long p) {
     }
 }
 
+// The busy process-heap block holding p (its start or anywhere inside it): {start, size}, or {0, 0}. Walks the
+// whole heap under its lock, allocating nothing; only `array` arguments pay for it.
+std::pair<unsigned long long, size_t> enclosing_heap_block(unsigned long long p) {
+    HANDLE heap = GetProcessHeap();
+    if (!HeapLock(heap)) {
+        return {0, 0};
+    }
+    std::pair<unsigned long long, size_t> found{0, 0};
+    PROCESS_HEAP_ENTRY e{};
+    while (HeapWalk(heap, &e)) {
+        unsigned long long start = reinterpret_cast<unsigned long long>(e.lpData);
+        if ((e.wFlags & PROCESS_HEAP_ENTRY_BUSY) && p >= start && p - start < e.cbData) {
+            found = {start, static_cast<size_t>(e.cbData)};
+            break;
+        }
+    }
+    HeapUnlock(heap);
+    return found;
+}
+
 void capture_pointees(RecordCall* call, const RecordFrame* f) {
     if (g_pointer_depth == 0 || g_pointers.empty()) {
         return;
@@ -1048,8 +1068,34 @@ extern "C" void* pbeta_record_before(RecordFrame* f) {
             continue;
         }
         size_t n = 0;
+        unsigned long long at = address;  // where the captured region starts
         if (a.capture == "fixed") {
             n = static_cast<size_t>(a.size);
+        } else if (a.capture == "array") {
+            // A scalar that may be an element of an array (design §7.3): the whole heap block holding it, from
+            // its start, unless the block is over kPointeeHeapMax, overlaps redacted memory, or overlaps another
+            // argument's region without lying inside it; then its own bytes, as `fixed`.
+            n = static_cast<size_t>(a.size);
+            auto block = enclosing_heap_block(address);
+            if (block.second >= n && block.second <= kPointeeHeapMax && !overlaps_redacted(block.first, block.second)) {
+                unsigned long long lo = block.first, hi = block.first + block.second;
+                bool inside_one = false, overlaps = false;
+                for (const PendingRegion& r : call->regions) {
+                    unsigned long long rlo = r.address, rhi = r.address + r.before.size();
+                    if (rlo <= lo && hi <= rhi) {
+                        inside_one = true;
+                    } else if (lo < rhi && rlo < hi) {
+                        overlaps = true;
+                    }
+                }
+                if (inside_one && !a.redact) {
+                    continue;  // another argument's region already holds it (inflate_table's pointers)
+                }
+                if (!overlaps) {
+                    at = lo;
+                    n = block.second;
+                }
+            }
         } else if (a.capture == "cstring") {
             n = safe_strlen(reinterpret_cast<const char*>(address), static_cast<size_t>(a.max ? a.max : 4096));
         } else if (a.capture == "sized") {
@@ -1065,18 +1111,18 @@ extern "C" void* pbeta_record_before(RecordFrame* f) {
         if (a.redact) {
             if (n) {
                 EnterCriticalSection(&g_lock);
-                g_redacted.emplace_back(address, address + n);
+                g_redacted.emplace_back(at, at + n);
                 LeaveCriticalSection(&g_lock);
             }
             continue;  // never captured
         }
         PendingRegion r;
         r.arg = a.index;
-        r.address = address;
+        r.address = at;
         r.kind = a.capture;
         r.layout = a.layout;
         r.before.resize(n);
-        if (n && !safe_copy(r.before.data(), reinterpret_cast<const void*>(address), n)) {
+        if (n && !safe_copy(r.before.data(), reinterpret_cast<const void*>(at), n)) {
             continue;  // unreadable: not captured, so a replay that reads it is inconclusive
         }
         call->regions.push_back(std::move(r));

@@ -131,10 +131,16 @@ fn prepare(
             before: r.before.clone(),
             expected_after: r.after.clone(),
             compare: std::iter::once(0..r.before.len()).collect(),
-            label: if r.region.kind == CaptureKind::Pointee {
-                format!("memory at {:#x} (through arg{arg})", r.region.address.0)
-            } else {
-                format!("arg{arg}")
+            label: match r.region.kind {
+                CaptureKind::Pointee => {
+                    format!("memory at {:#x} (through arg{arg})", r.region.address.0)
+                }
+                // The heap block arg points into: what the function writes there is its output, compared like
+                // the argument's own memory.
+                CaptureKind::Array => {
+                    format!("arg{arg}'s heap block at {:#x}", r.region.address.0)
+                }
+                _ => format!("arg{arg}"),
             },
             translated: false,
             pointee: r.region.kind == CaptureKind::Pointee,
@@ -482,7 +488,11 @@ fn compare(
         ValueType::Unknown => return CaseOutcome::inconclusive("unknown return type"),
     }
     let mut pointee_difference = None;
-    for (p, got) in prepared.iter().zip(&ran.regions) {
+    for ((p, got), &released) in prepared.iter().zip(&ran.regions).zip(&ran.released) {
+        if released {
+            compared.push(format!("{} freed", p.label));
+            continue;
+        }
         for r in &p.compare {
             if let Some(i) =
                 first_difference(p.address, &p.expected_after, got, r.clone(), &mut pointers)

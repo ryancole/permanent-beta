@@ -1,5 +1,5 @@
 //! Replay tests on a hand-built PE image: `.text` with one small function per case, `.rdata` with imports of
-//! `kernel32.dll!Sleep` and `kernel32.dll!__acrt_iob_func` and a constant, `.data` with a global.
+//! `kernel32.dll!Sleep`, `__acrt_iob_func`, `malloc`, `realloc` and `free` and a constant, `.data` with a global.
 
 use super::*;
 use permanent_beta_model::{
@@ -28,6 +28,10 @@ const WRITE_GLOBAL: u32 = 0x10c0; // mov [rip -> .data], ecx; ret
 const WRITE_IMAGE_PTR: u32 = 0x10d0; // lea rax, [rip -> .rdata+0x100]; mov [rcx], rax; ret
 const MALLOC_WRITE_READ: u32 = 0x10e0; // p = malloc(16); *(int*)p = 7; return *(int*)p
 const MALLOC_READ: u32 = 0x1100; // p = malloc(16); return *(int*)p (never written)
+const REALLOC_READ: u32 = 0x1120; // p = malloc(16); *(int*)p = 7; p = realloc(p, 32); return *(int*)p
+const REALLOC_READ_GROWN: u32 = 0x1150; // ... p = realloc(p, 32); return *(int*)(p + 16) (never written)
+const REALLOC_READ_OLD: u32 = 0x1180; // ... q = realloc(p, 32); return *(int*)p
+const FREE_ARG: u32 = 0x11c0; // free(rcx)
 
 /// Where the recording process had the old image loaded (cases record `image_size` 0x4000).
 const OLD_BASE: u64 = 0x7ff6_0000_0000;
@@ -93,6 +97,37 @@ fn text() -> Vec<u8> {
     let mut m = malloc_call(MALLOC_READ);
     m.extend([0x8b, 0x00, 0x48, 0x83, 0xc4, 0x28, 0xc3]);
     put(MALLOC_READ, &m);
+    // malloc(16), *p = 7, p saved at [rsp+20h], then realloc(p, 32) through IAT+0x18, then `tail`.
+    let realloc_call = |at: u32, tail: &[u8]| {
+        let mut m = malloc_call(at);
+        m.extend([0xc7, 0x00, 0x07, 0x00, 0x00, 0x00]); // mov dword [rax], 7
+        m.extend([0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+20h], rax
+        m.extend([0x48, 0x89, 0xc1, 0xba, 0x20, 0x00, 0x00, 0x00]); // mov rcx, rax; mov edx, 32
+        let call_at = at + m.len() as u32;
+        m.extend([0xff, 0x15]);
+        m.extend(rel32(call_at, 6, RDATA + 0x78));
+        m.extend(tail);
+        m.extend([0x48, 0x83, 0xc4, 0x28, 0xc3]); // add rsp, 28h; ret
+        m
+    };
+    put(REALLOC_READ, &realloc_call(REALLOC_READ, &[0x8b, 0x00]));
+    // mov eax, [rax+10h]
+    put(
+        REALLOC_READ_GROWN,
+        &realloc_call(REALLOC_READ_GROWN, &[0x8b, 0x40, 0x10]),
+    );
+    // mov rax, [rsp+20h]; mov eax, [rax]
+    put(
+        REALLOC_READ_OLD,
+        &realloc_call(
+            REALLOC_READ_OLD,
+            &[0x48, 0x8b, 0x44, 0x24, 0x20, 0x8b, 0x00],
+        ),
+    );
+    let mut f = vec![0x48, 0x83, 0xec, 0x28, 0xff, 0x15]; // sub rsp, 28h; call [rip -> IAT+0x20] (free)
+    f.extend(rel32(FREE_ARG + 4, 6, RDATA + 0x80));
+    f.extend([0x48, 0x83, 0xc4, 0x28, 0xc3]);
+    put(FREE_ARG, &f);
     t
 }
 
@@ -100,20 +135,20 @@ fn rdata() -> Vec<u8> {
     let mut r = vec![0u8; 0x200];
     let mut put = |off: usize, bytes: &[u8]| r[off..off + bytes.len()].copy_from_slice(bytes);
     // Import descriptor: OriginalFirstThunk, TimeDateStamp, ForwarderChain, Name, FirstThunk; then a null one.
-    put(0x00, &(RDATA + 0x40).to_le_bytes());
-    put(0x0c, &(RDATA + 0x80).to_le_bytes());
+    put(0x00, &(RDATA + 0x140).to_le_bytes());
+    put(0x0c, &(RDATA + 0x180).to_le_bytes());
     put(0x10, &(RDATA + 0x60).to_le_bytes());
-    put(0x40, &u64::from(RDATA + 0xa0).to_le_bytes()); // INT
-    put(0x48, &u64::from(RDATA + 0xc0).to_le_bytes());
-    put(0x50, &u64::from(RDATA + 0xe0).to_le_bytes());
-    put(0x60, &u64::from(RDATA + 0xa0).to_le_bytes()); // IAT
-    put(0x68, &u64::from(RDATA + 0xc0).to_le_bytes());
-    put(0x70, &u64::from(RDATA + 0xe0).to_le_bytes());
-    put(0x80, b"kernel32.dll\0");
+    for (i, name) in [0xa0u32, 0xc0, 0xe0, 0x120, 0x130].iter().enumerate() {
+        put(0x140 + 8 * i, &u64::from(RDATA + name).to_le_bytes()); // INT
+        put(0x60 + 8 * i, &u64::from(RDATA + name).to_le_bytes()); // IAT, 0x60..0x88
+    }
+    put(0x180, b"kernel32.dll\0");
     put(0xa2, b"Sleep\0");
     put(0xc2, b"__acrt_iob_func\0");
     put(0xe2, b"malloc\0");
     put(0x100, &1234u32.to_le_bytes());
+    put(0x122, b"realloc\0");
+    put(0x132, b"free\0");
     r
 }
 
@@ -333,7 +368,9 @@ fn the_test_image_parses() {
         vec![
             (RDATA + 0x60, "kernel32.dll!Sleep".to_owned()),
             (RDATA + 0x68, "kernel32.dll!__acrt_iob_func".to_owned()),
-            (RDATA + 0x70, "kernel32.dll!malloc".to_owned())
+            (RDATA + 0x70, "kernel32.dll!malloc".to_owned()),
+            (RDATA + 0x78, "kernel32.dll!realloc".to_owned()),
+            (RDATA + 0x80, "kernel32.dll!free".to_owned()),
         ]
     );
     let data = img.section_at(u64::from(DATA)).unwrap();
@@ -955,20 +992,26 @@ const HEAP_BLOCK: u64 = 0x6_0000_0040;
 
 /// `c` with its import calls recorded: one `malloc(size)` that returned `HEAP_BLOCK`.
 #[cfg(feature = "emulator")]
-fn with_malloc(mut c: LoadedCase, size: u64) -> LoadedCase {
+fn with_malloc(c: LoadedCase, size: u64) -> LoadedCase {
+    with_call(c, "malloc", size, 0, HEAP_BLOCK)
+}
+
+/// `c` with one more recorded import call: `kernel32.dll!name(rcx, rdx)` returning `rax`.
+#[cfg(feature = "emulator")]
+fn with_call(mut c: LoadedCase, name: &str, rcx: u64, rdx: u64, rax: u64) -> LoadedCase {
     c.case.imports_recorded = true;
     let call = permanent_beta_model::ImportCall {
-        import: "kernel32.dll!malloc".into(),
+        import: format!("kernel32.dll!{name}"),
         entry: EntryState {
-            rcx: Word(size),
-            rdx: Word(0),
+            rcx: Word(rcx),
+            rdx: Word(rdx),
             r8: Word(0),
             r9: Word(0),
             xmm: [Xmm::default(); 4],
             stack: Vec::new(),
         },
         observed: Observed {
-            rax: Word(HEAP_BLOCK),
+            rax: Word(rax),
             xmm0: Xmm::default(),
         },
         memory: Vec::new(),
@@ -979,6 +1022,125 @@ fn with_malloc(mut c: LoadedCase, size: u64) -> LoadedCase {
         memory: Vec::new(),
     });
     c
+}
+
+/// Where the recorded `realloc(HEAP_BLOCK, 32)` moved the block, when it moved.
+#[cfg(feature = "emulator")]
+const MOVED_BLOCK: u64 = 0x6_0000_2000;
+
+/// A case returning `rax` whose recorded calls are `malloc(16)` and then `realloc(HEAP_BLOCK, size)` returning
+/// `to`.
+#[cfg(feature = "emulator")]
+fn with_realloc(rax: u64, size: u64, to: u64) -> LoadedCase {
+    with_call(
+        with_malloc(case(0, 0, rax, None), 16),
+        "realloc",
+        HEAP_BLOCK,
+        size,
+        to,
+    )
+}
+
+#[cfg(feature = "emulator")]
+fn run_on(rva: u32, ret: ValueType, c: &LoadedCase) -> CaseOutcome {
+    replay(
+        &image(),
+        Rva(u64::from(rva)),
+        &spec(ret),
+        c,
+        &NewBuild::default(),
+    )
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_reallocated_block_keeps_what_was_written() {
+    // Moved and in place: the 7 written before realloc is still there.
+    for to in [MOVED_BLOCK, HEAP_BLOCK] {
+        let o = run_on(REALLOC_READ, ValueType::Int(4), &with_realloc(7, 32, to));
+        assert!(matches!(o, CaseOutcome::Pass { .. }), "to {to:#x}: {o:?}");
+    }
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn the_grown_part_of_a_reallocated_block_is_unwritten() {
+    // Negative: what realloc added holds nothing known, moved or in place.
+    for to in [MOVED_BLOCK, HEAP_BLOCK] {
+        let o = run_on(
+            REALLOC_READ_GROWN,
+            ValueType::Int(4),
+            &with_realloc(0, 32, to),
+        );
+        match o {
+            CaseOutcome::Inconclusive { reason } => {
+                assert!(reason.contains("didn't capture"), "{reason}")
+            }
+            other => panic!("to {to:#x}: expected inconclusive, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_moved_block_is_gone() {
+    // Negative: reading through the old pointer after realloc moved the block.
+    let o = run_on(
+        REALLOC_READ_OLD,
+        ValueType::Int(4),
+        &with_realloc(7, 32, MOVED_BLOCK),
+    );
+    match o {
+        CaseOutcome::Inconclusive { reason } => {
+            assert!(reason.contains(&format!("{HEAP_BLOCK:#x}")), "{reason}")
+        }
+        other => panic!("expected inconclusive, got {other:?}"),
+    }
+    // In place, the old pointer is the block.
+    let o = run_on(
+        REALLOC_READ_OLD,
+        ValueType::Int(4),
+        &with_realloc(7, 32, HEAP_BLOCK),
+    );
+    assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_realloc_of_another_size_is_inconclusive() {
+    // Negative: the old build grew the block to 64 bytes, the candidate to 32.
+    let o = run_on(
+        REALLOC_READ,
+        ValueType::Int(4),
+        &with_realloc(7, 64, MOVED_BLOCK),
+    );
+    match o {
+        CaseOutcome::Inconclusive { reason } => assert!(reason.contains("size"), "{reason}"),
+        other => panic!("expected inconclusive, got {other:?}"),
+    }
+}
+
+#[test]
+#[cfg(feature = "emulator")]
+fn a_recorded_block_the_function_frees_isnt_compared() {
+    // The function frees the block it was given; the recorded process's heap then wrote its bookkeeping there.
+    let (before, after) = ([1u8; 16], [0xfe; 16]);
+    let c = with_call(
+        case(STRUCT_AT, 0, 0, Some((&before, &after, None))),
+        "free",
+        STRUCT_AT,
+        0,
+        0,
+    );
+    let o = run_on(FREE_ARG, ValueType::Void, &c);
+    assert!(
+        matches!(&o, CaseOutcome::Pass { detail } if detail.contains("freed")),
+        "{o:?}"
+    );
+    // Negative: not freed, the same difference fails (DOUBLE leaves the region alone).
+    let c = case(STRUCT_AT, 0, 0, Some((&before, &after, None)));
+    let o = run_on(DOUBLE, ValueType::Void, &c);
+    assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
 }
 
 #[test]

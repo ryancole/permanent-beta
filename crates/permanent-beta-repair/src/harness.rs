@@ -3,13 +3,16 @@
 //!
 //! Per parameter: its Win64 slot, how the value travels (integer, float, pointer) and its width, and for a
 //! pointer what it points to:
-//! - a struct the PDB lays out, or a scalar: that many bytes (`fixed`);
+//! - a struct the PDB lays out: that many bytes (`fixed`);
+//! - a scalar or a pointer (`int*`, `unsigned short*`, `T**`): `array`, the whole heap block holding it, since the
+//!   prototype can't say whether it's one value or an element of an array (zlib's `inflate_table(..., unsigned
+//!   short* lens, ...)`), and otherwise its own bytes;
 //! - `const char*` / `char*`: a NUL-terminated string (`cstring`);
 //! - a byte pointer (`char*`, `unsigned char*`, `void*`, …) directly followed by an integer whose name says it's
 //!   a length (`len`, `size`, `cap`, `n`, …): that many bytes (`sized`). **[Guess]**: the names are the only
 //!   evidence. A wrong guess captures too little (replay reads uncaptured memory: inconclusive), never too much:
 //!   the recorder reads at most `max` bytes and survives unreadable memory.
-//! - anything else (a struct without a layout, `T**`, an unknown typedef): nothing. A replay that reads it is
+//! - anything else (a struct without a layout, `T***`, an unknown typedef): nothing. A replay that reads it is
 //!   inconclusive.
 //!
 //! Per hook, the globals to capture with each call: those the function, or anything it calls directly or
@@ -118,7 +121,7 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
                         }
                     }
                     Pointee::Scalar(size) => {
-                        arg.capture = CaptureKind::Fixed;
+                        arg.capture = CaptureKind::Array;
                         arg.size = Some(size);
                     }
                     Pointee::Named(name) => {
@@ -130,6 +133,12 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
                                 out.layouts.push(layout.clone());
                             }
                         }
+                    }
+                    // A pointer to a pointer (`code** table`, `char** argv`): the pointers, as an array; what
+                    // they point to isn't followed.
+                    Pointee::Unknown if is_pointer_to_pointer(&p.ty) => {
+                        arg.capture = CaptureKind::Array;
+                        arg.size = Some(8);
                     }
                     Pointee::Unknown => {}
                 }
@@ -357,6 +366,11 @@ fn pointee(ty: &str) -> Pointee {
     }
 }
 
+/// `T**`, and nothing else (no references, arrays or more stars).
+fn is_pointer_to_pointer(ty: &str) -> bool {
+    !ty.contains('&') && !ty.contains('[') && ty.matches('*').count() == 2
+}
+
 /// Parameter names that say "the byte count of the previous parameter". **[Guess]**
 fn is_length_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
@@ -477,10 +491,10 @@ mod tests {
         let slots: Vec<String> = h.args.iter().map(|a| a.slot.to_string()).collect();
         assert_eq!(slots, ["xmm0", "xmm1", "r8", "r9", "stack+0x28"]);
         assert_eq!(h.stack_args, 1);
-        // `int* out`: a scalar pointee, 4 bytes.
+        // `int* out`: a scalar pointee, 4 bytes, or the heap block it's an element of.
         assert_eq!(
             (h.args[2].capture, h.args[2].size),
-            (CaptureKind::Fixed, Some(4))
+            (CaptureKind::Array, Some(4))
         );
         assert_eq!(s.hook("log_event").unwrap().ret, ValueType::Void);
     }
@@ -514,12 +528,46 @@ mod tests {
     }
 
     #[test]
+    fn arrays_of_scalars_and_pointers() {
+        // zlib's inflate_table: every pointer may index an array in inflate's state.
+        let m = manifest(&[(
+            "inflate_table",
+            Some(
+                "int inflate_table(int type, unsigned short* lens, unsigned int codes, code** table, unsigned int* bits, unsigned short* work)",
+            ),
+            "v1",
+        )]);
+        let s = spec(&m, &export("v1", vec![]), 8);
+        let got: Vec<(CaptureKind, Option<u64>)> = s.hooks[0]
+            .args
+            .iter()
+            .map(|a| (a.capture, a.size))
+            .collect();
+        use CaptureKind::{Array, None as Nothing};
+        assert_eq!(
+            got,
+            [
+                (Nothing, None),
+                (Array, Some(2)),
+                (Nothing, None),
+                (Array, Some(8)),
+                (Array, Some(4)),
+                (Array, Some(2)),
+            ]
+        );
+        // Negative: three stars, and a reference to a pointer, capture nothing.
+        assert!(!is_pointer_to_pointer("char***"));
+        assert!(!is_pointer_to_pointer("char*&"));
+        assert!(is_pointer_to_pointer("const char* const*"));
+    }
+
+    #[test]
     fn unknown_pointees_capture_nothing() {
-        // Negative: no PDB layout for Order, a pointer to a pointer, an unknown typedef, a byte buffer with no
-        // length after it.
+        // Negative: no PDB layout for Order, a pointer to a pointer to a pointer, an unknown typedef, a byte
+        // buffer with no length after it.
         let m = manifest(&[
             ("a", Some("int a(Order* o)"), "v1"),
-            ("b", Some("int b(char** argv)"), "v1"),
+            ("b", Some("int b(char*** argv)"), "v1"),
             ("c", Some("int c(HANDLE_T* h)"), "v1"),
             ("d", Some("int d(unsigned char* p, int flags)"), "v1"),
         ]);

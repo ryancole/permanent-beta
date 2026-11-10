@@ -67,6 +67,9 @@ pub struct Ran {
     pub xmm0: [u8; 16],
     /// Each placed region's bytes after the call, in `Setup::regions` order.
     pub regions: Vec<Vec<u8>>,
+    /// Per region: the function freed it (`free`, or a `realloc` that moved it). What a freed block holds
+    /// afterwards is the heap's business (the recorded bytes may be its bookkeeping), so it isn't compared.
+    pub released: Vec<bool>,
     /// Each global's bytes after the call, in `Setup::globals` order.
     pub globals: Vec<Vec<u8>>,
     /// Import calls answered from the recording.
@@ -519,6 +522,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     vm.cpu.write_pc(base + setup.rva);
     let mut stand_ins = setup.imports.clone();
     let mut heap_blocks: Vec<Range<u64>> = Vec::new();
+    let mut released = vec![false; setup.regions.len()];
     // What an import may read: what something put there (see EmuView).
     let exact: Vec<Range<u64>> = setup
         .regions
@@ -587,14 +591,33 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
                         heap_blocks.push(address..address + size);
                     }
                     Some(imports::Heap::Free { address }) => {
-                        // Only a block this run handed out, or recorded memory the function was given.
-                        if let Some(b) = heap_blocks.iter().position(|b| b.start == address) {
-                            let b = heap_blocks.remove(b);
+                        // A block this run handed out, or recorded memory the function was given.
+                        if let Some(b) =
+                            take_block(&mut heap_blocks, setup.regions, &mut released, address)
+                        {
                             vm.cpu
                                 .mem
                                 .update_perm(b.start, b.end - b.start, perm::NONE)
                                 .map_err(mem_err)?;
                         }
+                    }
+                    Some(imports::Heap::Reallocate { from, to, size }) => {
+                        let old = take_block(&mut heap_blocks, setup.regions, &mut released, from)
+                            .ok_or_else(|| {
+                                format!(
+                                    "{name} of {from:#x}: not a block replay handed out or the recording holds                                      from its start"
+                                )
+                            })?;
+                        reallocate(vm, old, to, size)?;
+                        if to == from {
+                            // In place: the recorded region (if it was one) is still the function's memory.
+                            for (i, r) in setup.regions.iter().enumerate() {
+                                if r.address == from {
+                                    released[i] = false;
+                                }
+                            }
+                        }
+                        heap_blocks.push(to..to + size);
                     }
                     None => {}
                 }
@@ -652,12 +675,87 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         rax,
         xmm0,
         regions,
+        released,
         globals,
         import_calls,
         instructions: vm.cpu.icount - started_at,
         image: base..base + image.size(),
         rewritten,
     })
+}
+
+/// Takes the block starting at `address` out of what the function holds: a block this run handed out, or else a
+/// recorded region starting there (marked released). `None` if it's neither.
+fn take_block(
+    heap_blocks: &mut Vec<Range<u64>>,
+    regions: &[Placed],
+    released: &mut [bool],
+    address: u64,
+) -> Option<Range<u64>> {
+    if let Some(i) = heap_blocks.iter().position(|b| b.start == address) {
+        // A recorded region grown or shrunk in place is one of these now: it goes too.
+        for (r, gone) in regions.iter().zip(released.iter_mut()) {
+            if r.address == address {
+                *gone = true;
+            }
+        }
+        return Some(heap_blocks.remove(i));
+    }
+    let i = regions
+        .iter()
+        .enumerate()
+        .position(|(i, r)| r.address == address && !r.bytes.is_empty() && !released[i])?;
+    released[i] = true;
+    Some(address..address + regions[i].bytes.len() as u64)
+}
+
+/// `realloc` of `old` to `size` bytes at `to`: the bytes the function may read (written, or placed) in the first
+/// `min(old, size)` move along, and the rest of the new block is writable but unreadable until written. Moved,
+/// the old block is gone; in place, what's past the new size is.
+fn reallocate(vm: &mut icicle_vm::Vm, old: Range<u64>, to: u64, size: u64) -> Result<(), String> {
+    let keep = (old.end - old.start).min(size);
+    let mem = &mut vm.cpu.mem;
+    // Runs of readable bytes in what's kept, before any permission changes.
+    let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut at = 0;
+    while at < keep {
+        let readable = |a: u64| {
+            let p = mem.get_perm(old.start + a);
+            p & (perm::READ | perm::INIT) == perm::READ | perm::INIT
+        };
+        if !readable(at) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < keep && readable(at) {
+            at += 1;
+        }
+        let mut bytes = vec![0u8; (at - start) as usize];
+        mem.read_bytes(old.start + start, &mut bytes, perm::NONE)
+            .map_err(mem_err)?;
+        runs.push((start, bytes));
+    }
+    if to == old.start {
+        if size > keep {
+            mem.update_perm(to + keep, size - keep, perm::READ | perm::WRITE)
+                .map_err(mem_err)?;
+        } else if old.end > to + size {
+            mem.update_perm(to + size, old.end - (to + size), perm::NONE)
+                .map_err(mem_err)?;
+        }
+        return Ok(());
+    }
+    mem.update_perm(old.start, old.end - old.start, perm::NONE)
+        .map_err(mem_err)?;
+    mem.update_perm(to, size, perm::READ | perm::WRITE)
+        .map_err(|_| format!("realloc: couldn't hand out {size:#x} bytes at {to:#x}"))?;
+    // Writing marks the bytes initialized (readable).
+    for (off, bytes) in runs {
+        mem.write_bytes(to + off, &bytes, perm::NONE)
+            .map_err(mem_err)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

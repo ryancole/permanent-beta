@@ -12,6 +12,9 @@
 //!   isn't in memory, so equal inputs are what make it the same call.
 //! - `__stdio_common_vsprintf(options, buffer, count, format, locale, va_list)`: the same checks and count, then
 //!   writes the bytes the recorded call wrote into its buffer (`min(result + 1, count)`) into the candidate's.
+//! - `malloc`, `calloc`, `free`, `realloc`: the same request (block and size), answered with the recorded block
+//!   at its recorded address ([`Heap`]). A `realloc` that moved the block carries over the bytes the function may
+//!   read; what it added is unreadable until written.
 //!
 //! Conversions are compared by meaning, not by bits: integers at their width (the rest of an 8-byte `va_list` slot
 //! can hold anything), doubles by their 8 bytes, `%s` by the string's content (a string literal's address
@@ -53,6 +56,10 @@ pub enum Heap {
     },
     /// The block at `address` is gone: touching it is inconclusive.
     Free { address: u64 },
+    /// `realloc`: the block at `from` is now `size` bytes at `to` (the same address when it grew or shrank in
+    /// place). What the function had written in its first `min(old size, size)` bytes moves with it; the rest is
+    /// unreadable until written. Moved, the old block is gone.
+    Reallocate { from: u64, to: u64, size: u64 },
 }
 
 /// An import call's arguments and the memory they point to.
@@ -103,13 +110,14 @@ pub fn base_name(import: &str) -> &str {
 }
 
 /// The imports [`StandIns`] can answer for.
-pub const MODELLED: [&str; 6] = [
+pub const MODELLED: [&str; 7] = [
     "__acrt_iob_func",
     "__stdio_common_vfprintf",
     "__stdio_common_vsprintf",
     "malloc",
     "calloc",
     "free",
+    "realloc",
 ];
 
 /// Largest heap block replay hands out. **[Guess]**
@@ -326,11 +334,46 @@ impl StandIns {
                     heap: (address != 0).then_some(Heap::Free { address }),
                 })
             }
+            // The same block and size as recorded, answered with the recorded result: the UCRT's `realloc(NULL,
+            // n)` allocates, `realloc(p, 0)` frees `p` and returns NULL, and a NULL result for `n > 0` leaves `p`
+            // as it was.
+            "realloc" => {
+                same_value(name, now, &r, 0, 8, "pointer")?;
+                same_value(name, now, &r, 1, 8, "size")?;
+                let (from, size) = (arg_of(&r, 0, name)?, arg_of(&r, 1, name)?);
+                if size > MAX_ALLOCATION {
+                    return Err(format!(
+                        "{name} to {size} bytes: more than replay hands out"
+                    ));
+                }
+                let heap = match (from, size, rax) {
+                    (0, 0, _) | (0, _, 0) => None,
+                    (0, _, to) => Some(Heap::Allocate {
+                        address: to,
+                        size,
+                        zeroed: false,
+                    }),
+                    (_, 0, 0) => Some(Heap::Free { address: from }),
+                    (_, 0, _) => {
+                        return Err(format!(
+                            "the recorded {name} to 0 bytes returned {rax:#x}: what it did isn't modelled"
+                        ));
+                    }
+                    (_, _, 0) => None,
+                    (_, _, to) => Some(Heap::Reallocate { from, to, size }),
+                };
+                Ok(Effect {
+                    rax,
+                    writes: Vec::new(),
+                    heap,
+                })
+            }
             _ => unreachable!("checked against MODELLED"),
         }
     }
 
-    /// The blocks the recorded `malloc` and `calloc` calls returned, so the emulator can keep their addresses free.
+    /// The blocks the recorded `malloc`, `calloc` and `realloc` calls returned, so the emulator can keep their
+    /// addresses free.
     pub fn allocations(&self) -> Vec<std::ops::Range<u64>> {
         self.calls
             .iter()
@@ -339,6 +382,7 @@ impl StandIns {
                 let size = match base_name(&c.call.import) {
                     "malloc" => r.arg(0)?,
                     "calloc" => r.arg(0)?.checked_mul(r.arg(1)?)?,
+                    "realloc" => r.arg(1)?,
                     _ => return None,
                 };
                 let at = c.call.observed.rax.0;
@@ -873,5 +917,58 @@ mod tests {
         let copy = recorded("x!memcpy", &[0x2000, 0x1000, 4], 0x2000, Vec::new());
         let mut s = StandIns::new(vec![copy, iob]);
         assert!(s.finish().is_err());
+    }
+
+    /// The candidate's `realloc(ptr, size)` against the recorded one that returned `rax`.
+    fn realloc(ptr: u64, size: u64, rax: u64) -> Result<Effect, Refusal> {
+        let rec = recorded("x!realloc", &[ptr, size], rax, Vec::new());
+        let now = Now {
+            args: vec![ptr, size],
+            memory: BTreeMap::new(),
+        };
+        StandIns::new(vec![rec]).call("ucrtbase.dll!realloc", &now)
+    }
+
+    #[test]
+    fn realloc_follows_the_recorded_result() {
+        let heap = |ptr, size, rax| realloc(ptr, size, rax).unwrap().heap;
+        assert_eq!(
+            heap(0x1000, 64, 0x2000),
+            Some(Heap::Reallocate {
+                from: 0x1000,
+                to: 0x2000,
+                size: 64
+            })
+        );
+        // NULL in: an allocation. Size 0: a free. NULL out for a real size: the block stays.
+        assert_eq!(
+            heap(0, 64, 0x2000),
+            Some(Heap::Allocate {
+                address: 0x2000,
+                size: 64,
+                zeroed: false
+            })
+        );
+        assert_eq!(heap(0x1000, 0, 0), Some(Heap::Free { address: 0x1000 }));
+        assert_eq!(heap(0x1000, 64, 0), None);
+        // Its block is kept free like malloc's.
+        let rec = recorded("x!realloc", &[0x1000, 64], 0x2000, Vec::new());
+        assert_eq!(StandIns::new(vec![rec]).allocations(), vec![0x2000..0x2040]);
+    }
+
+    #[test]
+    fn realloc_of_another_block_or_size_is_refused() {
+        // Negative: another pointer, another size, an absurd size, and a size-0 call that returned a block.
+        let rec = recorded("x!realloc", &[0x1000, 64], 0x2000, Vec::new());
+        for (args, what) in [(vec![0x1100, 64], "pointer"), (vec![0x1000, 32], "size")] {
+            let now = Now {
+                args,
+                memory: BTreeMap::new(),
+            };
+            let got = StandIns::new(vec![rec.clone()]).call("x!realloc", &now);
+            assert!(matches!(&got, Err(why) if why.contains(what)), "{got:?}");
+        }
+        assert!(realloc(0x1000, MAX_ALLOCATION + 1, 0x2000).is_err());
+        assert!(realloc(0x1000, 0, 0x2000).is_err());
     }
 }

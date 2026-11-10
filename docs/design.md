@@ -607,7 +607,8 @@ Each detour logs what its prototype makes meaningful, written by hand.
 - *Record spec* (`pbeta harness-spec --hooks --analysis`): per hook bound to the build, from its prototype and the
   build's PDB struct layouts (`pbeta analyze --pdb`): each parameter's Win64 slot (`rcx`…`r9`, `xmm0`–`xmm3`,
   `stack+0x28`…), its value class and width (`int:4`, `float:8`, `pointer:8`), and what a pointer points to: a
-  struct with a layout or a scalar (`fixed`, that many bytes), `char*` (`cstring`), a byte pointer directly followed
+  struct with a layout (`fixed`, that many bytes), a scalar or a pointer (`int*`, `T**`: `array`, the heap block
+  holding it, else its own bytes), `char*` (`cstring`), a byte pointer directly followed
   by an integer named like a length (`sized`, **[Guess]**), or nothing. Per hook also the globals to capture
   (`[[hook.global]]`): those the function or anything it calls, directly or indirectly, refers to. They come from
   the analysis: `data_refs` (each function's RIP-relative references into writable sections, native) inside a
@@ -729,7 +730,7 @@ recorded block's address before placing anything), writable, and **readable only
 writes it** (icicle's uninitialized-memory tracking, now on; everything else is granted readable as before), so
 reading what the function never wrote is inconclusive, not a guess; `calloc` blocks are zeroed and readable; `free`
 of a handed-out block unmaps it. Another size is inconclusive (a struct may have grown). Up to 64 MiB a block
-**[Guess]**. `realloc` isn't modelled.
+**[Guess]**. `realloc` was added later (below).
 The recorder now follows structs by type through every level first and captures byte buffers after (a 64 KiB block
 behind a pointer into the middle of a heap buffer had swallowed zlib's state, which then wasn't followed). A byte
 pointer that doesn't start a heap block captures up to 64 KiB **[Guess]** (was 4 KiB), and one into the caller's
@@ -739,6 +740,23 @@ blocks, never the zeros around recorded regions that exist for vectorized over-r
 by copying those zeros, and are inconclusive now. zlib: **13 of 16** hooks replay, 0 fail, both steps: everything
 called but `inflate_table` (its `unsigned short*` arguments capture one element). zlib's structs have the same layout
 in all three releases, so translation still isn't measured on real code. Hook loop and fixture scorecards unchanged.
+
+**Array arguments and `realloc` (2026-11-09).** A pointer to a scalar or to a pointer (`unsigned short* lens`,
+`code** table`) can't say from the prototype whether it's one value or an element of an array. The record spec
+now gives it `array`: the recorder captures the whole process-heap block holding it (found with `HeapWalk`, its
+start or anywhere inside, up to 256 KiB **[Guess]**), once when several arguments point into the same block, and
+falls back to the element's own bytes on the stack, for a larger block, near redacted memory, or where the block
+would partly overlap another argument's region. The block is compared like the argument's own memory: what the
+function writes there is its output. zlib's `inflate_table` gets four pointers into inflate's state and now
+replays (3 of 3 cases); its cases replayed on each of the other 157 functions of v1.3.1 never pass (46 fail, 111
+inconclusive). `realloc` is answered like `malloc`: the same block and size, the recorded result. A moved block
+carries the bytes the function may read (per-byte permissions) to the new address and the old one is gone; what
+it grew by is unreadable until written; `realloc(NULL, n)` allocates, `realloc(p, 0)` frees, a NULL result leaves
+the block. It may be a block this run handed out or recorded memory starting at the pointer. A recorded region the
+function frees (`free`, or a moving `realloc`) is no longer compared after the call: the recorded bytes there may
+be the heap's bookkeeping. zlib doesn't call `realloc`, so it's measured only by unit tests. zlib: **14 of 16**
+hooks replay, 0 fail, both steps (`adler32_z` and `deflate_stored` aren't called). Hook loop and fixture
+scorecards unchanged.
 
 Not recorded: memory behind pointers inside structs beyond `pointer_depth` or without a typed field, the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is

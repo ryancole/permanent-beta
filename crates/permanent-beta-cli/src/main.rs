@@ -660,6 +660,9 @@ fn cmd_harness_spec(
                 let what = match (a.capture, a.layout.as_deref(), a.size) {
                     (CaptureKind::Fixed, Some(l), Some(n)) => format!("{l} ({n} bytes)"),
                     (CaptureKind::Fixed, None, Some(n)) => format!("{n} bytes"),
+                    (CaptureKind::Array, _, Some(n)) => {
+                        format!("{n}-byte elements (the heap block holding them)")
+                    }
                     (CaptureKind::Cstring, ..) => "string".into(),
                     (CaptureKind::Sized, ..) => {
                         format!(

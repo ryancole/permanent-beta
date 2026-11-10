@@ -1,10 +1,17 @@
-# Status — where we left off (2026-11-08)
+# Status — where we left off (2026-11-09)
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **struct changes inferred without a PDB** (design §7.2). The analyzer records each function's
+Latest work: **array arguments and `realloc` in replay** (design §7.3). Pointers to scalars and `T**` arguments
+are recorded as `array`: the whole heap block holding them (else their own bytes), so zlib's `inflate_table`, whose
+four pointers go into inflate's state, now replays (3 of 3; on the 157 other v1.3.1 functions its cases never
+pass). `realloc` is modelled (same block and size; a moved block keeps what was written, the growth is unreadable
+until written), and a recorded block the function frees isn't compared afterwards. zlib: **14 of 16** hooks replay
+(was 13), 0 fail, o2 and od. Hook loop unchanged (22 of 24, negative controls failing), fixtures 0 wrong.
+
+Before that: **struct changes inferred without a PDB** (design §7.2). The analyzer records each function's
 accesses through its pointer arguments; repair aligns the old function's and the candidate's and proposes the
 offsets that moved (`offset 0x4 -> 0x8`), as a guess for review. Measured on zlib, Lua and zstd with the PDB types
 hidden: 255 proposals on 3987 function pairs, 249 on structs that really changed; moves 1087 right, 11 wrong (a
@@ -405,9 +412,11 @@ What's new:
    correct and one wrong match in zstd, 3 costs 12). The code-tables fail threshold (now the named constant
    `CODE_TABLE_FAIL_AGREEING`) stays a guess: the check never fails on the corpus at 1, 2 or 3.
 4. **Widen replay further** (§7.3): globals, the UCRT's printing imports and the CRT memory functions are done,
-   pointers inside structs are followed by type, and replay is measured on zlib (`corpus/replay-measure.ps1`: 7 of
-   16 hooks replay, 13 now with heap allocation and buffers). Next: pointer-to-scalar arguments that are arrays
-   (`inflate_table`), `realloc`, globals reached only through pointers, a target whose callee
+   pointers inside structs are followed by type, heap calls including `realloc` are modelled, and pointer-to-scalar
+   arguments capture their heap block; replay is measured on zlib (`corpus/replay-measure.ps1`: 14 of 16 hooks
+   replay, the other two aren't called). Not covered: arrays on the stack (only the element is captured). Next:
+   `inflate` and `inflate_fast` (1 of 8 and 1 of 9 cases; they read memory not captured), `updatewindow`'s
+   `memcpy` into memory the recording doesn't hold, globals reached only through pointers, a target whose callee
    changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
