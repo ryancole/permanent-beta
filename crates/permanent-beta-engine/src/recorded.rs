@@ -1,17 +1,21 @@
 //! Behavioral evidence from recorded per-call test cases (design §6.2, §7.3): every case recorded at the
 //! candidate's old RVA in its old build is replayed on the candidate in the new build (`permanent-beta-replay`).
 //!
-//! Pass if every case that can be replayed matches and at least one can; fail if any differs; inconclusive if
-//! none can be replayed (unmodelled imports, uncaptured memory or globals, unmappable layouts, no emulator), or there are no
+//! Pass if every case that can be replayed matches and at least one can, and the passing cases are more than a
+//! function that returns a constant and does nothing else would pass: one of them writes memory or a global or
+//! calls a modelled import, or they return two different values. Otherwise one `return 0;` passes them
+//! (zlib's `updatewindow`, on a call that had nothing to copy, passed on `_matherr`), so they're no evidence:
+//! inconclusive. Fail if any case differs; inconclusive if none can be replayed (unmodelled imports, uncaptured memory or globals, unmappable layouts, no emulator), or there are no
 //! cases for this function of this build. Cases are matched to builds like scenario traces: a case of another
 //! build is no evidence, its RVA being another function there.
 
+use permanent_beta_model::ValueType;
 use permanent_beta_model::{
     AnalysisExport, BuildId, Candidate, CheckOutcome, CheckResult, FunctionFeatures, GlobalVar,
     Rva, TypeLayout,
 };
 use permanent_beta_replay::address::AddressMap;
-use permanent_beta_replay::{CaseOutcome, Image, NewBuild, Recording, replay};
+use permanent_beta_replay::{CaseOutcome, Image, LoadedCase, NewBuild, Recording, imports, replay};
 use permanent_beta_verify::{BehavioralRunner, VerifyContext};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -38,6 +42,41 @@ pub struct CaseResult {
     pub test_id: String,
     #[serde(flatten)]
     pub outcome: CaseOutcome,
+    /// What the recorded call did that a constant function couldn't.
+    #[serde(skip)]
+    pub signal: Signal,
+}
+
+/// What a recorded call shows beyond its return value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Signal {
+    /// It wrote recorded memory or a global, or called an import replay answers (not one replay runs itself,
+    /// like `memcpy`: its writes show in the memory).
+    pub effect: bool,
+    /// The return value at its declared width, if it has one.
+    pub ret: Option<u64>,
+}
+
+impl Signal {
+    fn of(case: &LoadedCase, ret: ValueType) -> Self {
+        let effect = case.regions.iter().any(|r| r.before != r.after)
+            || case.globals.iter().any(|g| g.before != g.after)
+            || case
+                .imports
+                .iter()
+                .any(|i| !imports::EXECUTED.contains(&imports::base_name(&i.call.import)));
+        let rax = case.case.observed.rax.0;
+        let ret = match ret {
+            ValueType::Int(w) if w < 8 => Some(rax & ((1u64 << (8 * u32::from(w))) - 1)),
+            ValueType::Int(_) | ValueType::Pointer => Some(rax),
+            ValueType::Float(w) => Some(
+                u64::from_le_bytes(case.case.observed.xmm0.0[..8].try_into().expect("8 bytes"))
+                    & if w == 4 { 0xffff_ffff } else { u64::MAX },
+            ),
+            ValueType::Void | ValueType::Unknown => None,
+        };
+        Self { effect, ret }
+    }
 }
 
 impl RecordedCasesRunner {
@@ -85,8 +124,13 @@ impl RecordedCasesRunner {
             .filter(|r| old_build.is_none_or(|b| &r.spec.build == b))
         {
             for c in rec.cases.iter().filter(|c| c.case.rva == old_rva) {
+                let ret = rec
+                    .spec
+                    .hook(&c.case.hook)
+                    .map_or(ValueType::Unknown, |h| h.ret);
                 cases.push(CaseResult {
                     test_id: c.case.test_id.clone(),
+                    signal: Signal::of(c, ret),
                     outcome: replay(
                         &self.image,
                         new_rva,
@@ -146,6 +190,25 @@ fn summarize(cases: &[CaseResult], old_rva: Rva) -> (CheckOutcome, String) {
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let passing: Vec<Signal> = cases
+        .iter()
+        .filter(|c| matches!(c.outcome, CaseOutcome::Pass { .. }))
+        .map(|c| c.signal)
+        .collect();
+    let returns: std::collections::BTreeSet<u64> = passing.iter().filter_map(|s| s.ret).collect();
+    if passed > 0 && !passing.iter().any(|s| s.effect) && returns.len() < 2 {
+        let what = match returns.first() {
+            Some(v) => format!("return {v:#x}"),
+            None => "return".into(),
+        };
+        return (
+            CheckOutcome::Inconclusive,
+            format!(
+                "{passed} of {} recorded cases replay identically, but each only shows the same {what} with nothing                  written and no import called, which any function returning that constant would pass",
+                cases.len()
+            ),
+        );
+    }
     if passed > 0 {
         let rest = if reasons.is_empty() {
             String::new()
@@ -206,7 +269,48 @@ mod tests {
         CaseResult {
             test_id: id.into(),
             outcome,
+            signal: Signal {
+                effect: true,
+                ret: Some(0),
+            },
         }
+    }
+
+    fn returning(id: &str, ret: u64) -> CaseResult {
+        CaseResult {
+            signal: Signal {
+                effect: false,
+                ret: Some(ret),
+            },
+            ..result(id, pass())
+        }
+    }
+
+    #[test]
+    fn what_a_constant_function_would_pass_is_no_evidence() {
+        // Negative: one case (or several) returning 0 and doing nothing else; the rest not replayable.
+        for passing in [
+            vec![returning("f-1", 0)],
+            vec![returning("f-1", 0), returning("f-2", 0)],
+        ] {
+            let mut cases = passing;
+            cases.push(result("f-9", inconclusive("reads memory")));
+            let (o, d) = summarize(&cases, Rva(0x10));
+            assert_eq!(o, CheckOutcome::Inconclusive, "{d}");
+            assert!(d.contains("returning that constant"), "{d}");
+        }
+        // Two different return values: a constant function fails one of them.
+        let (o, _) = summarize(&[returning("f-1", 0), returning("f-2", 7)], Rva(0x10));
+        assert_eq!(o, CheckOutcome::Pass);
+        // A write or an import call in one passing case is enough.
+        let (o, _) = summarize(&[returning("f-1", 0), result("f-2", pass())], Rva(0x10));
+        assert_eq!(o, CheckOutcome::Pass);
+        // Negative: a failing case still fails, trivial passes or not.
+        let fail = CaseOutcome::Fail {
+            detail: "returned 0x1, expected 0x0".into(),
+        };
+        let (o, _) = summarize(&[returning("f-1", 0), result("f-2", fail)], Rva(0x10));
+        assert_eq!(o, CheckOutcome::Fail);
     }
 
     fn pass() -> CaseOutcome {

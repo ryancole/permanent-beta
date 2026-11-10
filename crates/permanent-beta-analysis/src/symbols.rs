@@ -73,6 +73,13 @@ pub struct ApplyReport {
 
 /// Read a PDB file.
 pub fn read(path: &Path) -> Result<PdbSymbols, AnalysisError> {
+    read_with_types(path, &[])
+}
+
+/// [`read`], also keeping the layouts of the structs named in `extra` (and the structs inside them by value),
+/// which no procedure's signature may use: one code casts an opaque pointer to (zlib's `z_stream.state`, declared
+/// `internal_state*`, holds a `struct inflate_state` in inflate). A name the PDB doesn't define is an error.
+pub fn read_with_types(path: &Path, extra: &[String]) -> Result<PdbSymbols, AnalysisError> {
     let shown = path.display().to_string();
     let err = |e: pdb::Error| AnalysisError::InvalidPdb {
         path: shown.clone(),
@@ -193,6 +200,13 @@ pub fn read(path: &Path) -> Result<PdbSymbols, AnalysisError> {
             _ => None,
         })
         .collect();
+    if let Some(missing) = extra.iter().find(|n| !definitions.contains_key(*n)) {
+        return Err(AnalysisError::InvalidPdb {
+            path: shown,
+            reason: format!("no struct, class or union named {missing:?}"),
+        });
+    }
+    used_types.extend(extra.iter().cloned());
     used_types.sort();
     used_types.dedup();
     let types = layouts(&finder, &definitions, used_types);

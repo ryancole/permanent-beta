@@ -155,7 +155,7 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
             globals: reachable_globals(build, rva),
         });
     }
-    add_pointer_fields(&mut out, build);
+    add_pointer_fields(&mut out, build, 0);
     out
 }
 
@@ -196,8 +196,8 @@ pub const MAX_POINTER_LAYOUTS: usize = 64;
 /// The pointer fields of every layout in the spec, adding the layouts of the structs they point to (and theirs,
 /// up to [`MAX_POINTER_LAYOUTS`]). A field pointing to bytes, a scalar or `void` is followed but not scanned; a
 /// function pointer or a type without a layout isn't followed.
-fn add_pointer_fields(out: &mut HarnessSpec, build: &AnalysisExport) {
-    let mut i = 0;
+fn add_pointer_fields(out: &mut HarnessSpec, build: &AnalysisExport, from: usize) {
+    let mut i = from;
     while i < out.layouts.len() {
         let layout = out.layouts[i].clone();
         i += 1;
@@ -228,6 +228,61 @@ fn add_pointer_fields(out: &mut HarnessSpec, build: &AnalysisExport) {
             });
         }
     }
+}
+
+/// `layout.field=Target`: the pointer field may also point to a `Target`, a layout of `build` no prototype leads
+/// to (code casts the opaque pointer: zlib's `z_stream_s.state`, declared `internal_state*`, is a `struct
+/// inflate_state` in inflate). Added as a second [`PointerField`] after the declared one, with `Target`'s layout
+/// and its own pointer fields. The recorder takes a heap block as a struct only when the block is exactly that
+/// struct's size, never one larger than the block; where it can't tell (no heap block), the declared type
+/// comes first and wins. `Err` if the layout, the field or `Target` isn't known, or the field isn't a pointer.
+pub fn pointer_alias(
+    spec: &mut HarnessSpec,
+    build: &AnalysisExport,
+    what: &str,
+) -> Result<(), String> {
+    let bad = |why: &str| format!("{what:?}: {why}");
+    let (field, target) = what
+        .split_once('=')
+        .ok_or_else(|| bad("expected layout.field=Target"))?;
+    let (layout, field) = field
+        .split_once('.')
+        .ok_or_else(|| bad("expected layout.field=Target"))?;
+    let l = spec
+        .layout(layout)
+        .ok_or_else(|| bad(&format!("the spec captures no {layout}")))?;
+    let f = l
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .ok_or_else(|| bad(&format!("{layout} has no field {field}")))?;
+    if f.size != 8 || value_type(&f.ty) != ValueType::Pointer {
+        return Err(bad(&format!("{layout}.{field} isn't a pointer")));
+    }
+    let offset = f.offset;
+    let t = build
+        .type_layout(target)
+        .ok_or_else(|| {
+            bad(&format!(
+                "no layout of {target} (pbeta analyze --pdb --type {target})"
+            ))
+        })?
+        .clone();
+    let entry = PointerField {
+        layout: layout.to_owned(),
+        offset,
+        target: Some(target.to_owned()),
+    };
+    if spec.pointers.contains(&entry) {
+        return Ok(());
+    }
+    spec.pointers.push(entry);
+    if spec.layout(target).is_none() {
+        let from = spec.layouts.len();
+        spec.layouts.push(t);
+        add_pointer_fields(spec, build, from);
+    }
+    Ok(())
 }
 
 /// Marks `what` as never recorded: `hook.param` (a parameter by name or 0-based position) or `hook.global` (a
@@ -525,6 +580,112 @@ mod tests {
             s.hook("log_event").unwrap().args[0].capture,
             CaptureKind::Cstring
         );
+    }
+
+    /// zlib's shape: a stream whose `state` is declared as deflate's struct, and inflate's struct no
+    /// prototype mentions.
+    fn zlib_like() -> AnalysisExport {
+        let f = |name: &str, offset, size, ty: &str| FieldLayout {
+            name: name.into(),
+            offset,
+            size,
+            ty: ty.into(),
+            bits: None,
+        };
+        let l = |name: &str, size, fields| TypeLayout {
+            name: name.into(),
+            size,
+            union: false,
+            fields,
+        };
+        export(
+            "v1",
+            vec![
+                l(
+                    "z_stream_s",
+                    0x58,
+                    vec![
+                        f("avail_in", 8, 4, "unsigned int"),
+                        f("state", 0x28, 8, "struct internal_state*"),
+                    ],
+                ),
+                l(
+                    "internal_state",
+                    0x1718,
+                    vec![f("window", 0x50, 8, "unsigned char*")],
+                ),
+                l(
+                    "inflate_state",
+                    0x1bf0,
+                    vec![
+                        f("strm", 0, 8, "struct z_stream_s*"),
+                        f("window", 0x40, 8, "unsigned char*"),
+                    ],
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_pointer_field_can_be_aliased_to_another_struct() {
+        let build = zlib_like();
+        let m = manifest(&[(
+            "inflate",
+            Some("int inflate(z_stream_s* strm, int flush)"),
+            "v1",
+        )]);
+        let mut s = spec(&m, &build, 8);
+        assert!(
+            s.layout("inflate_state").is_none(),
+            "no prototype leads there"
+        );
+        pointer_alias(&mut s, &build, "z_stream_s.state=inflate_state").unwrap();
+        let state: Vec<Option<&str>> = s
+            .pointers
+            .iter()
+            .filter(|p| p.layout == "z_stream_s" && p.offset == 0x28)
+            .map(|p| p.target.as_deref())
+            .collect();
+        assert_eq!(
+            state,
+            [Some("internal_state"), Some("inflate_state")],
+            "declared first"
+        );
+        // inflate_state's own pointer fields are followed too.
+        assert!(
+            s.pointers
+                .iter()
+                .any(|p| p.layout == "inflate_state" && p.offset == 0x40 && p.target.is_none())
+        );
+        // Twice is once.
+        let n = s.pointers.len();
+        pointer_alias(&mut s, &build, "z_stream_s.state=inflate_state").unwrap();
+        assert_eq!(s.pointers.len(), n);
+    }
+
+    #[test]
+    fn a_bad_pointer_alias_is_refused() {
+        // Negative: an unknown layout, field or target, a field that isn't a pointer, no `=`.
+        let build = zlib_like();
+        let m = manifest(&[(
+            "inflate",
+            Some("int inflate(z_stream_s* strm, int flush)"),
+            "v1",
+        )]);
+        let mut s = spec(&m, &build, 8);
+        for (what, why) in [
+            ("gz_state.state=inflate_state", "captures no gz_state"),
+            ("z_stream_s.opaque=inflate_state", "no field opaque"),
+            (
+                "z_stream_s.state=deflate_state",
+                "no layout of deflate_state",
+            ),
+            ("z_stream_s.avail_in=inflate_state", "isn't a pointer"),
+            ("z_stream_s.state", "expected"),
+        ] {
+            let got = pointer_alias(&mut s, &build, what);
+            assert!(matches!(&got, Err(e) if e.contains(why)), "{what}: {got:?}");
+        }
     }
 
     #[test]

@@ -779,6 +779,10 @@ std::string import_json(const ImportRecord& r) {
 // in all; a field pointing to bytes captures the whole heap block when it's a process-heap block's start (up to
 // kPointeeHeapMax; also when it's larger than the struct, an array), otherwise up to kPointeeBlock readable bytes
 // (a stack buffer, a pointer into a block; behind a pointer into the caller's stack too), and isn't followed.
+// A field can be listed more than once with different target structs (`pbeta harness-spec --pointer-alias`: zlib's
+// z_stream.state is an internal_state in deflate, an inflate_state in inflate): a heap block is taken as a struct
+// only when it's exactly that size (larger is captured as bytes, like an array; smaller isn't that struct);
+// elsewhere the first listed wins.
 // Structs are followed through every level first, buffers captured after, so a buffer never swallows a struct. Pointers into the image or the recorder's own stack frames aren't followed. A region never overlaps an
 // argument's region or another pointee (a bytes region is cut short where one begins; a struct that would overlap
 // isn't captured), within kPointeeCaseMax bytes per case. Memory overlapping a redacted argument is never
@@ -909,8 +913,11 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
                 size_t block = heap_block_size(p);
                 unsigned long long typed = field.target.empty() ? 0 : layout_size(field.target);
                 if (typed == 0 || (block != 0 && block > typed)) {
-                    buffers.push_back({from.arg, p, block});  // bytes, or an array of structs
+                    buffers.push_back({from.arg, p, block});  // bytes, an array of structs, or another type
                     continue;
+                }
+                if (block != 0 && block < typed) {
+                    continue;  // a heap block smaller than the struct isn't one (an aliased field's other type)
                 }
                 if (limit_after(p) - p < typed || total + typed > kPointeeCaseMax) {
                     continue;  // would overlap captured memory, or over the budget
@@ -925,9 +932,11 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
         frontier = std::move(next);
     }
 
-    // 2. Byte buffers: whole heap blocks first (their size is known), then kPointeeBlock around a pointer into the
-    // caller's stack (code reads behind such a pointer too: zlib's updatewindow copies from next_out - copy) or
-    // from any other pointer, each cut short where captured memory begins.
+    // 2. Byte buffers: whole heap blocks first (their size is known), then the whole heap block a pointer points
+    // into the middle of (found by walking the heap: code reads behind such a pointer, zlib's updatewindow copies
+    // from next_out - copy; and nothing past the block, which is the heap's own bookkeeping and free space, rewritten
+    // by any malloc during the call), then kPointeeBlock around a pointer into the caller's stack or from any other
+    // pointer (a block over kPointeeHeapMax, not the process heap), each cut short where captured memory begins.
     std::stable_sort(buffers.begin(), buffers.end(), [](const Bytes& x, const Bytes& y) {
         return (x.block != 0) > (y.block != 0);
     });
@@ -948,6 +957,14 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
                 }
             }
             hi = p + kPointeeBlock < stack_high ? p + kPointeeBlock : stack_high;
+        } else if (auto block = enclosing_heap_block(p); block.second != 0 && block.second <= kPointeeHeapMax) {
+            lo = block.first;
+            for (const auto& t : taken) {
+                if (t.second <= p && t.second > lo) {
+                    lo = t.second;
+                }
+            }
+            hi = block.first + block.second;
         } else {
             hi = p + kPointeeBlock;
         }

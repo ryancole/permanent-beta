@@ -104,6 +104,11 @@ enum Command {
         /// comparing function boundaries with `pbeta analysis-diff`.
         #[arg(long, requires = "pdb")]
         pdb_functions: Option<PathBuf>,
+        /// With --pdb, also record this struct's layout (repeatable), one no signature uses: what code casts an
+        /// opaque pointer to (zlib's `inflate_state`). For `harness-spec --pointer-alias` and replay, which needs
+        /// it in both builds' analyses.
+        #[arg(long = "type", requires = "pdb")]
+        types: Vec<String>,
         /// Take function boundaries from a Ghidra export (integrations/ghidra/scripts/ExportFunctions.java)
         /// instead of native discovery. Hashes and features are still computed natively. Refused unless the
         /// export is of this file.
@@ -271,6 +276,12 @@ enum Command {
         /// to. 0 captures the arguments' memory only.
         #[arg(long, default_value_t = permanent_beta_engine::permanent_beta_repair::harness::DEFAULT_POINTER_DEPTH)]
         pointer_depth: u32,
+        /// `layout.field=Target` (repeatable): the pointer field may also point to a `Target` (a layout in the
+        /// analysis: `pbeta analyze --type`), as when code casts an opaque pointer (zlib's
+        /// `z_stream_s.state=inflate_state`). The recorder takes a heap block as `Target` only when the block is
+        /// exactly that size.
+        #[arg(long)]
+        pointer_alias: Vec<String>,
     },
     /// Replay the cases recorded at an old RVA on a function of a new binary, by emulation (design §7.3). Exit
     /// code 0 if every replayable case matches (and one could be replayed), 1 if one differs or none could.
@@ -362,12 +373,14 @@ fn run(cli: Cli) -> Result<u8> {
             out,
             pdb,
             pdb_functions,
+            types,
             functions_from,
         } => cmd_analyze(
             &binary,
             &out,
             pdb.as_deref(),
             pdb_functions.as_deref(),
+            &types,
             functions_from.as_deref(),
         ),
         Command::AnalysisDiff { a, b, json, limit } => cmd_analysis_diff(&a, &b, json, limit),
@@ -464,12 +477,16 @@ fn run(cli: Cli) -> Result<u8> {
             redact,
             no_import_memory,
             pointer_depth,
+            pointer_alias,
         } => cmd_harness_spec(
             &hooks,
             &analysis,
             &out,
             max_cases,
-            &redact,
+            &SpecEdits {
+                redact: &redact,
+                pointer_alias: &pointer_alias,
+            },
             !no_import_memory,
             pointer_depth,
         ),
@@ -625,12 +642,18 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
     })
 }
 
+/// Hand-given changes to a generated record spec: what never to record, and pointer fields' other types.
+struct SpecEdits<'a> {
+    redact: &'a [String],
+    pointer_alias: &'a [String],
+}
+
 fn cmd_harness_spec(
     hooks: &Path,
     analysis: &Path,
     out: &Path,
     max_cases: u32,
-    redact: &[String],
+    edits: &SpecEdits,
     import_memory: bool,
     pointer_depth: u32,
 ) -> Result<u8> {
@@ -641,8 +664,11 @@ fn cmd_harness_spec(
     let mut spec = harness::spec(&manifest, &build, max_cases);
     spec.import_memory = import_memory;
     spec.pointer_depth = pointer_depth;
-    for r in redact {
+    for r in edits.redact {
         harness::redact(&mut spec, r).map_err(anyhow::Error::msg)?;
+    }
+    for a in edits.pointer_alias {
+        harness::pointer_alias(&mut spec, &build, a).map_err(anyhow::Error::msg)?;
     }
     let text = format!(
         "# Record spec for the recording hook DLL (pbeta harness-spec; design §7.3). Edit `capture` to change what\n\
@@ -1144,6 +1170,7 @@ fn cmd_analyze(
     out: &Path,
     pdb: Option<&Path>,
     pdb_functions: Option<&Path>,
+    types: &[String],
     functions_from: Option<&Path>,
 ) -> Result<u8> {
     let mut analysis = match functions_from {
@@ -1172,7 +1199,7 @@ fn cmd_analyze(
         }
     };
     if let Some(pdb) = pdb {
-        let symbols = symbols::read(pdb)?;
+        let symbols = symbols::read_with_types(pdb, types)?;
         let report = symbols::apply(&mut analysis, &symbols)
             .map_err(|e| anyhow::anyhow!("{}: {e}", pdb.display()))?;
         eprintln!(

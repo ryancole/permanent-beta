@@ -758,6 +758,25 @@ be the heap's bookkeeping. zlib doesn't call `realloc`, so it's measured only by
 hooks replay, 0 fail, both steps (`adler32_z` and `deflate_stored` aren't called). Hook loop and fixture
 scorecards unchanged.
 
+**Aliased pointer fields, whole heap blocks and constant-only cases (2026-11-09).** zlib's `inflate` and
+`inflate_fast` replayed 1 of 8 and 1 of 9 cases: `z_stream.state` is declared `internal_state*` (deflate's state)
+but holds a `struct inflate_state` in inflate, so the recorder took that larger heap block for bytes and never
+followed its `window`. Two hand-given, reviewable hints fix it: `pbeta analyze --pdb --type inflate_state` keeps a
+layout no signature uses (in both builds, for replay to translate), and `pbeta harness-spec --pointer-alias
+z_stream_s.state=inflate_state` lists the field a second time with that target. The recorder takes a heap block as
+a struct only when it's exactly that size (larger is bytes, smaller isn't that struct); elsewhere the declared
+type, listed first, wins. A byte pointer into the middle of a heap block now captures that whole block (found with
+`HeapWalk`) instead of 64 KiB from the pointer: what lies past the block is the heap's bookkeeping, which a
+`malloc` during the call rewrites (8 `updatewindow` cases at /Od were inconclusive on it). And a hook's replay
+passes only if its passing cases show more than a constant function would: a write, a modelled import call, or
+two different return values. A wrong-target check (each hook's cases on every other function of the new build)
+found `updatewindow` passing on 21 wrong functions through one case that returned 0 and wrote nothing (`_matherr`
+returns 0); such cases alone are now inconclusive. zlib: **14 of 16** hooks replay, 0 fail, o2 and od, now with
+`inflate` 8 of 8, `inflate_fast` 9 of 9 and `updatewindow` 7 of 8 cases (one `memcpy` reads a buffer not
+captured); `inflate`, `inflate_fast`, `updatewindow` and `inflate_table` never pass on any of the 157 other
+functions of v1.3.1. Hook loop and fixture scorecards unchanged. **[Guess]**: the rule's notion of "constant" is
+the only trivial behaviour tested; a function returning its argument unchanged isn't ruled out.
+
 Not recorded: memory behind pointers inside structs beyond `pointer_depth` or without a typed field, the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is
 inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks.

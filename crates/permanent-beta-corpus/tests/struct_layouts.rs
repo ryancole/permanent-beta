@@ -171,3 +171,19 @@ fn without_a_pdb_the_moved_field_is_inferred_from_the_accesses() {
         assert!(!reader.is_resolved(), "[{flags}] {:?}", reader.action);
     }
 }
+
+#[test]
+#[ignore = "needs corpus/build-fixtures.ps1"]
+fn extra_types_are_kept_by_name() {
+    let pdb = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/fixtures/basic/o2/v1/fixture.pdb");
+    let plain = symbols::read(&pdb).unwrap();
+    // A type a signature already uses: the same layouts.
+    let again = symbols::read_with_types(&pdb, &["Config".into()]).unwrap();
+    assert_eq!(again.types, plain.types);
+    // Negative: a name the PDB doesn't define is refused, not silently left out.
+    let err = symbols::read_with_types(&pdb, &["NoSuchStruct".into()])
+        .expect_err("an unknown type is an error")
+        .to_string();
+    assert!(err.contains("NoSuchStruct"), "{err}");
+}

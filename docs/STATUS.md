@@ -4,7 +4,17 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **the parameter-count check measured with PDB signatures** (design §6.1). `pbeta-corpus score
+Latest work: **zlib's inflate side replays** (design §7.3). `inflate` and `inflate_fast` were 1 of 8 and 1 of
+9 cases: z_stream's `internal_state* state` holds an `inflate_state` there, which the recorder took for bytes.
+`pbeta analyze --type` and `harness-spec --pointer-alias z_stream_s.state=inflate_state` give the other type; the
+recorder takes it only for a heap block of exactly its size. Mid-block byte pointers now capture their whole heap
+block, not 64 KiB from the pointer (the heap's bookkeeping past it changed under `malloc`). A wrong-target check
+found `updatewindow` passing on 21 wrong functions through one case that only returned 0, so a hook's replay now
+passes only if its passing cases show a write, an import call or two different return values. zlib: 14 of 16
+hooks, 0 fail, o2 and od; `inflate` 8/8, `inflate_fast` 9/9, `updatewindow` 7/8; none of the inflate-side hooks
+passes on any of the 157 other functions. Hook loop and fixture scorecards unchanged.
+
+Before that: **the parameter-count check measured with PDB signatures** (design §6.1). `pbeta-corpus score
 --pdb-signatures` adds each function's PDB signature and nothing else (no names, types or globals). Over the 60
 gated corpus variants and `basic`: correct (31,096) and wrong (0) unchanged, accepted 25,211 → 30,503, since the
 check is an independent pass. Its 49 failures on correct pairs are all real signature changes, which belong in
@@ -422,9 +432,11 @@ What's new:
 4. **Widen replay further** (§7.3): globals, the UCRT's printing imports and the CRT memory functions are done,
    pointers inside structs are followed by type, heap calls including `realloc` are modelled, and pointer-to-scalar
    arguments capture their heap block; replay is measured on zlib (`corpus/replay-measure.ps1`: 14 of 16 hooks
-   replay, the other two aren't called). Not covered: arrays on the stack (only the element is captured). Next:
-   `inflate` and `inflate_fast` (1 of 8 and 1 of 9 cases; they read memory not captured), `updatewindow`'s
-   `memcpy` into memory the recording doesn't hold, globals reached only through pointers, a target whose callee
+   replay, the other two aren't called; `inflate` 8 of 8 cases, `inflate_fast` 9 of 9, `updatewindow` 7 of 8).
+   Not covered: arrays on the stack (only the element is captured), type punning without a hand-given
+   `--pointer-alias`. Next: finding aliases automatically (the PDB's local variables say inflate's `state` is an
+   `inflate_state*`), `updatewindow`'s last case (a `memcpy` from a buffer not captured), a wrong-target check in
+   `replay-measure.ps1` itself, globals reached only through pointers, a target whose callee
    changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).

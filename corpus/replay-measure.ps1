@@ -40,13 +40,16 @@ if (-not $NoBuild) {
 }
 
 foreach ($v in $Old, $New) {
-    & $pbeta analyze "$builds\$v\minigzip.exe" --pdb "$builds\$v\minigzip.pdb" --out "$out\$v.json" | Out-Null
+    # inflate keeps a `struct inflate_state` behind z_stream's `internal_state* state` (deflate's type): its layout,
+    # which no signature uses, and the alias below let the recorder follow it to the window.
+    & $pbeta analyze "$builds\$v\minigzip.exe" --pdb "$builds\$v\minigzip.pdb" --type inflate_state --out "$out\$v.json" | Out-Null
     if ($LASTEXITCODE) { throw "analyze $v failed" }
 }
 & $corpus hook-manifest --template (Join-Path $PSScriptRoot 'replay\zlib.template.toml') --map "$builds\$Old\minigzip.map" `
     --analysis "$out\$Old.json" --out "$out\hooks.toml"
 if ($LASTEXITCODE) { throw 'hook-manifest failed' }
-& $pbeta harness-spec --hooks "$out\hooks.toml" --analysis "$out\$Old.json" --out "$out\spec.toml" | Out-Null
+& $pbeta harness-spec --hooks "$out\hooks.toml" --analysis "$out\$Old.json" --out "$out\spec.toml" `
+    --pointer-alias z_stream_s.state=inflate_state | Out-Null
 if ($LASTEXITCODE) { throw 'harness-spec failed' }
 
 $input = Join-Path $repo "target\corpus-src\zlib\$Old\deflate.c"
