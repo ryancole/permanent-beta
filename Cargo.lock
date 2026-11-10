@@ -909,6 +909,7 @@ dependencies = [
 name = "permanent-beta-analysis"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "iced-x86",
  "object 0.36.7",
  "pdb",
@@ -981,6 +982,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "permanent-beta-engine",
  "permanent-beta-model",
  "permanent-beta-store",

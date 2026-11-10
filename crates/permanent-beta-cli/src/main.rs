@@ -94,6 +94,8 @@ enum Command {
     /// Analyze a PE x64 binary into the normalized AnalysisExport JSON (native analyzer).
     Analyze {
         binary: PathBuf,
+        /// Where to write the analysis: minified JSON, gzip-compressed if the path ends in `.gz`. Every command
+        /// that reads an analysis takes either.
         #[arg(long)]
         out: PathBuf,
         /// The build's PDB: add its function names and signatures. Refused unless its GUID and age match the

@@ -548,9 +548,7 @@ fn write_hooks(manifest: &HookManifest, path: &Path) -> Result<()> {
 }
 
 fn load_analysis(path: &Path) -> Result<AnalysisExport> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    Ok(permanent_beta_analysis::export::load(path)?)
 }
 
 fn load(path: &Path) -> Result<map::MapFile> {

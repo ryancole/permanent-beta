@@ -30,8 +30,19 @@ struct Cli {
 }
 
 fn load(path: &PathBuf) -> Result<AnalysisExport> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    // `pbeta analyze` gzips a `.gz` output; recognized by content, as `permanent_beta_analysis::export::load`
+    // does (this crate may not depend on analysis).
+    let text = if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .read_to_string(&mut text)
+            .with_context(|| format!("decompressing {}", path.display()))?;
+        text
+    } else {
+        String::from_utf8(bytes).with_context(|| format!("reading {}", path.display()))?
+    };
     let a: AnalysisExport = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .with_context(|| format!("parsing {}", path.display()))?;
     if a.schema_version != ANALYSIS_SCHEMA_VERSION {
