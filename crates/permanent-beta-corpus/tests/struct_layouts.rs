@@ -1,7 +1,7 @@
 //! Struct layout adaptation (design §7.2) on the real `basic` fixture builds, with their PDBs: scenario S5's
 //! `Config` gains a field before `b` in v2.
 //!
-//! Needs `pwsh corpus/build-fixtures.ps1` first, so these are `#[ignore]`d in a plain `cargo test`. CI runs them
+//! Needs `pwsh corpus/build-fixtures.ps1` first, so these are `#[ignore]`d in a plain `cargo test`. CI's manual corpus job runs them
 //! after building the fixtures: `cargo test -p permanent-beta-corpus -- --ignored`.
 
 use permanent_beta_analysis::{Analyzer, native::NativePeAnalyzer, symbols};

@@ -3,6 +3,14 @@ name: ci
 on:
   push:
   pull_request:
+  # The corpus job (below) only runs from here: Actions -> ci -> Run workflow, with "corpus" ticked. It takes far
+  # too long to run on every push.
+  workflow_dispatch:
+    inputs:
+      corpus:
+        description: Build and score the corpus (fixtures, real-world projects, hook-repair loop)
+        type: boolean
+        default: false
 
 jobs:
   rust:
@@ -27,8 +35,14 @@ jobs:
           test "$code" -eq 1
       - name: replay tests with the emulator (icicle running Ghidra's x86-64 SLEIGH specification)
         run: cargo test -p permanent-beta-replay -p permanent-beta-cli --features permanent-beta-replay/emulator
+
+  corpus:
+    if: github.event_name == 'workflow_dispatch' && inputs.corpus
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: build test fixtures with MSVC and generate answer keys
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           ./corpus/build-fixtures.ps1
@@ -36,13 +50,10 @@ jobs:
           if ($truth.Count -eq 0) { throw "no truth.json generated" }
           $truth | ForEach-Object { $_.FullName }
       - name: corpus gate (analyzer checks + zero wrong matches + correct-match baseline)
-        if: runner.os == 'Windows'
         run: cargo test -p permanent-beta-corpus -- --ignored --nocapture
       - name: real-world corpus gate (clone, build and score zlib, lua, zstd, tinyxml2 and yaml-cpp across release tags)
-        if: runner.os == 'Windows'
         shell: pwsh
         run: ./corpus/build-projects.ps1 -Score
       - name: hook-repair loop (Detours hooks repaired v1 -> v2 -> v3 and run; zero wrong relocations, identical traces; recorded cases replayed)
-        if: runner.os == 'Windows'
         shell: pwsh
         run: ./corpus/build-hooks.ps1 -Run -Replay

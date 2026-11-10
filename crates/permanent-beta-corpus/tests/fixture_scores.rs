@@ -1,7 +1,7 @@
 //! The corpus gate for the `basic` fixture: analyze, match and score every flag set against the answer key
 //! and corpus/fixtures/basic/expected.toml. Fails on any wrong match or a drop below the correct-match baseline.
 //!
-//! Needs `pwsh corpus/build-fixtures.ps1` first, so it's `#[ignore]`d in a plain `cargo test`. CI runs it after
+//! Needs `pwsh corpus/build-fixtures.ps1` first, so it's `#[ignore]`d in a plain `cargo test`. CI's manual corpus job runs it after
 //! building the fixtures: `cargo test -p permanent-beta-corpus -- --ignored`.
 
 use permanent_beta_corpus::{expected::Expected, fixture};

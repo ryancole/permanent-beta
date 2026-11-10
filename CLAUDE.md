@@ -29,9 +29,13 @@ stop plausible-but-wrong matching logic from merging.
 
 - Any change to analysis, matching or verification logic needs tests that include a *negative* case (something that
   must not match or must not be accepted).
-- Run `pwsh corpus/build-fixtures.ps1 -Score` before and after any analysis, matching or verification change and put
-  both scorecards in the PR. Wrong matches must stay at zero. When correct matches go up, raise
-  `gate.min_correct` in the fixture's `expected.toml` in the same PR.
+- Never run the corpus unless the owner explicitly asks for it in the current conversation: it takes far too long.
+  That covers `corpus/*.ps1` (`build-fixtures`, `build-projects`, `build-hooks -Run`, `replay-measure`,
+  `ghidra-diff`), `pbeta-corpus score` and `cargo test -- --ignored`. Plain `cargo test` is fine (corpus tests are
+  `#[ignore]`d). For an analysis, matching or verification change, say in the PR that the scorecards weren't run
+  and offer to run `pwsh corpus/build-fixtures.ps1 -Score` before and after. When they are run: wrong matches must
+  stay at zero, and when correct matches go up, raise `gate.min_correct` in the fixture's `expected.toml` in the
+  same PR.
 - Thresholds are tagged `[Guess]` in the design doc until calibrated. Don't present them as validated.
 - Keep the analysis schema versioned. Bump `ANALYSIS_SCHEMA_VERSION` on breaking changes.
 - No features for unpacking, defeating integrity checks, or evading anti-cheat or anti-tamper (design §12).

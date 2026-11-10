@@ -1,6 +1,6 @@
 //! The native analyzer, run on the real `basic` fixture builds and scored against their answer keys.
 //!
-//! Needs `pwsh corpus/build-fixtures.ps1` first, so these are `#[ignore]`d in a plain `cargo test`. CI runs them
+//! Needs `pwsh corpus/build-fixtures.ps1` first, so these are `#[ignore]`d in a plain `cargo test`. CI's manual corpus job runs them
 //! after building the fixtures: `cargo test -p permanent-beta-corpus -- --ignored`.
 
 use permanent_beta_analysis::{Analyzer, native::NativePeAnalyzer};

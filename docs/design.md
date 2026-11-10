@@ -1032,7 +1032,8 @@ Because the code is AI-written, **this corpus and its metrics are the primary co
   "silent wrong repair" count (an accepted wrong mapping on a hooked function).
 - **Target:** zero silent wrong repairs on the corpus, with accepted-mapping precision ≥ 99.5% **[Guess]**, to be set
   from data.
-- **CI gate:** any change to analysis, match or verify must not reduce accepted precision on the corpus.
+- **CI gate:** any change to analysis, match or verify must not reduce accepted precision on the corpus. CI runs it
+  only on request (`workflow_dispatch` with `corpus` ticked), not on every push: it takes too long.
   *Implemented for the purpose-built fixtures* (`pbeta-corpus score`, `corpus/fixtures/*/expected.toml`): zero
   wrong matches across every function in scope, and correct matches at or above a per-flag-set baseline that is
   raised as matching improves. Per-scenario targets are reported as met or not yet. *Real-world projects*
