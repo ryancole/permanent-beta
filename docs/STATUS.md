@@ -4,7 +4,15 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **zlib's inflate side replays** (design §7.3). `inflate` and `inflate_fast` were 1 of 8 and 1 of
+Latest work: **pointer aliases found automatically, and a wrong-target control** (design §7.3). `pbeta analyze
+--pdb` now finds fields code keeps in a local of another struct type (`z_stream_s.state`, an `inflate_state` in
+inflate), and the record spec applies those seen in code a hook reaches, so zlib needs no hand-given hints. And
+`pbeta bind --hooks --binary` sets a hand-written manifest's placeholder builds to the binary's SHA-256. `pbeta replay --others` replays
+a hook's cases on every other function of the new build; `replay-measure.ps1` fails if they pass on one, except
+identical code or a function calling the target (zlib's `crc32` wrapper passes `crc32_z`'s cases, as it should).
+zlib o2 and od: none do.
+
+Before that: **zlib's inflate side replays** (design §7.3). `inflate` and `inflate_fast` were 1 of 8 and 1 of
 9 cases: z_stream's `internal_state* state` holds an `inflate_state` there, which the recorder took for bytes.
 `pbeta analyze --type` and `harness-spec --pointer-alias z_stream_s.state=inflate_state` give the other type; the
 recorder takes it only for a heap block of exactly its size. Mid-block byte pointers now capture their whole heap
@@ -433,10 +441,8 @@ What's new:
    pointers inside structs are followed by type, heap calls including `realloc` are modelled, and pointer-to-scalar
    arguments capture their heap block; replay is measured on zlib (`corpus/replay-measure.ps1`: 14 of 16 hooks
    replay, the other two aren't called; `inflate` 8 of 8 cases, `inflate_fast` 9 of 9, `updatewindow` 7 of 8).
-   Not covered: arrays on the stack (only the element is captured), type punning without a hand-given
-   `--pointer-alias`. Next: finding aliases automatically (the PDB's local variables say inflate's `state` is an
-   `inflate_state*`), `updatewindow`'s last case (a `memcpy` from a buffer not captured), a wrong-target check in
-   `replay-measure.ps1` itself, globals reached only through pointers, a target whose callee
+   Pointer aliases are found in the PDB's locals. Not covered: arrays on the stack (only the element is captured),
+   type punning no local shows. Next: `updatewindow`'s last case (a `memcpy` from a buffer not captured), globals reached only through pointers, a target whose callee
    changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
@@ -452,8 +458,9 @@ What's new:
   The thunks forward at most 8 stack arguments and don't support variadic functions. The emulator build needs
   CMake, Ninja and libclang; without the `emulator` feature every case is inconclusive (pbeta says so).
 
-- The hook manifest needs the build's SHA-256 typed in by hand (`pbeta analyze` prints it in its JSON);
-  `pbeta-corpus hook-manifest` does it for the corpus only.
+- Binding a hand-written hook manifest: `pbeta bind --hooks h.toml --binary app.exe` sets every placeholder
+  `build` (e.g. `v1`) to the binary's SHA-256, keeping comments (2026-11-09; before, it was typed in by hand). It
+  doesn't check that the RVAs or symbols are that build's.
 - The trace diff checks one scripted scenario: a wrong target that happens to see the same arguments and results
   for those calls would pass it. The detours log by-value arguments written per prototype by hand.
 - AOB patterns are only regenerated with `--new-binary`; without it a re-bound hook has no pattern. The minimum

@@ -17,7 +17,7 @@ use crate::AnalysisError;
 use pdb::{FallibleIterator, TypeData, TypeFinder, TypeIndex};
 use permanent_beta_model::{
     ANALYSIS_SCHEMA_VERSION, AnalysisExport, BuildInfo, FieldLayout, FunctionFeatures,
-    FunctionSignature, GlobalVar, NameSource, Param, Producer, Rva, TypeLayout,
+    FunctionSignature, GlobalVar, NameSource, Param, PointerAlias, Producer, Rva, TypeLayout,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -43,6 +43,8 @@ pub struct PdbSymbols {
     /// Global variables with a unique name, sorted by name. A static local is named `procedure::name`; a name
     /// two variables at different addresses share is left out (it couldn't be found again by name).
     pub globals: Vec<GlobalVar>,
+    /// Pointer fields code keeps in a local of another struct type ([`PointerAlias`]).
+    pub pointer_aliases: Vec<PointerAlias>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +117,8 @@ pub fn read_with_types(path: &Path, extra: &[String]) -> Result<PdbSymbols, Anal
         definitions.entry(name).or_insert(item.index());
     }
     let mut used_types: Vec<String> = Vec::new();
+    // Locals that point to a struct, with the procedure they're in: (procedure, local, struct).
+    let mut struct_locals: Vec<(String, String, String)> = Vec::new();
 
     let mut procedures: BTreeMap<Rva, Vec<PdbProcedure>> = BTreeMap::new();
     // Data symbols by qualified name: (RVA, size, type). More than one RVA under a name: ambiguous.
@@ -156,6 +160,26 @@ pub fn read_with_types(path: &Path, extra: &[String]) -> Result<PdbSymbols, Anal
                         None => name.into_owned(),
                     };
                     add_data(name, &d);
+                    continue;
+                }
+                Ok(pdb::SymbolData::RegisterRelative(pdb::RegisterRelativeSymbol {
+                    type_index,
+                    name,
+                    ..
+                }))
+                | Ok(pdb::SymbolData::Local(pdb::LocalSymbol {
+                    type_index, name, ..
+                })) => {
+                    if let Some((_, proc_name)) = scopes.last()
+                        && let Some(udt) = struct_pointee(&type_name(&finder, type_index, 0))
+                        && definitions.contains_key(udt)
+                    {
+                        struct_locals.push((
+                            proc_name.clone(),
+                            name.to_string().into_owned(),
+                            udt.to_owned(),
+                        ));
+                    }
                     continue;
                 }
                 _ => continue,
@@ -209,13 +233,31 @@ pub fn read_with_types(path: &Path, extra: &[String]) -> Result<PdbSymbols, Anal
     used_types.extend(extra.iter().cloned());
     used_types.sort();
     used_types.dedup();
-    let types = layouts(&finder, &definitions, used_types);
+    let mut types = layouts(&finder, &definitions, used_types.clone());
+    // Aliases' targets need their layouts too, whose fields may be aliased in turn.
+    let mut aliases = pointer_aliases(&types, &struct_locals);
+    for _ in 0..MAX_NESTED_LAYOUTS {
+        let missing: Vec<String> = aliases
+            .iter()
+            .filter(|a| !types.iter().any(|t| t.name == a.target))
+            .map(|a| a.target.clone())
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        used_types.extend(missing);
+        used_types.sort();
+        used_types.dedup();
+        types = layouts(&finder, &definitions, used_types.clone());
+        aliases = pointer_aliases(&types, &struct_locals);
+    }
     Ok(PdbSymbols {
         guid,
         age,
         procedures,
         types,
         globals,
+        pointer_aliases: aliases,
     })
 }
 
@@ -284,6 +326,7 @@ pub fn apply(export: &mut AnalysisExport, symbols: &PdbSymbols) -> Result<ApplyR
         .collect();
     report.globals = export.globals.len();
     export.data_symbols = symbols.globals.clone();
+    export.pointer_aliases = symbols.pointer_aliases.clone();
     Ok(report)
 }
 
@@ -335,6 +378,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
         types: Vec::new(),
         globals: Vec::new(),
         data_symbols: Vec::new(),
+        pointer_aliases: Vec::new(),
     }
 }
 
@@ -376,6 +420,68 @@ fn signature(finder: &TypeFinder<'_>, index: TypeIndex) -> Option<FunctionSignat
         return_type: return_type.map(|t| type_name(finder, t, 0)),
         params,
     })
+}
+
+/// The struct a C-like type name points to: `struct X*` or `const union X*` → `X`; anything else (no pointer, a
+/// pointer to a pointer, a scalar) → `None`.
+fn struct_pointee(ty: &str) -> Option<&str> {
+    let t = ty.strip_prefix("const ").unwrap_or(ty);
+    let t = t.strip_suffix('*')?;
+    if t.contains('*') || t.contains('&') {
+        return None;
+    }
+    let t = t
+        .strip_prefix("struct ")
+        .or_else(|| t.strip_prefix("union "))?;
+    (!t.is_empty()).then_some(t)
+}
+
+/// How many functions are named as an alias's evidence; the record spec uses an alias only if one of them is
+/// reached from a hook. **[Guess]**
+const MAX_ALIAS_EVIDENCE: usize = 64;
+
+/// A field of a layout that points to struct `X`, and a local of the same name pointing to struct `Y` ≠ `X`: code
+/// that keeps the field in that local treats it as a `Y` (zlib's inflate: `state = (struct inflate_state
+/// FAR*)strm->state`). **[Guess]**: the shared name is the only evidence; the recorder takes a block as `Y`
+/// only when it's exactly `Y`'s size, so a wrong alias costs nothing unless the sizes agree.
+fn pointer_aliases(
+    layouts: &[TypeLayout],
+    locals: &[(String, String, String)],
+) -> Vec<PointerAlias> {
+    let mut out: Vec<PointerAlias> = Vec::new();
+    for l in layouts {
+        for f in &l.fields {
+            let Some(declared) = struct_pointee(&f.ty) else {
+                continue;
+            };
+            for (procedure, name, target) in locals {
+                if name != &f.name || target == declared {
+                    continue;
+                }
+                let at = match out
+                    .iter()
+                    .position(|a| a.layout == l.name && a.field == f.name && &a.target == target)
+                {
+                    Some(i) => i,
+                    None => {
+                        out.push(PointerAlias {
+                            layout: l.name.clone(),
+                            field: f.name.clone(),
+                            target: target.clone(),
+                            seen_in: Vec::new(),
+                        });
+                        out.len() - 1
+                    }
+                };
+                let seen = &mut out[at].seen_in;
+                if seen.len() < MAX_ALIAS_EVIDENCE && !seen.contains(procedure) {
+                    seen.push(procedure.clone());
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.layout, &a.field, &a.target).cmp(&(&b.layout, &b.field, &b.target)));
+    out
 }
 
 /// The parameters of an argument list, each type's name and whether it's CodeView's "no type". `None` when
@@ -705,6 +811,7 @@ mod tests {
                 procedures: BTreeMap::new(),
                 types: Vec::new(),
                 globals: Vec::new(),
+                pointer_aliases: Vec::new(),
             },
         );
         e.functions = rvas
@@ -746,6 +853,7 @@ mod tests {
             procedures,
             types: Vec::new(),
             globals: Vec::new(),
+            pointer_aliases: Vec::new(),
         }
     }
 
@@ -827,6 +935,55 @@ mod tests {
         let p = procedures_export(&e.build, &s);
         assert_eq!(p.functions.len(), 1);
         assert!(p.functions[0].name.is_none());
+    }
+
+    #[test]
+    fn a_field_kept_in_a_local_of_another_struct_type_is_an_alias() {
+        let field = |name: &str, ty: &str| FieldLayout {
+            name: name.into(),
+            offset: 0,
+            size: 8,
+            ty: ty.into(),
+            bits: None,
+        };
+        let stream = TypeLayout {
+            name: "z_stream_s".into(),
+            size: 0x58,
+            union: false,
+            fields: vec![
+                field("state", "struct internal_state*"),
+                field("next_in", "unsigned char*"),
+                field("zalloc", "fnptr"),
+            ],
+        };
+        let local = |f: &str, name: &str, ty: &str| (f.to_owned(), name.to_owned(), ty.to_owned());
+        let locals = [
+            local("inflate", "state", "inflate_state"),
+            local("inflate_fast", "state", "inflate_state"),
+            local("deflate", "state", "internal_state"),
+            local("inflate", "strm", "z_stream_s"),
+        ];
+        let got = pointer_aliases(std::slice::from_ref(&stream), &locals);
+        assert_eq!(
+            got,
+            vec![PointerAlias {
+                layout: "z_stream_s".into(),
+                field: "state".into(),
+                target: "inflate_state".into(),
+                seen_in: vec!["inflate".into(), "inflate_fast".into()],
+            }]
+        );
+        // Negative: a local of the declared type (deflate's), another name, a field that isn't a struct pointer.
+        let none = [
+            local("deflate", "state", "internal_state"),
+            local("f", "window", "inflate_state"),
+        ];
+        assert!(pointer_aliases(std::slice::from_ref(&stream), &none).is_empty());
+        assert_eq!(struct_pointee("const struct X*"), Some("X"));
+        assert_eq!(struct_pointee("union U*"), Some("U"));
+        assert_eq!(struct_pointee("struct X**"), None);
+        assert_eq!(struct_pointee("unsigned char*"), None);
+        assert_eq!(struct_pointee("struct X"), None);
     }
 
     #[test]

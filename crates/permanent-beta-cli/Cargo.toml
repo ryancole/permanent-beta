@@ -23,6 +23,8 @@ clap = { workspace = true, features = ["env"] }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# Rewrites a hook manifest in place keeping its comments (`pbeta bind`).
+toml_edit.workspace = true
 
 [features]
 # Replay recorded test cases by emulation (icicle, MIT or Apache-2.0, running Ghidra's x86-64 SLEIGH specification,

@@ -306,8 +306,27 @@ enum Command {
         /// to the new image (data symbols by name, functions through the accepted matches).
         #[arg(long)]
         old_analysis: Option<PathBuf>,
+        /// Also replay the cases on every other function of --new-analysis, as a control for replay itself: they
+        /// should pass on none of them but those with identical code. Exit code 1 if one does.
+        #[arg(long, requires = "new_analysis")]
+        others: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Bind a hook manifest's hooks to a binary: set each placeholder `target.build` (anything but a SHA-256, e.g.
+    /// `v1`), or each equal to --from, to the binary's build id. Comments and layout are kept. A hook already bound
+    /// to another build is left alone: moving it is `pbeta repair`'s job. Exit code 1 if no hook was bound.
+    Bind {
+        #[arg(long)]
+        hooks: PathBuf,
+        #[arg(long)]
+        binary: PathBuf,
+        /// Only hooks bound to this build (a placeholder or an id).
+        #[arg(long)]
+        from: Option<String>,
+        /// Where to write the result (default: the manifest itself).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Inspect and decide the review queue.
     Review {
@@ -459,6 +478,7 @@ fn run(cli: Cli) -> Result<u8> {
             new_rva,
             new_analysis,
             old_analysis,
+            others,
             json,
         } => cmd_replay(ReplayArgs {
             cases: &cases,
@@ -467,8 +487,15 @@ fn run(cli: Cli) -> Result<u8> {
             new_rva,
             new_analysis: new_analysis.as_deref(),
             old_analysis: old_analysis.as_deref(),
+            others,
             json,
         }),
+        Command::Bind {
+            hooks,
+            binary,
+            from,
+            out,
+        } => cmd_bind(&hooks, &binary, from.as_deref(), out.as_deref()),
         Command::HarnessSpec {
             hooks,
             analysis,
@@ -587,6 +614,7 @@ struct ReplayArgs<'a> {
     new_rva: Rva,
     new_analysis: Option<&'a Path>,
     old_analysis: Option<&'a Path>,
+    others: bool,
     json: bool,
 }
 
@@ -618,8 +646,15 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
         runner = runner.with_addresses(&old, &new, &accepted_pairs(&old, &new));
     }
     let j = runner.judge(None, a.old_rva, a.new_rva);
+    let others = a
+        .others
+        .then(|| runner.judge_others(None, a.old_rva, a.new_rva, &new));
     if a.json {
-        println!("{}", serde_json::to_string_pretty(&j)?);
+        let mut v = serde_json::to_value(&j)?;
+        if let Some(o) = &others {
+            v["others"] = serde_json::to_value(o)?;
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
         for c in &j.cases {
             let (what, text) = match &c.outcome {
@@ -635,11 +670,97 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
             CheckOutcome::Inconclusive => "inconclusive",
         };
         println!("\n{outcome}: {}", j.detail);
+        if let Some(o) = &others {
+            let list = |v: &[Rva]| v.iter().map(Rva::to_string).collect::<Vec<_>>().join(", ");
+            println!(
+                "other functions: {} pass ({}), {} with identical code pass ({}), {} calling it pass ({}), {} fail, \
+                 {} inconclusive",
+                o.passed.len(),
+                list(&o.passed),
+                o.same_code.len(),
+                list(&o.same_code),
+                o.calls_target.len(),
+                list(&o.calls_target),
+                o.failed,
+                o.inconclusive
+            );
+        }
     }
+    let other_passes = others.as_ref().is_some_and(|o| !o.passed.is_empty());
     Ok(match j.outcome {
-        CheckOutcome::Pass => EXIT_OK,
+        CheckOutcome::Pass if !other_passes => EXIT_OK,
         _ => EXIT_NEEDS_REVIEW,
     })
+}
+
+fn cmd_bind(hooks: &Path, binary: &Path, from: Option<&str>, out: Option<&Path>) -> Result<u8> {
+    let bytes = std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
+    let id = permanent_beta_analysis::native::build_id(&bytes).0;
+    let text =
+        std::fs::read_to_string(hooks).with_context(|| format!("reading {}", hooks.display()))?;
+    let (bound, names) = bind_manifest(&text, &id, from)?;
+    // Still a manifest.
+    toml::from_str::<HookManifest>(&bound).context("the bound manifest doesn't parse")?;
+    let out = out.unwrap_or(hooks);
+    std::fs::write(out, bound).with_context(|| format!("writing {}", out.display()))?;
+    println!(
+        "bound {} hook(s) to {id}: {}",
+        names.len(),
+        if names.is_empty() {
+            "none".into()
+        } else {
+            names.join(", ")
+        }
+    );
+    Ok(if names.is_empty() {
+        EXIT_NEEDS_REVIEW
+    } else {
+        EXIT_OK
+    })
+}
+
+/// Whether a build reference is a build id (a SHA-256, 64 hex digits) rather than a placeholder.
+fn is_build_id(b: &str) -> bool {
+    b.len() == 64 && b.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+/// `text` (a hook manifest) with every hook bound to `from`, or to a placeholder when `from` is `None`, bound to
+/// `id` instead; and the names of those hooks.
+fn bind_manifest(text: &str, id: &str, from: Option<&str>) -> Result<(String, Vec<String>)> {
+    let mut doc: toml_edit::DocumentMut = text.parse().context("parsing the hook manifest")?;
+    let mut names = Vec::new();
+    if let Some(hooks) = doc.get_mut("hook").and_then(|h| h.as_array_of_tables_mut()) {
+        for h in hooks.iter_mut() {
+            let name = h
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("?")
+                .to_owned();
+            let Some(target) = h.get_mut("target").and_then(|t| t.as_table_like_mut()) else {
+                continue;
+            };
+            let build = target.get("build").and_then(|b| b.as_str()).unwrap_or("");
+            let rebind = match from {
+                Some(f) => build == f,
+                None => !is_build_id(build),
+            };
+            if rebind {
+                // Keep the value's comment and spacing.
+                match target.get_mut("build").and_then(|b| b.as_value_mut()) {
+                    Some(v) => {
+                        let decor = v.decor().clone();
+                        *v = toml_edit::Value::from(id);
+                        *v.decor_mut() = decor;
+                    }
+                    None => {
+                        target.insert("build", toml_edit::value(id));
+                    }
+                }
+                names.push(name);
+            }
+        }
+    }
+    Ok((doc.to_string(), names))
 }
 
 /// Hand-given changes to a generated record spec: what never to record, and pointer fields' other types.
@@ -1570,6 +1691,49 @@ fn source_str(s: &CandidateSource) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_sets_placeholder_builds_and_keeps_comments() {
+        let other = "a".repeat(64);
+        let text = format!(
+            r#"# My hooks.
+[[hook]]
+name = "f"
+
+[hook.target]
+build = "v1" # the shipped build
+rva = "0x1000"
+
+[[hook]]
+name = "g"
+target = {{ build = "v1", symbol = "g" }}
+
+[[hook]]
+name = "h"
+
+[hook.target]
+build = "{other}"
+rva = "0x2000"
+"#
+        );
+        let id = "b".repeat(64);
+        let (out, names) = bind_manifest(&text, &id, None).unwrap();
+        assert_eq!(names, ["f", "g"]);
+        assert!(
+            out.contains("# My hooks.") && out.contains("# the shipped build"),
+            "{out}"
+        );
+        let m: HookManifest = toml::from_str(&out).unwrap();
+        let builds: Vec<&str> = m.hooks.iter().map(|h| h.target.build.0.as_str()).collect();
+        // Negative: the hook already bound to another build stays there.
+        assert_eq!(builds, [id.as_str(), id.as_str(), other.as_str()]);
+        // With --from, exactly those hooks, placeholder or not.
+        let (_, names) = bind_manifest(&text, &id, Some(&other)).unwrap();
+        assert_eq!(names, ["h"]);
+        // Negative: --from naming no hook's build binds nothing.
+        let (_, names) = bind_manifest(&text, &id, Some("v2")).unwrap();
+        assert!(names.is_empty());
+    }
     use permanent_beta_model::{AnalysisExport, ReviewReason};
 
     /// Always picks the first shortlisted candidate.

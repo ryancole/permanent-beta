@@ -35,6 +35,23 @@ pub struct AnalysisExport {
     /// §7.3). Optional, like `globals`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_symbols: Vec<GlobalVar>,
+    /// Pointer fields that code treats as pointing to another struct than declared, from `pbeta analyze --pdb`
+    /// (design §7.3): zlib's `z_stream_s.state` is declared `internal_state*`, and inflate keeps it in a local
+    /// `inflate_state* state`. For the record spec, which lists the field with both targets; the recorder picks by
+    /// heap block size. Optional.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pointer_aliases: Vec<PointerAlias>,
+}
+
+/// A pointer field (`layout.field`) that may point to a `target` struct other than its declared type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerAlias {
+    pub layout: String,
+    pub field: String,
+    pub target: String,
+    /// Functions with a local of the same name pointing to `target`: the evidence (at most 64). The record spec
+    /// uses the alias only if a hook reaches one of them.
+    pub seen_in: Vec<String>,
 }
 
 impl AnalysisExport {

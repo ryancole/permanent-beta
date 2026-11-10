@@ -777,6 +777,23 @@ captured); `inflate`, `inflate_fast`, `updatewindow` and `inflate_table` never p
 functions of v1.3.1. Hook loop and fixture scorecards unchanged. **[Guess]**: the rule's notion of "constant" is
 the only trivial behaviour tested; a function returning its argument unchanged isn't ruled out.
 
+**Wrong-target control (2026-11-09).** `pbeta replay --others` replays the cases on every other function of the
+new build too, and `corpus/replay-measure.ps1` now fails if a hook's cases pass on one, like a correct pair
+failing. Two kinds are listed apart, since replay can't tell them from the target by construction and matching
+has to: identical code (the same normalized hash) and a function that calls the target (zlib's `crc32` forwards to
+`crc32_z` and passes its 18 cases). zlib, o2 and od: no other hook's cases pass on any other function. The control
+is most of the run time (about 10 and 20 minutes). A behavioral pass therefore says "behaves like the old function
+on these calls", which a forwarding wrapper also does: the candidate's structural evidence has to separate them.
+
+**Pointer aliases found in the PDB (2026-11-09).** The hand-given hints above are now found automatically:
+`pbeta analyze --pdb` reads each procedure's locals, and a struct field `f` declared `X*` with a local `f` of type
+`Y*` (`Y` ≠ `X`) somewhere is an alias (`pointer_aliases` in the analysis, with the functions it's seen in; the
+layouts of the targets are kept). **[Guess]**: the shared name is the only evidence, and it's noisy (Lua: 53
+aliases from fields like `next`; yaml-cpp and JsonCpp: STL internals), so the record spec applies one only when it's
+seen in a function a hook reaches, and the recorder's exact-size rule still decides per block. On zlib that gives
+exactly `z_stream_s.state → inflate_state` (seen in `inflate` and `inflate_fast`) and leaves out `→ gz_state` (the
+`gz_*` functions, which no hook reaches). `--type` and `--pointer-alias` stay for what the PDB doesn't show.
+
 Not recorded: memory behind pointers inside structs beyond `pointer_depth` or without a typed field, the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is
 inconclusive. Variadic functions and more than 8 stack arguments aren't supported by the thunks.

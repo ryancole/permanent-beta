@@ -158,6 +158,72 @@ impl RecordedCasesRunner {
     }
 }
 
+/// The same cases replayed on every other function of the new build: a control for replay itself. The cases of a
+/// function should pass on no function but its counterpart, except two kinds listed apart: one with identical
+/// code (the same normalized hash: a duplicate, an ICF twin), and one that calls the target (a wrapper that
+/// forwards to it, as zlib's `crc32` to `crc32_z`), which behaves the same by construction. Replay can't tell
+/// those from the target; matching has to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Others {
+    /// Functions with other code the cases pass on: replay can't tell them from the target. Should be empty.
+    pub passed: Vec<Rva>,
+    /// Functions with the target's code the cases pass on.
+    pub same_code: Vec<Rva>,
+    /// Functions calling the target that the cases pass on.
+    pub calls_target: Vec<Rva>,
+    pub failed: usize,
+    pub inconclusive: usize,
+}
+
+impl Others {
+    /// Sorts each function's outcome into the tally. `target_hash` is the target's normalized hash.
+    fn add(
+        &mut self,
+        target_hash: Option<&str>,
+        rva: Rva,
+        hash: Option<&str>,
+        calls_target: bool,
+        outcome: CheckOutcome,
+    ) {
+        match outcome {
+            CheckOutcome::Pass if target_hash.is_some() && hash == target_hash => {
+                self.same_code.push(rva)
+            }
+            CheckOutcome::Pass if calls_target => self.calls_target.push(rva),
+            CheckOutcome::Pass => self.passed.push(rva),
+            CheckOutcome::Fail => self.failed += 1,
+            CheckOutcome::Inconclusive => self.inconclusive += 1,
+        }
+    }
+}
+
+impl RecordedCasesRunner {
+    /// [`Self::judge`] on every function of `new` but `new_rva`.
+    pub fn judge_others(
+        &self,
+        old_build: Option<&BuildId>,
+        old_rva: Rva,
+        new_rva: Rva,
+        new: &AnalysisExport,
+    ) -> Others {
+        let target_hash = new
+            .function(new_rva)
+            .and_then(|f| f.normalized_hash.as_deref());
+        let mut others = Others::default();
+        for f in new.functions.iter().filter(|f| f.rva != new_rva) {
+            let j = self.judge(old_build, old_rva, f.rva);
+            others.add(
+                target_hash,
+                f.rva,
+                f.normalized_hash.as_deref(),
+                f.callees.contains(&new_rva),
+                j.outcome,
+            );
+        }
+        others
+    }
+}
+
 fn summarize(cases: &[CaseResult], old_rva: Rva) -> (CheckOutcome, String) {
     if cases.is_empty() {
         return (
@@ -284,6 +350,33 @@ mod tests {
             },
             ..result(id, pass())
         }
+    }
+
+    #[test]
+    fn other_functions_passing_are_listed_apart_from_identical_code() {
+        let mut o = Others::default();
+        o.add(Some("h1"), Rva(0x10), Some("h1"), false, CheckOutcome::Pass);
+        o.add(Some("h1"), Rva(0x20), Some("h2"), false, CheckOutcome::Pass);
+        o.add(Some("h1"), Rva(0x30), None, false, CheckOutcome::Pass);
+        o.add(Some("h1"), Rva(0x40), Some("h1"), false, CheckOutcome::Fail);
+        o.add(
+            Some("h1"),
+            Rva(0x50),
+            Some("h3"),
+            false,
+            CheckOutcome::Inconclusive,
+        );
+        o.add(Some("h1"), Rva(0x60), Some("h4"), true, CheckOutcome::Pass);
+        // Negative: only the same hash, or calling the target, excuses a pass; another hash or none is replay
+        // failing to tell them apart.
+        assert_eq!(o.same_code, [Rva(0x10)]);
+        assert_eq!(o.calls_target, [Rva(0x60)]);
+        assert_eq!(o.passed, [Rva(0x20), Rva(0x30)]);
+        assert_eq!((o.failed, o.inconclusive), (1, 1));
+        // Negative: a target without a hash excuses nothing, not even a function without one.
+        let mut o = Others::default();
+        o.add(None, Rva(0x10), None, false, CheckOutcome::Pass);
+        assert_eq!(o.passed, [Rva(0x10)]);
     }
 
     #[test]

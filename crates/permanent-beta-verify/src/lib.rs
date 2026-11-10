@@ -691,6 +691,7 @@ mod tests {
             types: Vec::new(),
             globals: Vec::new(),
             data_symbols: Vec::new(),
+            pointer_aliases: Vec::new(),
         }
     }
 

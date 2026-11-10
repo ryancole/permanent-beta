@@ -20,6 +20,10 @@
 //! left out, replay gives it a fixed value). Calls through pointers aren't followed, so a global only such a
 //! callee reads isn't listed and a replay that reads it is inconclusive.
 //!
+//! Pointer aliases: a pointer field code treats as another struct than declared (zlib's `z_stream_s.state`, an
+//! `inflate_state` in inflate) is listed again with that target, from the analysis's `pointer_aliases` (a local
+//! of the same name and the other type, in the PDB) or by hand ([`pointer_alias`]).
+//!
 //! Redaction ([`redact`], `pbeta harness-spec --redact hook.param`): an argument or global marked `redact` is never
 //! recorded, nor any import call's memory that overlaps it. `import_memory = false` records import calls without
 //! their memory, so data derived from the hook's (a receipt formatted from a customer name) can't reach the
@@ -156,7 +160,44 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
         });
     }
     add_pointer_fields(&mut out, build, 0);
+    apply_analysis_aliases(&mut out, build);
     out
+}
+
+/// The analysis's [`PointerAlias`]es (`pbeta analyze --pdb`) for the layouts the spec captures, seen in a
+/// function a hook reaches (the hook or anything it calls, as for globals), until none adds a layout with more of
+/// them. The name match behind an alias is weak evidence (Lua's `next` fields alias half its structs), so only
+/// what the hooked code itself does counts. One the spec can't use (its field isn't a pointer there) is left out.
+fn apply_analysis_aliases(out: &mut HarnessSpec, build: &AnalysisExport) {
+    let mut reached: BTreeSet<&str> = BTreeSet::new();
+    let mut seen: BTreeSet<Rva> = BTreeSet::new();
+    let mut todo: Vec<Rva> = out.hooks.iter().map(|h| h.rva).collect();
+    while let Some(r) = todo.pop() {
+        if !seen.insert(r) {
+            continue;
+        }
+        if let Some(f) = build.function(r) {
+            reached.extend(f.name.as_deref());
+            todo.extend(f.callees.iter().copied());
+        }
+    }
+    loop {
+        let before = out.pointers.len();
+        for a in &build.pointer_aliases {
+            if out.layout(&a.layout).is_some()
+                && a.seen_in.iter().any(|f| reached.contains(f.as_str()))
+            {
+                let _ = pointer_alias(
+                    out,
+                    build,
+                    &format!("{}.{}={}", a.layout, a.field, a.target),
+                );
+            }
+        }
+        if out.pointers.len() == before {
+            break;
+        }
+    }
 }
 
 /// The named globals the function at `rva` and its direct and indirect callees refer to, by RVA.
@@ -598,7 +639,7 @@ mod tests {
             union: false,
             fields,
         };
-        export(
+        let mut e = export(
             "v1",
             vec![
                 l(
@@ -623,7 +664,24 @@ mod tests {
                     ],
                 ),
             ],
-        )
+        );
+        // inflate (the first hook's RVA) calls inflate_fast; gz_open is reached from no hook.
+        let func = |rva: u64, name: &str, callees: &[u64]| {
+            let mut f: permanent_beta_model::FunctionFeatures = serde_json::from_value(
+                serde_json::json!({"rva": format!("{rva:#x}"), "size": 16, "name": name, "name_source": null,
+                    "normalized_hash": null, "mnemonic_hash": null, "basic_blocks": null, "edges": null,
+                    "signature": null}),
+            )
+            .unwrap();
+            f.callees = callees.iter().map(|&c| Rva(c)).collect();
+            f
+        };
+        e.functions = vec![
+            func(0x1000, "inflate", &[0x2000]),
+            func(0x2000, "inflate_fast", &[]),
+            func(0x3000, "gz_open", &[]),
+        ];
+        e
     }
 
     #[test]
@@ -661,6 +719,55 @@ mod tests {
         let n = s.pointers.len();
         pointer_alias(&mut s, &build, "z_stream_s.state=inflate_state").unwrap();
         assert_eq!(s.pointers.len(), n);
+    }
+
+    #[test]
+    fn the_analysis_aliases_are_applied_for_captured_layouts() {
+        let mut build = zlib_like();
+        let alias = |layout: &str, target: &str, seen: &str| permanent_beta_model::PointerAlias {
+            layout: layout.into(),
+            field: "state".into(),
+            target: target.into(),
+            seen_in: vec![seen.into()],
+        };
+        // Seen in inflate_fast, which the hooked inflate calls. Negative: the second names a layout no hook
+        // captures.
+        build.pointer_aliases = vec![
+            alias("z_stream_s", "inflate_state", "inflate_fast"),
+            alias("gz_state", "inflate_state", "inflate"),
+        ];
+        let m = manifest(&[(
+            "inflate",
+            Some("int inflate(z_stream_s* strm, int flush)"),
+            "v1",
+        )]);
+        let s = spec(&m, &build, 8);
+        let targets: Vec<Option<&str>> = s
+            .pointers
+            .iter()
+            .filter(|p| p.layout == "z_stream_s" && p.offset == 0x28)
+            .map(|p| p.target.as_deref())
+            .collect();
+        assert_eq!(targets, [Some("internal_state"), Some("inflate_state")]);
+        assert!(s.layout("inflate_state").is_some());
+        assert!(s.layout("gz_state").is_none());
+        // Negative: the same alias seen only in code no hook reaches.
+        let mut unreached = build.clone();
+        unreached.pointer_aliases = vec![alias("z_stream_s", "inflate_state", "gz_open")];
+        let m = manifest(&[(
+            "inflate",
+            Some("int inflate(z_stream_s* strm, int flush)"),
+            "v1",
+        )]);
+        assert!(spec(&m, &unreached, 8).layout("inflate_state").is_none());
+        // Negative: a hook that captures no z_stream gets none of it.
+        let m = manifest(&[(
+            "crc32_z",
+            Some("unsigned long crc32_z(unsigned long crc, const unsigned char* buf, size_t len)"),
+            "v1",
+        )]);
+        let s = spec(&m, &build, 8);
+        assert!(s.pointers.is_empty() && s.layout("inflate_state").is_none());
     }
 
     #[test]

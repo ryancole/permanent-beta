@@ -149,6 +149,7 @@ pub(crate) fn analyze_ranges(
         types: Vec::new(),
         globals: Vec::new(),
         data_symbols: Vec::new(),
+        pointer_aliases: Vec::new(),
     }
 }
 

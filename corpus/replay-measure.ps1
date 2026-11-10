@@ -9,6 +9,11 @@
   (the answer key), so every pair is correct: this measures replay, not matching. A correct pair must never fail;
   the point is how many cases replay at all, and why the others don't.
 
+  Each hook's cases are also replayed on every other function of the new build (`pbeta replay --others`), the
+  control for replay itself: they must pass on none of them, except a function with identical code (the same
+  normalized hash) or one that calls the target (a forwarding wrapper: zlib's crc32 calls crc32_z). One that passes fails the measurement, like a correct pair failing. -SkipOthers leaves the
+  control out (it's most of the run time).
+
   Local only, like ghidra-diff.ps1. Needs the corpus built (build-projects.ps1, zlib) and the hook DLL and
   launcher (build-hooks.ps1). Writes target/replay/zlib/<flags>-<old>-<new>/: the spec, the recordings and
   replay.json with every case's outcome.
@@ -21,7 +26,8 @@ param(
     [string] $Flags = 'o2',
     [string] $Old = 'v1.3',
     [string] $New = 'v1.3.1',
-    [switch] $NoBuild
+    [switch] $NoBuild,
+    [switch] $SkipOthers
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
@@ -40,16 +46,15 @@ if (-not $NoBuild) {
 }
 
 foreach ($v in $Old, $New) {
-    # inflate keeps a `struct inflate_state` behind z_stream's `internal_state* state` (deflate's type): its layout,
-    # which no signature uses, and the alias below let the recorder follow it to the window.
-    & $pbeta analyze "$builds\$v\minigzip.exe" --pdb "$builds\$v\minigzip.pdb" --type inflate_state --out "$out\$v.json" | Out-Null
+    # inflate keeps a `struct inflate_state` behind z_stream's `internal_state* state` (deflate's type): the PDB's
+    # locals say so (`pointer_aliases`), and the record spec follows it to the window.
+    & $pbeta analyze "$builds\$v\minigzip.exe" --pdb "$builds\$v\minigzip.pdb" --out "$out\$v.json" | Out-Null
     if ($LASTEXITCODE) { throw "analyze $v failed" }
 }
 & $corpus hook-manifest --template (Join-Path $PSScriptRoot 'replay\zlib.template.toml') --map "$builds\$Old\minigzip.map" `
     --analysis "$out\$Old.json" --out "$out\hooks.toml"
 if ($LASTEXITCODE) { throw 'hook-manifest failed' }
-& $pbeta harness-spec --hooks "$out\hooks.toml" --analysis "$out\$Old.json" --out "$out\spec.toml" `
-    --pointer-alias z_stream_s.state=inflate_state | Out-Null
+& $pbeta harness-spec --hooks "$out\hooks.toml" --analysis "$out\$Old.json" --out "$out\spec.toml" | Out-Null
 if ($LASTEXITCODE) { throw 'harness-spec failed' }
 
 $input = Join-Path $repo "target\corpus-src\zlib\$Old\deflate.c"
@@ -93,20 +98,31 @@ $names = Get-Content "$out\hooks.toml" | Select-String '^name = "(.+)"' | ForEac
 foreach ($h in $names) {
     if (-not $newRva[$h]) { $rows += [pscustomobject]@{ Hook = $h; Outcome = "not in $New" }; continue }
     $j = & $pbeta (@('replay') + $caseArgs + @('--binary', "$builds\$New\minigzip.exe", '--old-rva', $oldRva[$h],
-            '--new-rva', $newRva[$h], '--new-analysis', "$out\$New.json", '--old-analysis', "$out\$Old.json", '--json'))
+            '--new-rva', $newRva[$h], '--new-analysis', "$out\$New.json", '--old-analysis', "$out\$Old.json", '--json') +
+        $(if ($SkipOthers) { @() } else { @('--others') }))
     $o = ($j | Out-String) | ConvertFrom-Json
     $all += [pscustomobject]@{ Hook = $h; Result = $o }
     $rows += [pscustomobject]@{
         Hook    = $h
         Outcome = $o.outcome
         Cases   = (@($o.cases | Group-Object outcome | ForEach-Object { "$($_.Name) $($_.Count)" }) -join ', ')
+        Others  = if ($o.others) { "pass $(@($o.others.passed).Count), same code $(@($o.others.same_code).Count), wrapper $(@($o.others.calls_target).Count)" } else { '' }
+        OthersPassed = if ($o.others) { @($o.others.passed) } else { @() }
         Detail  = if ($o.detail.Length -gt 160) { $o.detail.Substring(0, 160) + '...' } else { $o.detail }
     }
 }
 $all | ConvertTo-Json -Depth 8 | Set-Content "$out\replay.json"
-$rows | Format-Table -AutoSize -Wrap | Out-String -Width 250 | Write-Host
+$rows | Format-Table Hook, Outcome, Cases, Others, Detail -AutoSize -Wrap | Out-String -Width 250 | Write-Host
 $failed = @($rows | Where-Object Outcome -eq 'fail')
 $passed = @($rows | Where-Object Outcome -eq 'pass')
 Write-Host "zlib $Flags $Old -> ${New}: $($passed.Count) of $($rows.Count) hooks replay (all matching), $($failed.Count) fail"
 # Every pair is correct by the answer key: a failure is replay's error.
 if ($failed.Count) { throw "replay failed a correct pair: $($failed.Hook -join ', ')" }
+# A hook's cases passing on a function with other code: replay can't tell the wrong function from the right one.
+$confused = @($rows | Where-Object { $_.OthersPassed.Count })
+if (-not $SkipOthers) {
+    Write-Host "control: $($confused.Count) of $($rows.Count) hooks' cases pass on another function of $New"
+}
+if ($confused.Count) {
+    throw "replay passed wrong functions: $(($confused | ForEach-Object { "$($_.Hook) on $($_.OthersPassed -join ', ')" }) -join '; ')"
+}
