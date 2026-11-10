@@ -390,7 +390,7 @@ Implemented as small `StructuralCheck`s returning `pass | fail | inconclusive` w
 
 | Check | Pass condition | Status |
 |---|---|---|
-| Parameter count | Equal when both signatures are known (PDB or Ghidra) | Implemented |
+| Parameter count | Equal when both signatures are known (PDB or Ghidra). A variadic or unprototyped (K&R) function has no known count, so no signature | Implemented; measured 2026-11-09 with PDB signatures only (`pbeta-corpus score --pdb-signatures`: no names, types or globals) on the 60 gated corpus variants and `basic`: correct and wrong counts unchanged (31,096 correct, 0 wrong); accepted 25,211 → 30,503 (it's an independent pass); 49 correct pairs fail it, each a real signature change sent to review (`basic` S4, Lua `funcargs`, yaml-cpp's `std::string&` → `const char*, size_t`, zstd's added or removed flags); never passes a wrong pair there. On zstd's skipped /LTCG and PGO variants it fails 2 of the 3 known wrong matches. The measurement caught K&R definitions (zlib 1.2.13) read as one parameter of unknown type, fixed |
 | Inferred register arguments | Same number of Win64 argument registers (rcx/rdx/r8/r9, xmm0–3) read before written, up to the first call. Works without symbols. A lower bound, so sanity-only: a mismatch sends to review (it caught fixture S4's added parameter), a match never counts | Implemented |
 | String references | Jaccard similarity ≥ 0.5 **[Guess]** at the threshold | Implemented |
 | Size ratio | New/old size within 0.5–2.0; fail outside 0.25–4.0 **[Guess]**. Sanity check only: can fail a candidate, never counts as support | Implemented |

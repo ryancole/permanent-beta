@@ -4,7 +4,15 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **array arguments and `realloc` in replay** (design §7.3). Pointers to scalars and `T**` arguments
+Latest work: **the parameter-count check measured with PDB signatures** (design §6.1). `pbeta-corpus score
+--pdb-signatures` adds each function's PDB signature and nothing else (no names, types or globals). Over the 60
+gated corpus variants and `basic`: correct (31,096) and wrong (0) unchanged, accepted 25,211 → 30,503, since the
+check is an independent pass. Its 49 failures on correct pairs are all real signature changes, which belong in
+review. The measurement caught a PDB-reader bug: K&R and variadic functions (zlib 1.2.13) were read as one
+parameter of unknown type, failing correct pairs against 1.3's prototypes and feeding repair's prototype proposals
+a bogus change; such functions now have no signature. Hook loop and fixture scorecards unchanged.
+
+Before that: **array arguments and `realloc` in replay** (design §7.3). Pointers to scalars and `T**` arguments
 are recorded as `array`: the whole heap block holding them (else their own bytes), so zlib's `inflate_table`, whose
 four pointers go into inflate's state, now replays (3 of 3; on the 157 other v1.3.1 functions its cases never
 pass). `realloc` is modelled (same block and size; a moved block keeps what was written, the growth is unreadable
@@ -371,7 +379,7 @@ What's new:
 | Goal | State |
 |---|---|
 | 1. Find the new location | Done; measured on zlib, Lua, zstd, TinyXML-2, yaml-cpp and JsonCpp, /O2, /O2+ICF, /Od, /LTCG and PGO (zstd: not /LTCG or PGO) |
-| 2. Verify it's the same function | Done for symbol-less binaries, including C++ vtable slots (code-tables check); with `--pdb`, signatures feed the parameter-count check (not yet measured on the corpus) |
+| 2. Verify it's the same function | Done for symbol-less binaries, including C++ vtable slots (code-tables check); with `--pdb`, signatures feed the parameter-count check (measured 2026-11-09: correct and wrong unchanged, accepted +21%, its 49 failures all real signature changes) |
 | 3. Adapt hooks (signature/struct changes) | Prototype + shim proposals: from both builds' PDB signatures any parameter change (added incl. stack, removed, reordered, retyped), otherwise added register parameters; changed struct layouts from PDB types (changes, new definition, offsets). Without a PDB: struct field moves inferred from accesses (a guess for review); stack/removed parameters need PDBs |
 | 4. Behavioral tests from the old version | Done: scenario trace diff and trial runs (M4), and recorded per-call test cases replayed by emulation, with struct layouts translated by field name, globals placed by name and the UCRT's printing imports answered from the recording; on the hook loop 22 of 24 resolved hook repairs replay, all passing |
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |

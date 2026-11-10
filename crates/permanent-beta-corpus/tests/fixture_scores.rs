@@ -19,7 +19,7 @@ fn basic_fixture_passes_the_gate() {
     let mut failures = Vec::new();
     for flags in expected.gate.min_correct.keys() {
         let dir = root.join("target/fixtures/basic").join(flags);
-        let v = fixture::score_variant(&dir, flags, &expected).unwrap();
+        let v = fixture::score_variant(&dir, flags, &expected, fixture::Symbols::None).unwrap();
         print!("{}", fixture::render(&v));
         failures.extend(
             v.evaluation

@@ -351,19 +351,44 @@ fn signature(finder: &TypeFinder<'_>, index: TypeIndex) -> Option<FunctionSignat
             ty: type_name(finder, this, 0),
         });
     }
-    // `f(void)` is recorded as one `void` argument; it has no parameters.
-    let void_only = list.arguments.len() == 1 && type_name(finder, list.arguments[0], 0) == "void";
-    if !void_only {
-        params.extend(list.arguments.iter().map(|&t| Param {
-            name: None,
-            ty: type_name(finder, t, 0),
-        }));
-    }
+    let args: Vec<(String, bool)> = list
+        .arguments
+        .iter()
+        .map(|&t| (type_name(finder, t, 0), is_no_type(finder, t)))
+        .collect();
+    params.extend(parameter_list(args)?);
     Some(FunctionSignature {
         calling_convention: calling_convention(convention).map(str::to_owned),
         return_type: return_type.map(|t| type_name(finder, t, 0)),
         params,
     })
+}
+
+/// The parameters of an argument list, each type's name and whether it's CodeView's "no type". `None` when
+/// the count isn't known: a list ending in "no type" is a variadic function (`f(const char*, ...)`) or one
+/// defined without a prototype (K&R `f()` in C, as zlib 1.2.13 defines its functions), which the PDB can't tell
+/// apart. Counting that as one parameter of unknown type made correct matches fail the parameter-count check
+/// against the next release's prototypes. `f(void)` is recorded as one `void` argument: no parameters.
+fn parameter_list(args: Vec<(String, bool)>) -> Option<Vec<Param>> {
+    if args.last().is_some_and(|(_, no_type)| *no_type) {
+        return None;
+    }
+    if matches!(args.as_slice(), [(ty, _)] if ty == "void") {
+        return Some(Vec::new());
+    }
+    Some(
+        args.into_iter()
+            .map(|(ty, _)| Param { name: None, ty })
+            .collect(),
+    )
+}
+
+/// Whether `index` is CodeView's "no type" (not a pointer to it).
+fn is_no_type(finder: &TypeFinder<'_>, index: TypeIndex) -> bool {
+    matches!(
+        finder.find(index).ok().and_then(|t| t.parse().ok()),
+        Some(TypeData::Primitive(p)) if p.kind == pdb::PrimitiveKind::NoType && p.indirection.is_none()
+    )
 }
 
 /// How many levels of by-value members are followed from a struct a signature uses (a struct inside a struct).
@@ -788,6 +813,29 @@ mod tests {
         let p = procedures_export(&e.build, &s);
         assert_eq!(p.functions.len(), 1);
         assert!(p.functions[0].name.is_none());
+    }
+
+    #[test]
+    fn argument_lists_with_an_unknown_count_have_no_signature() {
+        let arg = |ty: &str| (ty.to_owned(), false);
+        let tys =
+            |p: Option<Vec<Param>>| p.map(|p| p.into_iter().map(|p| p.ty).collect::<Vec<_>>());
+        assert_eq!(
+            tys(parameter_list(vec![arg("int"), arg("char*")])),
+            Some(vec!["int".to_owned(), "char*".to_owned()])
+        );
+        assert_eq!(tys(parameter_list(vec![arg("void")])), Some(vec![]));
+        assert_eq!(tys(parameter_list(vec![])), Some(vec![]));
+        // Negative: K&R `f()` and variadic `f(const char*, ...)` end in "no type": the count isn't known, so no
+        // signature, never one parameter of type `?`.
+        let none = ("?".to_owned(), true);
+        assert_eq!(parameter_list(vec![none.clone()]), None);
+        assert_eq!(parameter_list(vec![arg("const char*"), none]), None);
+        // A depth-limited name is `?` too, but it's a real parameter.
+        assert_eq!(
+            tys(parameter_list(vec![arg("?")])),
+            Some(vec!["?".to_owned()])
+        );
     }
 
     #[test]

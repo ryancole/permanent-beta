@@ -58,6 +58,11 @@ enum Command {
         /// Also list the functions present in both builds that weren't matched correctly.
         #[arg(long)]
         misses: bool,
+        /// Add each function's PDB signature to both analyses, and nothing else from the PDB (no names, types or
+        /// globals), to measure the parameter-count check. The PDB is found beside each executable or, for a
+        /// corpus project, in its builds/ directory, and must be that build's.
+        #[arg(long)]
+        pdb_signatures: bool,
     },
     /// Write the v1 hook manifest from a template whose locators name symbols (corpus/hooks).
     HookManifest {
@@ -178,7 +183,13 @@ fn main() -> Result<ExitCode> {
             built,
             expected,
             misses,
+            pdb_signatures,
         } => {
+            let symbols = if pdb_signatures {
+                fixture::Symbols::Signatures
+            } else {
+                fixture::Symbols::None
+            };
             let text = std::fs::read_to_string(&expected)
                 .with_context(|| format!("reading {}", expected.display()))?;
             let expected = Expected::parse(&text)
@@ -202,7 +213,7 @@ fn main() -> Result<ExitCode> {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                let v = fixture::score_variant(&dir, &flags, &expected)?;
+                let v = fixture::score_variant(&dir, &flags, &expected, symbols)?;
                 print!("{}", fixture::render(&v));
                 if misses {
                     print!("{}", fixture::render_misses(&v));
