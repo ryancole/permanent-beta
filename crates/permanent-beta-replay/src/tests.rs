@@ -32,6 +32,8 @@ const REALLOC_READ: u32 = 0x1120; // p = malloc(16); *(int*)p = 7; p = realloc(p
 const REALLOC_READ_GROWN: u32 = 0x1150; // ... p = realloc(p, 32); return *(int*)(p + 16) (never written)
 const REALLOC_READ_OLD: u32 = 0x1180; // ... q = realloc(p, 32); return *(int*)p
 const FREE_ARG: u32 = 0x11c0; // free(rcx)
+const READ_AT_4: u32 = 0x11e0; // mov eax, [rcx+4]; ret
+const READ_FIELD_0: u32 = 0x11f0; // mov eax, [rcx]; ret
 
 /// Where the recording process had the old image loaded (cases record `image_size` 0x4000).
 const OLD_BASE: u64 = 0x7ff6_0000_0000;
@@ -128,6 +130,8 @@ fn text() -> Vec<u8> {
     f.extend(rel32(FREE_ARG + 4, 6, RDATA + 0x80));
     f.extend([0x48, 0x83, 0xc4, 0x28, 0xc3]);
     put(FREE_ARG, &f);
+    put(READ_AT_4, &[0x8b, 0x41, 0x04, 0xc3]);
+    put(READ_FIELD_0, &[0x8b, 0x01, 0xc3]);
     t
 }
 
@@ -692,10 +696,23 @@ mod emulated {
         // Negative: replayed untranslated (same layout claimed), the new code would read past the struct.
         let o = run(READ_AT_8, ValueType::Int(4), &c, &[config_v1()]);
         assert!(!matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
-        // Negative: a new field has no recorded value.
+        // A new field has no recorded value: code that doesn't read it still replays (b moved to 8)...
         let added = config(vec![field("a", 0), field("inserted", 4), field("b", 8)], 12);
-        let o = run(READ_AT_8, ValueType::Int(4), &c, &[added]);
-        inconclusive(&o, "inserted is new");
+        let o = run(
+            READ_AT_8,
+            ValueType::Int(4),
+            &c,
+            std::slice::from_ref(&added),
+        );
+        assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
+        // ...and negative: code that reads it is inconclusive, never fed zeros.
+        let o = run(READ_AT_4, ValueType::Int(4), &c, &[added]);
+        inconclusive(&o, &format!("{:#x}", STRUCT_AT + 4));
+        // A removed field is dropped: the new code can't read it by name.
+        let removed = config(vec![field("b", 0)], 4);
+        let c = case(STRUCT_AT, 0, 7, Some((&r, &r, Some("Config"))));
+        let o = run(READ_FIELD_0, ValueType::Int(4), &c, &[removed]);
+        assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
     }
 }
 

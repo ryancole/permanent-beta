@@ -111,6 +111,8 @@ struct Prepared {
     compare: Vec<Range<usize>>,
     label: String,
     translated: bool,
+    /// Byte ranges with no recorded value (fields the old layout lacks): unreadable until written.
+    unknown: Vec<Range<usize>>,
     /// Reached through a pointer ([`CaptureKind::Pointee`]): something replay doesn't model (an import's
     /// internals, another thread) may have written it during the recorded call, so a difference there makes the
     /// case inconclusive, not a fail.
@@ -123,6 +125,7 @@ fn prepare(
     case: &LoadedCase,
     new_layouts: &[TypeLayout],
 ) -> Result<Vec<Prepared>, String> {
+    let types = translate::Types::new(&spec.layouts, new_layouts);
     let mut out = Vec::new();
     for r in &case.regions {
         let arg = r.region.arg;
@@ -143,6 +146,7 @@ fn prepare(
                 _ => format!("arg{arg}"),
             },
             translated: false,
+            unknown: Vec::new(),
             pointee: r.region.kind == CaptureKind::Pointee,
         };
         if let Some(name) = &r.region.layout {
@@ -150,18 +154,17 @@ fn prepare(
             let old = spec
                 .layout(name)
                 .ok_or_else(|| format!("the recording's spec has no layout of {name}"))?;
-            let new = new_layouts
-                .iter()
-                .find(|l| &l.name == name)
-                .ok_or_else(|| {
-                    format!("no layout of {name} for the new build (analyze it with --pdb)")
-                })?;
+            // The same name, or the struct it was renamed to (the same structure, translate::Types).
+            let new = types.new_layout(name).ok_or_else(|| {
+                format!("no layout of {name} for the new build (analyze it with --pdb)")
+            })?;
             if !translate::same_layout(old, new) {
-                let before = translate::translate(old, new, &r.before)?;
-                let after = translate::translate(old, new, &r.after)?;
+                let before = types.translate(old, new, &r.before)?;
+                let after = types.translate(old, new, &r.after)?;
                 p.before = before.bytes;
                 p.expected_after = after.bytes;
                 p.compare = before.fields;
+                p.unknown = before.unknown;
                 p.translated = true;
             }
         }
@@ -295,6 +298,7 @@ fn run_and_compare(
         .map(|p| emulate::Placed {
             address: p.address,
             bytes: p.before.clone(),
+            unknown: p.unknown.clone(),
         })
         .collect();
     let placed_globals: Vec<emulate::Placed> = globals
@@ -302,6 +306,7 @@ fn run_and_compare(
         .map(|g| emulate::Placed {
             address: g.rva,
             bytes: g.before.clone(),
+            unknown: Vec::new(),
         })
         .collect();
     let ran = match emulate::run(&emulate::Setup {

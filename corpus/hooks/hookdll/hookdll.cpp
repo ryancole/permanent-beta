@@ -321,10 +321,10 @@ std::string lower(std::string s) {
 const char kRecorder[] = "permanent-beta-hookdll 0.2";
 constexpr int kThunks = 16;
 constexpr int kMaxArgs = 16;
-// Import calls: patched import address table slots (the 64 import thunks in record_thunk.asm), stack arguments
+// Import calls: patched import address table slots (the 256 import thunks in record_thunk.asm; zstd has 112 imports), stack arguments
 // recorded, and bytes captured behind an argument (kImportBlock) and behind a pointer inside that (kImportInner).
 // [Guess]
-constexpr int kImportThunks = 64;
+constexpr int kImportThunks = 256;
 constexpr int kImportStackArgs = 8;
 constexpr size_t kImportBlock = 512;
 constexpr size_t kImportInner = 256;
@@ -790,7 +790,7 @@ std::string import_json(const ImportRecord& r) {
 // inconclusive.
 
 constexpr size_t kPointeeBlock = 64 * 1024;      // behind a byte pointer that isn't a heap block's start [Guess]
-constexpr size_t kPointeeHeapMax = 256 * 1024;   // of one heap block [Guess]
+constexpr size_t kPointeeHeapMax = 1024 * 1024;  // of one heap block [Guess]: zstd's stream buffers are ~260 KiB
 constexpr size_t kPointeeCaseMax = 4 << 20;      // per case [Guess]
 unsigned g_pointer_depth = 0;
 std::vector<RecPointer> g_pointers;
@@ -942,6 +942,18 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
     });
     for (const Bytes& want : buffers) {
         unsigned long long p = want.p;
+        // A pointer one past the end of a heap block (C allows it: zlib's next_out at the end of its full output
+        // buffer, which updatewindow copies from backwards) also captures that block.
+        if (!inside(p - 1)) {
+            auto behind = enclosing_heap_block(p - 1);
+            if (behind.second != 0 && behind.first + behind.second == p && behind.second <= kPointeeHeapMax &&
+                !inside(behind.first) && limit_after(behind.first) >= p && total + behind.second <= kPointeeCaseMax) {
+                std::vector<unsigned char> got = readable_prefix(behind.first, behind.second);
+                if (got.size() == behind.second && !overlaps_redacted(behind.first, got.size())) {
+                    add(want.arg, behind.first, std::move(got), "");
+                }
+            }
+        }
         if (inside(p)) {
             continue;
         }
@@ -965,6 +977,10 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
                 }
             }
             hi = block.first + block.second;
+        } else if (block.second != 0) {
+            // A block over kPointeeHeapMax: kPointeeBlock from the pointer, never past the block's end.
+            unsigned long long end = block.first + block.second;
+            hi = end - p < kPointeeBlock ? end : p + kPointeeBlock;
         } else {
             hi = p + kPointeeBlock;
         }
@@ -1094,21 +1110,48 @@ extern "C" void* pbeta_record_before(RecordFrame* f) {
             // argument's region without lying inside it; then its own bytes, as `fixed`.
             n = static_cast<size_t>(a.size);
             auto block = enclosing_heap_block(address);
+            // In a block over kPointeeHeapMax (zstd's workspace, megabytes), kPointeeBlock from the element on,
+            // within the block: arrays are indexed forward from the pointer.
+            if (block.second > kPointeeHeapMax) {
+                unsigned long long end = block.first + block.second;
+                block = {address, static_cast<size_t>(end - address < kPointeeBlock ? end - address : kPointeeBlock)};
+            }
             if (block.second >= n && block.second <= kPointeeHeapMax && !overlaps_redacted(block.first, block.second)) {
                 unsigned long long lo = block.first, hi = block.first + block.second;
-                bool inside_one = false, overlaps = false;
+                bool inside_one = false, typed_overlap = false;
                 for (const PendingRegion& r : call->regions) {
                     unsigned long long rlo = r.address, rhi = r.address + r.before.size();
                     if (rlo <= lo && hi <= rhi) {
                         inside_one = true;
-                    } else if (lo < rhi && rlo < hi) {
-                        overlaps = true;
+                    } else if (lo < rhi && rlo < hi && !r.layout.empty()) {
+                        typed_overlap = true;  // a struct's bytes can't be merged: replay translates them
                     }
                 }
                 if (inside_one && !a.redact) {
                     continue;  // another argument's region already holds it (inflate_table's pointers)
                 }
-                if (!overlaps) {
+                if (!typed_overlap && !a.redact) {
+                    // Untyped regions this one overlaps or holds (another array of the same workspace, a buffer
+                    // inside the same context: zstd's count and normalizedCounter, DTable and the literals
+                    // buffer) are merged into one region covering them all.
+                    for (const PendingRegion& r : call->regions) {
+                        unsigned long long rlo = r.address, rhi = r.address + r.before.size();
+                        if (lo < rhi && rlo < hi) {
+                            lo = rlo < lo ? rlo : lo;
+                            hi = rhi > hi ? rhi : hi;
+                        }
+                    }
+                    if (hi - lo <= kPointeeHeapMax && !overlaps_redacted(lo, static_cast<size_t>(hi - lo))) {
+                        call->regions.erase(
+                            std::remove_if(call->regions.begin(), call->regions.end(),
+                                           [&](const PendingRegion& r) {
+                                               return r.address < hi && lo < r.address + r.before.size();
+                                           }),
+                            call->regions.end());
+                        at = lo;
+                        n = static_cast<size_t>(hi - lo);
+                    }
+                } else if (!typed_overlap) {
                     at = lo;
                     n = block.second;
                 }

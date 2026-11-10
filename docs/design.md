@@ -648,9 +648,13 @@ Each detour logs what its prototype makes meaningful, written by hand.
   **[Guess]**), an interrupt or `syscall`, no return within 10M instructions, an unknown return type, nothing to
   compare, or a pointer returned outside the recorded memory.
 - *Layout translation:* a recorded struct whose layout differs in the new build's PDB is rewritten into the new
-  layout by field name, and only its fields are compared. A field without its counterpart (added, removed, renamed,
-  resized or retyped, a moved bitfield) makes the case inconclusive; so does a struct with no layout for the new
-  build (analyzed without `--pdb`).
+  layout by field name, and only the fields both layouts have are compared. Since 2026-11-09 (zstd, below): a
+  removed field is dropped; an added one has no recorded value, so its bytes are unreadable until the function
+  writes them, and never compared; a struct held by value is translated field by field (the spec carries the
+  nested layouts); a renamed struct is found by structure (the one new-only struct with the same fields), a renamed
+  enum of the same size is the same type **[Guess]**, and a pointer is an address whatever its type's name. A
+  resized or retyped field, or a moved bitfield, makes the case inconclusive; so does a struct with no layout for
+  the new build (analyzed without `--pdb`).
 - *Verification:* `RecordedCasesRunner` (§6.2), `pbeta repair --cases <dir> --new-binary`, and `pbeta replay`
   for one old/new RVA pair.
 
@@ -793,6 +797,25 @@ aliases from fields like `next`; yaml-cpp and JsonCpp: STL internals), so the re
 seen in a function a hook reaches, and the recorder's exact-size rule still decides per block. On zlib that gives
 exactly `z_stream_s.state → inflate_state` (seen in `inflate` and `inflate_fast`) and leaves out `→ gz_state` (the
 `gz_*` functions, which no hook reaches). `--type` and `--pointer-alias` stay for what the PDB doesn't show.
+
+**Replay measured on zstd (2026-11-09).** `corpus/replay-measure.ps1 -Project zstd` hooks 16 functions of the zstd
+CLI (`corpus/replay/zstd.template.toml`: compression and decompression, most taking `ZSTD_CCtx_s*` or
+`ZSTD_DCtx_s*`) and records compressing and decompressing `zstd_compress.c`, single-threaded. Unlike zlib, zstd's
+structs change between releases (1.5.7 renamed dozens of types, `seqStore_t` → `SeqStore_t`, removed
+`ZSTD_CCtx_s.blockSize` and added `blockSizeMax`, changed nested by-value structs), so this is layout translation's
+first measurement on real code. The first run replayed 1 of 16 hooks; what it took, all general:
+- translation by structure for renamed types, dropped removed fields, unreadable added fields, nested structs field
+  by field, same-size integers and enums as the same bytes (§7.3 *Layout translation*);
+- the spec carries the layouts of structs held by value; `…Capacity` is a length name and a sized buffer is
+  captured up to 256 KiB **[Guess]** (a zstd block is 128 KiB);
+- the recorder: 256 import thunks (zstd has 112 imports; with 64 no case had its imports recorded), whole heap
+  blocks up to 1 MiB **[Guess]** (zstd's stream buffers are ~260 KiB), a 64 KiB window from an `array` pointer into
+  a larger block, never past its end, and untyped regions an `array` capture overlaps merged into one (`count` and
+  `normalizedCounter` in one workspace); and a pointer one past a heap block's end also captures that block
+  (zlib's `updatewindow` copies from `next_out - copy`).
+zstd /O2 1.5.6 → 1.5.7: **11 of 16** hooks replay, 0 fail. Two aren't called; `ZSTD_compressStream2`,
+`ZSTD_compressBlock_internal` and `ZSTD_buildSeqStore` index hash tables across a workspace of megabytes, more
+than a case records, and stay inconclusive. The wrong-target control runs on all threads (each its own emulator).
 
 Not recorded: memory behind pointers inside structs beyond `pointer_depth` or without a typed field, the globals a callee reached only through a
 pointer reads, and comparison rules (`compare.ignore`). Imports are modelled one by one; any other import is

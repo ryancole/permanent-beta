@@ -46,6 +46,9 @@ const SLACK: u64 = 32;
 pub struct Placed {
     pub address: u64,
     pub bytes: Vec<u8>,
+    /// Byte ranges (offsets into `bytes`) with no recorded value: a struct's fields the old build didn't have.
+    /// Writable, unreadable until written.
+    pub unknown: Vec<Range<usize>>,
 }
 
 pub struct Setup<'a> {
@@ -312,6 +315,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         .map(|r| Placed {
             address: r.start,
             bytes: vec![0; (r.end - r.start) as usize],
+            unknown: Vec::new(),
         })
         .collect();
     let region_pages = page_ranges(&[setup.regions, &reserved].concat());
@@ -475,6 +479,14 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         .map_err(mem_err)?;
         mem.write_bytes(r.address, bytes, perm::NONE)
             .map_err(mem_err)?;
+        for u in &r.unknown {
+            mem.update_perm(
+                r.address + u.start as u64,
+                (u.end - u.start) as u64,
+                perm::READ | perm::WRITE,
+            )
+            .map_err(mem_err)?;
+        }
     }
 
     // Entry state: [rsp] the return trap, then the shadow space, then the recorded stack arguments.

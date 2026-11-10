@@ -198,7 +198,8 @@ impl Others {
 }
 
 impl RecordedCasesRunner {
-    /// [`Self::judge`] on every function of `new` but `new_rva`.
+    /// [`Self::judge`] on every function of `new` but `new_rva`, spread over the machine's threads (each replays
+    /// in its own emulator).
     pub fn judge_others(
         &self,
         old_build: Option<&BuildId>,
@@ -209,15 +210,36 @@ impl RecordedCasesRunner {
         let target_hash = new
             .function(new_rva)
             .and_then(|f| f.normalized_hash.as_deref());
+        let targets: Vec<&FunctionFeatures> =
+            new.functions.iter().filter(|f| f.rva != new_rva).collect();
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(targets.len().max(1));
+        let chunk = targets.len().div_ceil(threads).max(1);
+        let outcomes: Vec<CheckOutcome> = std::thread::scope(|s| {
+            let handles: Vec<_> = targets
+                .chunks(chunk)
+                .map(|part| {
+                    s.spawn(move || {
+                        part.iter()
+                            .map(|f| self.judge(old_build, old_rva, f.rva).outcome)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("a replay thread panicked"))
+                .collect()
+        });
         let mut others = Others::default();
-        for f in new.functions.iter().filter(|f| f.rva != new_rva) {
-            let j = self.judge(old_build, old_rva, f.rva);
+        for (f, outcome) in targets.iter().zip(outcomes) {
             others.add(
                 target_hash,
                 f.rva,
                 f.normalized_hash.as_deref(),
                 f.callees.contains(&new_rva),
-                j.outcome,
+                outcome,
             );
         }
         others

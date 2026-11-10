@@ -48,8 +48,9 @@ pub const DEFAULT_MAX_CASES: u32 = 32;
 pub const DEFAULT_POINTER_DEPTH: u32 = 2;
 /// Most bytes captured for a C string. **[Guess]**
 pub const CSTRING_MAX: u64 = 4096;
-/// Most bytes captured for a buffer sized by another argument. **[Guess]**
-pub const SIZED_MAX: u64 = 64 * 1024;
+/// Most bytes captured for a buffer sized by another argument. **[Guess]**: 256 KiB holds a zstd block (128 KiB)
+/// with room; was 64 KiB.
+pub const SIZED_MAX: u64 = 256 * 1024;
 
 /// The spec for every hook of `manifest` bound to `build`'s build. `build` should be analyzed with `--pdb`, or
 /// no struct gets a layout (its pointers capture nothing).
@@ -161,7 +162,35 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
     }
     add_pointer_fields(&mut out, build, 0);
     apply_analysis_aliases(&mut out, build);
+    add_nested_layouts(&mut out, build);
     out
+}
+
+/// The layouts of structs held by value in the spec's layouts (and in theirs), so a replay can translate them
+/// field by field when they changed (zstd's `ZSTD_CCtx_s.appliedParams`). Not followed by the recorder: a nested
+/// struct is part of its outer struct's bytes.
+fn add_nested_layouts(out: &mut HarnessSpec, build: &AnalysisExport) {
+    let mut i = 0;
+    while i < out.layouts.len() && out.layouts.len() < MAX_POINTER_LAYOUTS * 2 {
+        let fields = out.layouts[i].fields.clone();
+        i += 1;
+        for f in fields {
+            if f.ty.contains('*') || f.ty.contains('[') || f.ty.contains('&') {
+                continue;
+            }
+            let Some(name) =
+                f.ty.strip_prefix("struct ")
+                    .or_else(|| f.ty.strip_prefix("union "))
+            else {
+                continue;
+            };
+            if out.layout(name).is_none()
+                && let Some(l) = build.type_layout(name)
+            {
+                out.layouts.push(l.clone());
+            }
+        }
+    }
 }
 
 /// The analysis's [`PointerAlias`]es (`pbeta analyze --pdb`) for the layouts the spec captures, seen in a
@@ -322,6 +351,7 @@ pub fn pointer_alias(
         let from = spec.layouts.len();
         spec.layouts.push(t);
         add_pointer_fields(spec, build, from);
+        add_nested_layouts(spec, build);
     }
     Ok(())
 }
@@ -473,7 +503,7 @@ fn is_length_name(name: &str) -> bool {
     matches!(
         n.as_str(),
         "n" | "len" | "length" | "size" | "cap" | "capacity" | "count" | "bytes" | "nbytes" | "cb"
-    ) || ["len", "size", "_cap", "_bytes"]
+    ) || ["len", "size", "_cap", "_bytes", "capacity"]
         .iter()
         .any(|s| n.ends_with(s))
 }
@@ -616,6 +646,9 @@ mod tests {
         let c = s.hook("checksum").unwrap();
         assert_eq!(c.args[0].capture, CaptureKind::Sized);
         assert_eq!(c.args[0].max, Some(SIZED_MAX));
+        // zstd's `void* dst, size_t dstCapacity`. Negative: `flags` isn't a length.
+        assert!(is_length_name("dstCapacity") && is_length_name("srcSize"));
+        assert!(!is_length_name("flags") && !is_length_name("capacityMode"));
         // `const char* msg, int code`: `code` isn't a length, so it's a string.
         assert_eq!(
             s.hook("log_event").unwrap().args[0].capture,
@@ -768,6 +801,59 @@ mod tests {
         )]);
         let s = spec(&m, &build, 8);
         assert!(s.pointers.is_empty() && s.layout("inflate_state").is_none());
+    }
+
+    #[test]
+    fn structs_held_by_value_bring_their_layouts() {
+        let f = |name: &str, offset, size, ty: &str| FieldLayout {
+            name: name.into(),
+            offset,
+            size,
+            ty: ty.into(),
+            bits: None,
+        };
+        let l = |name: &str, size, fields| TypeLayout {
+            name: name.into(),
+            size,
+            union: false,
+            fields,
+        };
+        let build = export(
+            "v1",
+            vec![
+                l(
+                    "Ctx",
+                    0x20,
+                    vec![
+                        f("params", 0, 0x10, "struct Params"),
+                        f("next", 0x10, 8, "struct Ctx*"),
+                        f("buf", 0x18, 8, "struct Big*"),
+                    ],
+                ),
+                l(
+                    "Params",
+                    0x10,
+                    vec![f("level", 0, 4, "int"), f("inner", 4, 8, "struct Inner")],
+                ),
+                l("Inner", 8, vec![f("x", 0, 8, "long long")]),
+                l("Big", 0x1000, vec![]),
+            ],
+        );
+        let m = manifest(&[("f", Some("int f(Ctx* c)"), "v1")]);
+        let s = spec(&m, &build, 8);
+        let names: Vec<&str> = s.layouts.iter().map(|l| l.name.as_str()).collect();
+        // Ctx, the structs it holds by value (two levels), and Big through its pointer field.
+        assert!(
+            names.contains(&"Params") && names.contains(&"Inner") && names.contains(&"Big"),
+            "{names:?}"
+        );
+        // Negative: a by-value field of a type the PDB doesn't lay out adds nothing (and doesn't fail).
+        let build = export(
+            "v1",
+            vec![l("Ctx", 0x10, vec![f("params", 0, 0x10, "struct Unknown")])],
+        );
+        let s = spec(&m, &build, 8);
+        assert_eq!(s.layouts.len(), 1);
     }
 
     #[test]

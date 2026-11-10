@@ -1,0 +1,148 @@
+# zstd functions hooked in the zstd CLI to measure replay on real code (corpus/replay-measure.ps1 -Project zstd).
+# Prototypes from the PDB's signatures with enums written as int, PDB struct names, and parameter names (the
+# record spec takes a buffer's length from the parameter after it). Compression and decompression, most taking
+# the contexts whose layouts change between releases. Record mode attaches at most 16 hooks.
+
+[[hook]]
+name = "ZSTD_compressBound"
+detour = "record"
+prototype = "unsigned long long ZSTD_compressBound(unsigned long long srcSize)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_compressBound"
+
+[[hook]]
+name = "ZSTD_XXH64"
+detour = "record"
+prototype = "unsigned long long ZSTD_XXH64(const void* input, size_t len, unsigned long long seed)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_XXH64"
+
+[[hook]]
+name = "ZSTD_XXH64_update"
+detour = "record"
+prototype = "int ZSTD_XXH64_update(XXH64_state_s* state, const void* input, size_t len)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_XXH64_update"
+
+[[hook]]
+name = "ZSTD_getFrameHeader_advanced"
+detour = "record"
+prototype = "size_t ZSTD_getFrameHeader_advanced(ZSTD_frameHeader* zfhPtr, const void* src, size_t srcSize, int format)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_getFrameHeader_advanced"
+
+[[hook]]
+name = "ZSTD_compressStream2"
+detour = "record"
+prototype = "size_t ZSTD_compressStream2(ZSTD_CCtx_s* cctx, ZSTD_outBuffer_s* output, ZSTD_inBuffer_s* input, int endOp)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_compressStream2"
+
+[[hook]]
+name = "ZSTD_compressBlock_internal"
+detour = "record"
+prototype = "size_t ZSTD_compressBlock_internal(ZSTD_CCtx_s* zc, void* dst, size_t dstCapacity, const void* src, size_t srcSize, unsigned int frame)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_compressBlock_internal"
+
+[[hook]]
+name = "ZSTD_buildSeqStore"
+detour = "record"
+prototype = "size_t ZSTD_buildSeqStore(ZSTD_CCtx_s* zc, const void* src, size_t srcSize)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_buildSeqStore"
+
+[[hook]]
+name = "HIST_count_simple"
+detour = "record"
+prototype = "unsigned int HIST_count_simple(unsigned int* count, unsigned int* maxSymbolValuePtr, const void* src, size_t srcSize)"
+
+[hook.target]
+build = "v1"
+symbol = "HIST_count_simple"
+
+[[hook]]
+name = "FSE_normalizeCount"
+detour = "record"
+prototype = "size_t FSE_normalizeCount(short* normalizedCounter, unsigned int tableLog, const unsigned int* count, size_t total, unsigned int maxSymbolValue, unsigned int useLowProbCount)"
+
+[hook.target]
+build = "v1"
+symbol = "FSE_normalizeCount"
+
+[[hook]]
+name = "FSE_buildCTable_wksp"
+detour = "record"
+prototype = "size_t FSE_buildCTable_wksp(unsigned int* ct, const short* normalizedCounter, unsigned int maxSymbolValue, unsigned int tableLog, void* workSpace, size_t wkspSize)"
+
+[hook.target]
+build = "v1"
+symbol = "FSE_buildCTable_wksp"
+
+[[hook]]
+name = "ZSTD_decompressStream"
+detour = "record"
+prototype = "size_t ZSTD_decompressStream(ZSTD_DCtx_s* zds, ZSTD_outBuffer_s* output, ZSTD_inBuffer_s* input)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_decompressStream"
+
+[[hook]]
+name = "ZSTD_decompressContinue"
+detour = "record"
+prototype = "size_t ZSTD_decompressContinue(ZSTD_DCtx_s* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_decompressContinue"
+
+[[hook]]
+name = "ZSTD_decompressBlock_internal"
+detour = "record"
+prototype = "size_t ZSTD_decompressBlock_internal(ZSTD_DCtx_s* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize, int streaming)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_decompressBlock_internal"
+
+[[hook]]
+name = "ZSTD_decodeLiteralsBlock"
+detour = "record"
+prototype = "size_t ZSTD_decodeLiteralsBlock(ZSTD_DCtx_s* dctx, const void* src, size_t srcSize, void* dst, size_t dstCapacity, int streaming)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_decodeLiteralsBlock"
+
+[[hook]]
+name = "ZSTD_decodeSeqHeaders"
+detour = "record"
+prototype = "size_t ZSTD_decodeSeqHeaders(ZSTD_DCtx_s* dctx, int* nbSeqPtr, const void* src, size_t srcSize)"
+
+[hook.target]
+build = "v1"
+symbol = "ZSTD_decodeSeqHeaders"
+
+[[hook]]
+name = "HUF_decompress4X_usingDTable"
+detour = "record"
+prototype = "size_t HUF_decompress4X_usingDTable(void* dst, size_t maxDstSize, const void* cSrc, size_t cSrcSize, const unsigned int* DTable, int flags)"
+
+[hook.target]
+build = "v1"
+symbol = "HUF_decompress4X_usingDTable"

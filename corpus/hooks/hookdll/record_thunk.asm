@@ -131,7 +131,7 @@ ENDM
 
 ; IMPORT_THUNKS in hookdll.cpp.
 j = 0
-REPT 64
+REPT 256
     IMPORT_THUNK %j
     j = j + 1
 ENDM
@@ -145,7 +145,7 @@ ENDM
 PUBLIC pbeta_import_thunks
 pbeta_import_thunks LABEL QWORD
 j = 0
-REPT 64
+REPT 256
     THUNK_ADDR %j
     j = j + 1
 ENDM

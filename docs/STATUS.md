@@ -4,7 +4,15 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **pointer aliases found automatically, and a wrong-target control** (design §7.3). `pbeta analyze
+Latest work: **replay measured on zstd** (design §7.3), the first real target whose structs change between
+releases. `replay-measure.ps1 -Project zstd`: 1 of 16 hooks replayed at first, **11 of 16** now, 0 fail, after
+general fixes: translation handles renamed types (by structure), removed fields (dropped), added fields
+(unreadable until written), nested by-value structs and same-size integer and enum changes; the recorder patches
+256 imports (was 64), captures whole heap blocks up to 1 MiB, windows into larger ones, merges overlapping arrays
+and captures the block a one-past-the-end pointer ends. Left inconclusive: compression that indexes megabytes of
+workspace.
+
+Before that: **pointer aliases found automatically, and a wrong-target control** (design §7.3). `pbeta analyze
 --pdb` now finds fields code keeps in a local of another struct type (`z_stream_s.state`, an `inflate_state` in
 inflate), and the record spec applies those seen in code a hook reaches, so zlib needs no hand-given hints. And
 `pbeta bind --hooks --binary` sets a hand-written manifest's placeholder builds to the binary's SHA-256. `pbeta replay --others` replays
@@ -442,7 +450,7 @@ What's new:
    arguments capture their heap block; replay is measured on zlib (`corpus/replay-measure.ps1`: 14 of 16 hooks
    replay, the other two aren't called; `inflate` 8 of 8 cases, `inflate_fast` 9 of 9, `updatewindow` 7 of 8).
    Pointer aliases are found in the PDB's locals. Not covered: arrays on the stack (only the element is captured),
-   type punning no local shows. Next: `updatewindow`'s last case (a `memcpy` from a buffer not captured), globals reached only through pointers, a target whose callee
+   type punning no local shows. Next: zstd's compression hooks (megabytes of workspace per case), globals reached only through pointers, a target whose callee
    changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
    translation outside unit tests.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
@@ -453,7 +461,7 @@ What's new:
 
 - Replay needs the PDB of both builds for globals (named by it), and is inconclusive for a global without a
   unique PDB name, one only a callee reached through a pointer reads, and any import without a model (three are
-  modelled). The recorder patches at most 64 imports, and its import memory sizes (512 bytes per argument, 256
+  modelled). The recorder patches at most 256 imports, and its import memory sizes (512 bytes per argument, 256
   behind each pointer in that) are guesses. The record spec's `sized` buffers are guessed from parameter names.
   The thunks forward at most 8 stack arguments and don't support variadic functions. The emulator build needs
   CMake, Ninja and libclang; without the `emulator` feature every case is inconclusive (pbeta says so).
