@@ -167,13 +167,22 @@ Per function (fields optional unless noted):
 | `mnemonic_hash` | Hash of the mnemonic sequence only. Survives register allocation changes. **[Guess]** at its usefulness for MSVC. |
 | `basic_blocks`, `edges` | CFG shape (planned: a proper structural fingerprint, MD-index style). |
 | `callees` | Call-graph edges (RVAs within the same build). |
+| `code_refs` | Code addresses outside the function taken by a RIP-relative `lea` (function pointers). Not hashed or matched on; the wrong-target control walks them with `callees` (§7.3). Optional; no schema bump. |
 | `code_tables` (per build) | Runs of ≥ 2 consecutive relocated pointers to function starts in data: vtables and function tables. Optional; no schema bump. |
 | `strings`, `constants`, `imports` | Referenced string literals, non-trivial immediates, imported APIs called. |
 | `signature` | Calling convention, return type, parameters, typically from PDB or decompiler. |
 
-**Planned additions:** per-function pseudocode (from Ghidra, for review and AI), struct type definitions
-referenced by signatures, and a `features_version` so that hashes from different normalizer versions are never
-compared.
+Per build, **`features_version`** (2026-11-10) names the normalizer that computed the code features and its
+version (`native-1`; `permanent_beta_analysis::native::FEATURES_VERSION`). Every native analysis has it, whatever
+found the boundaries (native discovery or a Ghidra export: the features come from the same code). The engine
+matches, repairs and verifies only between analyses that agree on it (`AnalysisExport::features_comparable`):
+another version, or an analysis without one (written before it existed, or PDB-only), is refused with "analyze
+both builds with the same pbeta", never matched on hashes that mean different things. An earlier build is checked
+only if a hook is bound to it. The number is bumped on any change to what a feature covers; `schema_version` is
+for the export's shape. Optional, so adding it didn't change the schema version.
+
+Per-function pseudocode (from Ghidra, for review and AI) and the struct layouts signatures use (`types`, from a
+PDB) are in the schema too.
 
 ### 4.2 Native analyzer (fast path, in Rust)
 

@@ -82,7 +82,7 @@ pub fn score_variant(
     model: &dyn Model,
     select: Select,
     limit: usize,
-) -> (AiTotals, Vec<AiRow>) {
+) -> anyhow::Result<(AiTotals, Vec<AiRow>)> {
     let mut by_old: BTreeMap<Rva, (BTreeSet<String>, BTreeSet<Rva>)> = BTreeMap::new();
     for e in &truth.functions {
         if let Some(o) = e.old {
@@ -92,7 +92,7 @@ pub fn score_variant(
         }
     }
     let engine = Engine::with_defaults();
-    let report = engine.match_builds(old, new);
+    let report = engine.match_builds(old, new)?;
     let pairs: Vec<_> = report.reports.iter().map(|r| r.candidate.clone()).collect();
     let m = Matched::new(old, new, &pairs);
     let proposer = Proposer::new(model);
@@ -125,7 +125,7 @@ pub fn score_variant(
         let judgement = match &asked.outcome {
             Outcome::Proposed { candidate } => {
                 verdict = engine
-                    .verify_candidate(old, new, candidate, Criticality::Normal)
+                    .verify_candidate(old, new, candidate, Criticality::Normal)?
                     .map(|v| v.verdict);
                 let right = acceptable.contains(&candidate.new);
                 let passes = verdict == Some(Verdict::Accepted);
@@ -169,7 +169,7 @@ pub fn score_variant(
             judgement,
         });
     }
-    (totals, rows)
+    Ok((totals, rows))
 }
 
 pub fn render_totals(label: &str, t: &AiTotals) -> String {
@@ -249,13 +249,13 @@ mod tests {
         // A model that always picks the first candidate: right for `edited`, wrong for `gone`.
         let first =
             Scripted(|_: &Prompt| Ok(r#"{"choice":"c1","confidence":0.9,"rationale":"x"}"#.into()));
-        let (t, rows) = score_variant(&truth, &old, &new, &first, Select::All, 10);
+        let (t, rows) = score_variant(&truth, &old, &new, &first, Select::All, 10).unwrap();
         assert_eq!((t.asked, t.correct, t.wrong), (2, 1, 1), "{rows:#?}");
         // A model that always says none: right for the deleted one, a miss for the edited one.
         let none = Scripted(|_: &Prompt| {
             Ok(r#"{"choice":"none","confidence":0.5,"rationale":"x"}"#.into())
         });
-        let (t, _) = score_variant(&truth, &old, &new, &none, Select::All, 10);
+        let (t, _) = score_variant(&truth, &old, &new, &none, Select::All, 10).unwrap();
         assert_eq!(
             (t.abstained_right, t.abstained_missed, t.correct + t.wrong),
             (1, 1, 0)
@@ -264,15 +264,16 @@ mod tests {
         // The limit bounds the questions.
         assert_eq!(
             score_variant(&truth, &old, &new, &none, Select::All, 1)
+                .unwrap()
                 .0
                 .asked,
             1
         );
         // Selecting deleted functions asks only about `gone`; a model that always picks c1 is then always wrong.
-        let (t, rows) = score_variant(&truth, &old, &new, &first, Select::Deleted, 10);
+        let (t, rows) = score_variant(&truth, &old, &new, &first, Select::Deleted, 10).unwrap();
         assert_eq!((t.asked, t.correct, t.wrong), (1, 0, 1), "{rows:#?}");
         assert_eq!(rows[0].names, vec!["gone".to_owned()]);
-        let (t, _) = score_variant(&truth, &old, &new, &none, Select::Present, 10);
+        let (t, _) = score_variant(&truth, &old, &new, &none, Select::Present, 10).unwrap();
         assert_eq!((t.asked, t.abstained_missed), (1, 1));
     }
 }

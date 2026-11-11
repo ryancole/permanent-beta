@@ -20,6 +20,11 @@ use permanent_beta_model::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+/// The native normalizer's [`AnalysisExport::features_version`]. Bump the number on any change to what a code
+/// feature covers (the normalized or mnemonic hash, mnemonic counts, blocks and edges, inferred arguments, callee
+/// order): analyses from before and after can't be matched against each other.
+pub const FEATURES_VERSION: &str = "native-1";
+
 pub const PRODUCER: &str = "permanent-beta-native-pe";
 
 pub struct NativePeAnalyzer;
@@ -144,6 +149,7 @@ pub(crate) fn analyze_ranges(
             pdb: image.pdb.clone().map(|(guid, age)| PdbInfo { guid, age }),
         },
         producer,
+        features_version: Some(FEATURES_VERSION.to_owned()),
         functions,
         code_tables,
         types: Vec::new(),
@@ -163,5 +169,22 @@ mod tests {
             analyze_bytes(b"not a pe file", "x"),
             Err(BytesError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn every_native_analysis_names_its_features_version() {
+        // Whatever found the boundaries (native discovery or a Ghidra export), the features come from here.
+        let image = image::tests::image(&[0xc3], &[]);
+        let producer = Producer {
+            tool: "ghidra".into(),
+            version: "0".into(),
+        };
+        let e = analyze_ranges(&image, &[0xc3], "t.exe", Vec::new(), producer);
+        assert_eq!(e.features_version.as_deref(), Some(FEATURES_VERSION));
+        // Negative: an analysis without it doesn't match one with it.
+        let mut old = e.clone();
+        old.features_version = None;
+        assert!(old.features_comparable(&e).is_err());
+        assert!(e.features_comparable(&e).is_ok());
     }
 }

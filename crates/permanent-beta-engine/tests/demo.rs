@@ -18,7 +18,9 @@ fn demo_repair_outcomes() {
     let new: AnalysisExport = serde_json::from_str(&demo("v2.json")).unwrap();
     let manifest: HookManifest = toml::from_str(&demo("hooks.toml")).unwrap();
 
-    let report = Engine::with_defaults().repair(&manifest, &old, &new);
+    let report = Engine::with_defaults()
+        .repair(&manifest, &old, &new)
+        .unwrap();
     let action = |name: &str| {
         &report
             .repairs

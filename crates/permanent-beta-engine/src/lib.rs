@@ -5,8 +5,8 @@
 use permanent_beta_match::{MatchOutcome, Matcher, default_matchers, run_passes};
 use permanent_beta_model::{
     Ambiguity, AnalysisExport, BuildId, Candidate, CandidateSource, Criticality, Decider, Evidence,
-    FunctionFeatures, HookManifest, HookSpec, Mapping, MappingStatus, PriorDecisions, ReviewItem,
-    ReviewReason, Rva, VerificationReport,
+    FunctionFeatures, HookManifest, HookSpec, IncomparableFeatures, Mapping, MappingStatus,
+    PriorDecisions, ReviewItem, ReviewReason, Rva, VerificationReport,
 };
 use permanent_beta_repair::{
     HookRepair, RepairAction, decide, from_review, layout, prototype, review_items,
@@ -108,8 +108,15 @@ impl Engine {
         Self::new(default_matchers(), Verifier::with_behavioral(runner))
     }
 
-    /// Match every function and verify each candidate with the `normal` policy.
-    pub fn match_builds(&self, old: &AnalysisExport, new: &AnalysisExport) -> MatchReport {
+    /// Match every function and verify each candidate with the `normal` policy. Refused if the analyses' code
+    /// features aren't comparable ([`AnalysisExport::features_comparable`]): every entry point checks it, so no
+    /// hash from one normalizer is ever compared with another's.
+    pub fn match_builds(
+        &self,
+        old: &AnalysisExport,
+        new: &AnalysisExport,
+    ) -> Result<MatchReport, IncomparableFeatures> {
+        old.features_comparable(new)?;
         let outcome = run_passes(old, new, &self.matchers);
         let candidates = &outcome.candidates;
         let ctx = VerifyContext::new(old, new, candidates);
@@ -129,7 +136,7 @@ impl Engine {
                 .filter(|r| !claimed(*r))
                 .collect::<Vec<_>>()
         };
-        MatchReport {
+        Ok(MatchReport {
             from_build: old.build.id.clone(),
             to_build: new.build.id.clone(),
             unmatched_old: unmatched(&old.functions, &|r: Rva| {
@@ -140,7 +147,7 @@ impl Engine {
             }),
             reports,
             ambiguities: outcome.ambiguities.clone(),
-        }
+        })
     }
 
     /// Verify one candidate proposed from outside the engine (an AI proposer, an MCP client) exactly like the
@@ -153,14 +160,20 @@ impl Engine {
         new: &AnalysisExport,
         candidate: &Candidate,
         criticality: Criticality,
-    ) -> Option<VerificationReport> {
-        let (o, n) = (old.function(candidate.old)?, new.function(candidate.new)?);
+    ) -> Result<Option<VerificationReport>, IncomparableFeatures> {
+        old.features_comparable(new)?;
+        let (Some(o), Some(n)) = (old.function(candidate.old), new.function(candidate.new)) else {
+            return Ok(None);
+        };
         let outcome = run_passes(old, new, &self.matchers);
         let ctx = VerifyContext::new(old, new, &outcome.candidates);
-        Some(
-            self.verifier
-                .verify(&ctx, candidate, o, n, Policy::for_criticality(criticality)),
-        )
+        Ok(Some(self.verifier.verify(
+            &ctx,
+            candidate,
+            o,
+            n,
+            Policy::for_criticality(criticality),
+        )))
     }
 
     /// Repair every hook in `manifest`, moving it from `old` to `new`, with no earlier review decisions.
@@ -169,7 +182,7 @@ impl Engine {
         manifest: &HookManifest,
         old: &AnalysisExport,
         new: &AnalysisExport,
-    ) -> RepairReport {
+    ) -> Result<RepairReport, IncomparableFeatures> {
         self.repair_with(manifest, old, new, &PriorDecisions::default())
     }
 
@@ -182,7 +195,7 @@ impl Engine {
         old: &AnalysisExport,
         new: &AnalysisExport,
         prior: &PriorDecisions,
-    ) -> RepairReport {
+    ) -> Result<RepairReport, IncomparableFeatures> {
         let priors = BTreeMap::from([(old.build.id.clone(), prior.clone())]);
         self.repair_across(manifest, old, &[], new, &priors)
     }
@@ -192,7 +205,8 @@ impl Engine {
     /// is matched from its own build straight to `new` (e.g. v1 → v3), never through `old`, where its RVA means
     /// nothing. A hook bound to a build that isn't given is a stale locator.
     ///
-    /// `priors` holds review decisions per source build (for the pair source → `new`).
+    /// `priors` holds review decisions per source build (for the pair source → `new`). Refused if a source build
+    /// it matches from (`old`, or an earlier build a hook needs) has code features not comparable with `new`'s.
     pub fn repair_across(
         &self,
         manifest: &HookManifest,
@@ -200,7 +214,8 @@ impl Engine {
         earlier: &[AnalysisExport],
         new: &AnalysisExport,
         priors: &BTreeMap<BuildId, PriorDecisions>,
-    ) -> RepairReport {
+    ) -> Result<RepairReport, IncomparableFeatures> {
+        old.features_comparable(new)?;
         let (from, to) = (&old.build.id, &new.build.id);
         // One match run per source build that some hook needs (always the old build: its mappings are recorded).
         let mut pairs: Vec<Pair> = vec![Pair::new(old, new, &self.matchers)];
@@ -210,6 +225,7 @@ impl Engine {
                 continue;
             }
             if let Some(e) = earlier.iter().find(|e| &e.build.id == b) {
+                e.features_comparable(new)?;
                 pairs.push(Pair::new(e, new, &self.matchers));
             }
         }
@@ -251,14 +267,14 @@ impl Engine {
             })
             .collect();
 
-        RepairReport {
+        Ok(RepairReport {
             from_build: from.clone(),
             to_build: to.clone(),
             review_items: review_items(&repairs, from, to),
             updated_manifest: rewrite_manifest(manifest, &repairs, to),
             mappings,
             repairs,
-        }
+        })
     }
 
     /// Repair one hook within one build pair.
@@ -492,6 +508,7 @@ mod tests {
                 tool: "test".into(),
                 version: "0".into(),
             },
+            features_version: None,
             functions,
             code_tables: Vec::new(),
             types: Vec::new(),
@@ -549,7 +566,9 @@ mod tests {
     #[test]
     fn without_decisions_an_ambiguous_hook_needs_review() {
         let (old, new) = ambiguous_pair();
-        let r = Engine::with_defaults().repair(&manifest(), &old, &new);
+        let r = Engine::with_defaults()
+            .repair(&manifest(), &old, &new)
+            .unwrap();
         assert!(r.needs_review());
         assert_eq!(r.review_items[0].reason, ReviewReason::Ambiguous);
     }
@@ -561,7 +580,9 @@ mod tests {
             accepted: vec![human(0x120)],
             rejected: vec![],
         };
-        let r = Engine::with_defaults().repair_with(&manifest(), &old, &new, &prior);
+        let r = Engine::with_defaults()
+            .repair_with(&manifest(), &old, &new, &prior)
+            .unwrap();
         assert!(!r.needs_review(), "{:?}", r.review_items);
         assert_eq!(
             r.repairs[0].action,
@@ -588,7 +609,9 @@ mod tests {
             accepted: vec![engine_made],
             rejected: vec![],
         };
-        let r = Engine::with_defaults().repair_with(&manifest(), &old, &new, &prior);
+        let r = Engine::with_defaults()
+            .repair_with(&manifest(), &old, &new, &prior)
+            .unwrap();
         assert!(r.needs_review());
     }
 
@@ -601,7 +624,9 @@ mod tests {
             accepted: vec![],
             rejected: vec![(Rva(0x10), Rva(0x110))],
         };
-        let r = Engine::with_defaults().repair_with(&manifest(), &old, &new, &prior);
+        let r = Engine::with_defaults()
+            .repair_with(&manifest(), &old, &new, &prior)
+            .unwrap();
         assert!(r.needs_review());
         assert!(r.mappings.is_empty());
         let RepairAction::NeedsReview { detail, .. } = &r.repairs[0].action else {
@@ -619,7 +644,7 @@ mod tests {
         let new = export("b", vec![func(0x110, "k")]);
         let mut stale = manifest();
         stale.hooks[0].target.build = BuildId("z".into());
-        let r = Engine::with_defaults().repair(&stale, &old, &new);
+        let r = Engine::with_defaults().repair(&stale, &old, &new).unwrap();
         assert!(r.needs_review());
         assert_eq!(r.review_items[0].reason, ReviewReason::StaleLocator);
         assert!(r.mappings.is_empty());
@@ -631,7 +656,9 @@ mod tests {
 
         // Control: bound to the old build, the same hook is looked up and matched (this bare test function then
         // lacks independent evidence, which is a different review reason).
-        let r = Engine::with_defaults().repair(&manifest(), &old, &new);
+        let r = Engine::with_defaults()
+            .repair(&manifest(), &old, &new)
+            .unwrap();
         assert_eq!(r.repairs[0].old, Some(Rva(0x10)));
         assert_eq!(
             r.repairs[0].verification.as_ref().map(|v| v.candidate.new),
@@ -649,13 +676,15 @@ mod tests {
         let mut stale = manifest();
         stale.hooks[0].target.build = BuildId("z".into());
 
-        let r = Engine::with_defaults().repair_across(
-            &stale,
-            &old,
-            std::slice::from_ref(&z),
-            &new,
-            &BTreeMap::new(),
-        );
+        let r = Engine::with_defaults()
+            .repair_across(
+                &stale,
+                &old,
+                std::slice::from_ref(&z),
+                &new,
+                &BTreeMap::new(),
+            )
+            .unwrap();
         let repair = &r.repairs[0];
         assert_eq!(repair.from_build, Some(BuildId("z".into())));
         assert_eq!(repair.old, Some(Rva(0x10)));
@@ -673,8 +702,75 @@ mod tests {
         );
 
         // Without z's analysis it stays a stale locator.
-        let r = Engine::with_defaults().repair_across(&stale, &old, &[], &new, &BTreeMap::new());
+        let r = Engine::with_defaults()
+            .repair_across(&stale, &old, &[], &new, &BTreeMap::new())
+            .unwrap();
         assert_eq!(r.review_items[0].reason, ReviewReason::StaleLocator);
+    }
+
+    fn versioned(mut e: AnalysisExport, version: Option<&str>) -> AnalysisExport {
+        e.features_version = version.map(str::to_owned);
+        e
+    }
+
+    #[test]
+    fn analyses_from_different_normalizers_are_never_matched() {
+        // The same hash in both builds: matched only when both analyses' features version agrees.
+        let old = export("a", vec![func(0x10, "k")]);
+        let new = export("b", vec![func(0x110, "k")]);
+        let engine = Engine::with_defaults();
+        for (o, n) in [(Some("native-1"), Some("native-1")), (None, None)] {
+            let (o, n) = (versioned(old.clone(), o), versioned(new.clone(), n));
+            assert_eq!(engine.match_builds(&o, &n).unwrap().reports.len(), 1);
+            assert!(engine.repair(&manifest(), &o, &n).is_ok());
+        }
+        // Negative: another version, or one analysis without a version, is refused: no match run, no repair, no
+        // verified proposal.
+        let candidate = ai_candidate(0x10, 0x110);
+        for (o, n) in [
+            (Some("native-1"), Some("native-2")),
+            (Some("native-1"), None),
+            (None, Some("native-1")),
+        ] {
+            let (o, n) = (versioned(old.clone(), o), versioned(new.clone(), n));
+            let why = engine.match_builds(&o, &n).unwrap_err();
+            assert_eq!(
+                (why.old_build.0.as_str(), why.new_build.0.as_str()),
+                ("a", "b")
+            );
+            assert!(why.to_string().contains("same pbeta"), "{why}");
+            assert!(engine.repair(&manifest(), &o, &n).is_err());
+            assert!(
+                engine
+                    .verify_candidate(&o, &n, &candidate, Criticality::Normal)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn an_earlier_build_is_checked_only_when_a_hook_needs_it() {
+        let z = versioned(export("z", vec![func(0x10, "hooked")]), Some("native-0"));
+        let old = versioned(export("a", vec![func(0x30, "hooked")]), Some("native-1"));
+        let new = versioned(export("b", vec![func(0x130, "hooked")]), Some("native-1"));
+        let engine = Engine::with_defaults();
+        let earlier = std::slice::from_ref(&z);
+        // No hook is bound to z: it isn't matched, so its version doesn't matter.
+        let mut current = manifest();
+        current.hooks[0].target.build = BuildId("a".into());
+        current.hooks[0].target.rva = Some(Rva(0x30));
+        assert!(
+            engine
+                .repair_across(&current, &old, earlier, &new, &BTreeMap::new())
+                .is_ok()
+        );
+        // Negative: a hook bound to z needs z -> b, which is refused.
+        let mut stale = manifest();
+        stale.hooks[0].target.build = BuildId("z".into());
+        let why = engine
+            .repair_across(&stale, &old, earlier, &new, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(why.old_build, BuildId("z".into()));
     }
 
     #[test]
@@ -689,7 +785,7 @@ mod tests {
         let (old, new) = (export("a", vec![old_fn]), export("b", copies));
         let mut m = manifest();
         m.hooks[0].prototype = Some("void H(const char* msg, int code)".into());
-        let r = Engine::with_defaults().repair(&m, &old, &new);
+        let r = Engine::with_defaults().repair(&m, &old, &new).unwrap();
         assert!(!r.repairs[0].is_resolved());
         let proposed: Vec<Rva> = r.repairs[0].proposals.iter().map(|p| p.candidate).collect();
         assert_eq!(proposed, vec![Rva(0x110), Rva(0x120)]);
@@ -705,7 +801,7 @@ mod tests {
         for f in &mut same.functions {
             f.inferred_args = Some(2);
         }
-        let r2 = Engine::with_defaults().repair(&m, &old, &same);
+        let r2 = Engine::with_defaults().repair(&m, &old, &same).unwrap();
         assert!(r2.repairs[0].proposals.is_empty());
         assert_eq!(r.review_items[0].proposals, r.repairs[0].proposals);
     }
@@ -717,7 +813,9 @@ mod tests {
             accepted: vec![],
             rejected: vec![(Rva(0x10), Rva(0x110))],
         };
-        let r = Engine::with_defaults().repair_with(&manifest(), &old, &new, &prior);
+        let r = Engine::with_defaults()
+            .repair_with(&manifest(), &old, &new, &prior)
+            .unwrap();
         let news: Vec<Rva> = r.review_items[0]
             .candidates
             .iter()
@@ -753,7 +851,7 @@ mod tests {
     fn an_ai_proposal_is_attached_to_an_unmatched_hooks_review_item_and_never_applied() {
         let (old, new) = unmatched_pair();
         let engine = Engine::with_defaults();
-        let mut r = engine.repair(&manifest(), &old, &new);
+        let mut r = engine.repair(&manifest(), &old, &new).unwrap();
         assert!(matches!(
             r.repairs[0].action,
             RepairAction::NeedsReview {
@@ -763,6 +861,7 @@ mod tests {
         ));
         let v = engine
             .verify_candidate(&old, &new, &ai_candidate(0x10, 0x110), Criticality::Normal)
+            .unwrap()
             .unwrap();
         assert_eq!(r.attach_proposals("H", vec![v]), 1);
         // Still in review, no mapping, the manifest unchanged; the proposal is a candidate in the review item.
@@ -782,16 +881,18 @@ mod tests {
         // Negative: an ambiguous hook already has the engine's competitors; it takes no outside proposal.
         let (old, new) = ambiguous_pair();
         let engine = Engine::with_defaults();
-        let mut r = engine.repair(&manifest(), &old, &new);
+        let mut r = engine.repair(&manifest(), &old, &new).unwrap();
         let v = engine
             .verify_candidate(&old, &new, &ai_candidate(0x10, 0x110), Criticality::Normal)
+            .unwrap()
             .unwrap();
         assert_eq!(r.attach_proposals("H", vec![v]), 0);
         // Negative: a proposal about another old function is dropped.
         let (old, new) = unmatched_pair();
-        let mut r = engine.repair(&manifest(), &old, &new);
+        let mut r = engine.repair(&manifest(), &old, &new).unwrap();
         let mut v = engine
             .verify_candidate(&old, &new, &ai_candidate(0x10, 0x110), Criticality::Normal)
+            .unwrap()
             .unwrap();
         v.candidate.old = Rva(0x99);
         assert_eq!(r.attach_proposals("H", vec![v]), 0);

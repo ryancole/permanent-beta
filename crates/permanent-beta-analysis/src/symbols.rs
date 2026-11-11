@@ -374,6 +374,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
             tool: PRODUCER.to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         },
+        features_version: None,
         functions,
         code_tables: Vec::new(),
         types: Vec::new(),

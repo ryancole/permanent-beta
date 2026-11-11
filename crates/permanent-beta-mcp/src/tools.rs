@@ -141,7 +141,7 @@ impl Tools {
             self.build(args, "old_build")?,
             self.build(args, "new_build")?,
         );
-        let report = self.engine.match_builds(old, new);
+        let report = self.engine.match_builds(old, new)?;
         if args.get("rva").is_some_and(|v| !v.is_null()) {
             let rva = rva_arg(args, "rva")?;
             if old.function(rva).is_none() {
@@ -226,7 +226,7 @@ impl Tools {
         let (candidate, criticality) = self.candidate(args)?;
         let report = self
             .engine
-            .verify_candidate(old, new, &candidate, criticality)
+            .verify_candidate(old, new, &candidate, criticality)?
             .ok_or_else(|| {
                 anyhow!(
                     "no function at {} in the old build or at {} in the new build",
@@ -268,7 +268,7 @@ impl Tools {
         }
         let engine_candidate = self
             .engine
-            .match_builds(old, new)
+            .match_builds(old, new)?
             .reports
             .into_iter()
             .find(|r| r.candidate.old == o)

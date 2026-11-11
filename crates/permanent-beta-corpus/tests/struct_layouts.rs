@@ -85,7 +85,9 @@ fn a_hook_on_a_function_whose_struct_changed_goes_to_review_with_the_new_offsets
                 hook("pb_unchanged", "int pb_unchanged(int x)", &old),
             ],
         };
-        let r = Engine::with_defaults().repair(&manifest, &old, &new);
+        let r = Engine::with_defaults()
+            .repair(&manifest, &old, &new)
+            .unwrap();
         let reader = &r.repairs[0];
         // Either the layout change is the reason, or the hook was already in review for another one and the
         // detail says the layout changed too.
@@ -153,7 +155,9 @@ fn without_a_pdb_the_moved_field_is_inferred_from_the_accesses() {
         );
         h.target.build = old.build.id.clone();
         let manifest = HookManifest { hooks: vec![h] };
-        let r = Engine::with_defaults().repair(&manifest, &old, &new);
+        let r = Engine::with_defaults()
+            .repair(&manifest, &old, &new)
+            .unwrap();
         let reader = &r.repairs[0];
         let [p] = reader.struct_proposals.as_slice() else {
             panic!(

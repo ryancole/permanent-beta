@@ -1,10 +1,15 @@
-# Status — where we left off (2026-11-09)
+# Status — where we left off (2026-11-10)
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **replay measured on zstd** (design §7.3), the first real target whose structs change between
+Latest work: **`features_version`** (design §4.1). Native analyses name the normalizer that computed their
+hashes (`native-1`), and the engine refuses to match, repair or verify two analyses that disagree on it (or where
+only one has it), instead of comparing hashes that mean different things. Bump `FEATURES_VERSION` on any change to
+what a hash or code feature covers. Corpus unchanged (fixture gates pass, 0 wrong; replay as below).
+
+Before that: **replay measured on zstd** (design §7.3), the first real target whose structs change between
 releases. `replay-measure.ps1 -Project zstd`: 1 of 16 hooks replayed at first, **11 of 16** now, 0 fail, after
 general fixes: translation handles renamed types (by structure), removed fields (dropped), added fields
 (unreadable until written), nested by-value structs and same-size integer and enum changes; the recorder patches

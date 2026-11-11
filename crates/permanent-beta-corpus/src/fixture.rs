@@ -91,7 +91,7 @@ pub fn score_variant(
     symbols: Symbols,
 ) -> Result<VariantScore> {
     let (truth, old, new) = load_variant_with(dir, symbols)?;
-    let report = Engine::with_defaults().match_builds(&old, &new);
+    let report = Engine::with_defaults().match_builds(&old, &new)?;
     let card = score(&truth, &report.reports, &report.ambiguities);
     let evaluation = expected.evaluate(flags, &card);
     let param_count = CheckTally::count(&report.reports, &card, "param-count");
@@ -193,25 +193,25 @@ pub fn sweep_variant(
     old: &AnalysisExport,
     new: &AnalysisExport,
     grid: &[SimilarityParams],
-) -> Vec<SweepPoint> {
+) -> Result<Vec<SweepPoint>> {
     grid.iter()
         .map(|&params| {
             let engine = Engine::new(matchers_with_similarity(params), Verifier::with_defaults());
-            let report = engine.match_builds(old, new);
+            let report = engine.match_builds(old, new)?;
             let card = score(truth, &report.reports, &report.ambiguities);
             let sim = card
                 .by_pass()
                 .get("similarity")
                 .copied()
                 .unwrap_or_default();
-            SweepPoint {
+            Ok(SweepPoint {
                 params,
                 correct: card.totals.correct(),
                 accepted: card.totals.accepted,
                 wrong: card.totals.wrong,
                 sim_correct: sim.correct(),
                 sim_wrong: sim.wrong,
-            }
+            })
         })
         .collect()
 }

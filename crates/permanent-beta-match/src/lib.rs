@@ -1628,6 +1628,7 @@ mod tests {
                 tool: "test".into(),
                 version: "0".into(),
             },
+            features_version: None,
             functions,
             code_tables: Vec::new(),
             types: Vec::new(),

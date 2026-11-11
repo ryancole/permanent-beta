@@ -4,8 +4,8 @@ use crate::ids::{BuildId, Rva};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Bump on any breaking change to [`AnalysisExport`], including a change in what a hash covers: hashes from
-/// different versions aren't comparable.
+/// Bump on any breaking change to [`AnalysisExport`]'s shape. A change in what a hash or another code feature
+/// covers bumps the analyzer's features version instead ([`AnalysisExport::features_version`]).
 ///
 /// 2: the normalized hash covers the name of an import read through the IAT.
 pub const ANALYSIS_SCHEMA_VERSION: u32 = 2;
@@ -15,6 +15,14 @@ pub struct AnalysisExport {
     pub schema_version: u32,
     pub build: BuildInfo,
     pub producer: Producer,
+    /// Which normalizer computed the code features (hashes, mnemonic counts, blocks and edges, inferred
+    /// arguments): the analyzer's name and a version it bumps whenever what a feature covers changes, e.g.
+    /// `native-1`. Two builds are matched only if their analyses agree on it (design §4.1): a hash from another
+    /// normalizer, or another version of it, means nothing next to this one. `None` for an analysis without code
+    /// features (PDB-only), and for analyses written before it existed. Optional, so adding it didn't change
+    /// the schema version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features_version: Option<String>,
     pub functions: Vec<FunctionFeatures>,
     /// Tables of code pointers stored in data: vtables and function tables. Optional, so adding it didn't
     /// change the schema version; an export without it just gives table-based matching nothing to use.
@@ -54,7 +62,44 @@ pub struct PointerAlias {
     pub seen_in: Vec<String>,
 }
 
+/// Two analyses whose code features came from different normalizers (or versions of one): matching them would
+/// compare hashes that mean different things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomparableFeatures {
+    pub old_build: BuildId,
+    pub new_build: BuildId,
+    pub old: String,
+    pub new: String,
+}
+
+impl std::fmt::Display for IncomparableFeatures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the analyses of {} and {} have different features versions ({} and {}): analyze both builds with              the same pbeta",
+            self.old_build, self.new_build, self.old, self.new
+        )
+    }
+}
+
+impl std::error::Error for IncomparableFeatures {}
+
 impl AnalysisExport {
+    /// Whether this analysis's code features can be compared with `new`'s: the same features version, where an
+    /// unknown one (`None`) only equals another unknown one.
+    pub fn features_comparable(&self, new: &AnalysisExport) -> Result<(), IncomparableFeatures> {
+        if self.features_version == new.features_version {
+            return Ok(());
+        }
+        let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".to_owned());
+        Err(IncomparableFeatures {
+            old_build: self.build.id.clone(),
+            new_build: new.build.id.clone(),
+            old: shown(&self.features_version),
+            new: shown(&new.features_version),
+        })
+    }
+
     pub fn type_layout(&self, name: &str) -> Option<&TypeLayout> {
         self.types.iter().find(|t| t.name == name)
     }

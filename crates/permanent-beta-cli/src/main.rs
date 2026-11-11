@@ -599,14 +599,14 @@ fn recorded_runner(
 fn accepted_pairs(
     old: &permanent_beta_model::AnalysisExport,
     new: &permanent_beta_model::AnalysisExport,
-) -> Vec<(Rva, Rva)> {
-    Engine::with_defaults()
-        .match_builds(old, new)
+) -> Result<Vec<(Rva, Rva)>> {
+    Ok(Engine::with_defaults()
+        .match_builds(old, new)?
         .reports
         .into_iter()
         .filter(|r| r.verdict == permanent_beta_model::Verdict::Accepted)
         .map(|r| (r.candidate.old, r.candidate.new))
-        .collect()
+        .collect())
 }
 
 struct ReplayArgs<'a> {
@@ -645,7 +645,7 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
             "--old-analysis needs --new-analysis (addresses are mapped between the two)"
         );
         let old = export::load(p)?;
-        runner = runner.with_addresses(&old, &new, &accepted_pairs(&old, &new));
+        runner = runner.with_addresses(&old, &new, &accepted_pairs(&old, &new)?);
     }
     let j = runner.judge(None, a.old_rva, a.new_rva);
     let others = a
@@ -847,7 +847,7 @@ fn cmd_harness_spec(
 
 fn cmd_match(old: &Path, new: &Path, json: bool) -> Result<u8> {
     let (old, new) = (export::load(old)?, export::load(new)?);
-    let report = Engine::with_defaults().match_builds(&old, &new);
+    let report = Engine::with_defaults().match_builds(&old, &new)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -920,7 +920,7 @@ fn propose_for_unmatched(
     priors: &BTreeMap<BuildId, PriorDecisions>,
     model: &dyn permanent_beta_ai::backend::Model,
     shortlist: usize,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     use permanent_beta_ai::{Outcome, Proposer, shortlist::Matched};
     use permanent_beta_model::ReviewReason;
     let asks: Vec<(String, Rva, BuildId)> = report
@@ -952,14 +952,14 @@ fn propose_for_unmatched(
         else {
             continue;
         };
-        let pairs = pairs_by_build.entry(from.clone()).or_insert_with(|| {
-            engine
-                .match_builds(src, new)
-                .reports
-                .into_iter()
-                .map(|r| r.candidate)
-                .collect()
-        });
+        if !pairs_by_build.contains_key(&from) {
+            let matched = engine.match_builds(src, new)?;
+            pairs_by_build.insert(
+                from.clone(),
+                matched.reports.into_iter().map(|r| r.candidate).collect(),
+            );
+        }
+        let pairs = &pairs_by_build[&from];
         let criticality = manifest
             .hooks
             .iter()
@@ -971,7 +971,7 @@ fn propose_for_unmatched(
                 let rejected = priors
                     .get(&from)
                     .is_some_and(|p| p.rejected.contains(&(candidate.old, candidate.new)));
-                match engine.verify_candidate(src, new, candidate, criticality) {
+                match engine.verify_candidate(src, new, candidate, criticality)? {
                     _ if rejected => {
                         format!("proposed {}, already rejected by a reviewer", candidate.new)
                     }
@@ -995,7 +995,7 @@ fn propose_for_unmatched(
         };
         notes.push(format!("{hook}: {note}"));
     }
-    notes
+    Ok(notes)
 }
 
 fn cmd_repair(a: RepairArgs) -> Result<u8> {
@@ -1032,7 +1032,10 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
         let bin = a.new_binary.context("--cases needs --new-binary")?;
         let mut runner = recorded_runner(a.cases, bin, &new)?;
         for o in std::iter::once(&old).chain(&earlier) {
-            runner = runner.with_addresses(o, &new, &accepted_pairs(o, &new));
+            // An earlier build that can't be matched to the new one is refused by the repair if a hook needs it.
+            if o.features_comparable(&new).is_ok() {
+                runner = runner.with_addresses(o, &new, &accepted_pairs(o, &new)?);
+            }
         }
         runners.push(Box::new(runner));
     }
@@ -1041,7 +1044,7 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
         1 => Engine::with_behavioral(runners.pop().expect("one runner")),
         _ => Engine::with_behavioral(Box::new(AllOf(runners))),
     };
-    let mut report = engine.repair_across(&manifest, &old, &earlier, &new, &priors);
+    let mut report = engine.repair_across(&manifest, &old, &earlier, &new, &priors)?;
     let proposal_notes = match a.proposer {
         Some((model, shortlist)) => propose_for_unmatched(
             &engine,
@@ -1053,7 +1056,7 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
             &priors,
             model,
             shortlist,
-        ),
+        )?,
         None => Vec::new(),
     };
 
@@ -1203,7 +1206,7 @@ fn cmd_propose(a: ProposeArgs) -> Result<u8> {
     use permanent_beta_ai::{Outcome, Proposer, shortlist::Matched};
     let (old, new) = (export::load(a.old)?, export::load(a.new)?);
     let engine = Engine::with_defaults();
-    let report = engine.match_builds(&old, &new);
+    let report = engine.match_builds(&old, &new)?;
     let pairs: Vec<_> = report.reports.iter().map(|r| r.candidate.clone()).collect();
     let targets: Vec<Rva> = if a.only.is_empty() {
         report.unmatched_old.clone()
@@ -1222,7 +1225,7 @@ fn cmd_propose(a: ProposeArgs) -> Result<u8> {
         // Every proposal goes through the engine's verification, then to review: never accepted here.
         let verified = match &asked.outcome {
             Outcome::Proposed { candidate } => {
-                engine.verify_candidate(&old, &new, candidate, Criticality::Normal)
+                engine.verify_candidate(&old, &new, candidate, Criticality::Normal)?
             }
             _ => None,
         };
@@ -1787,7 +1790,9 @@ rva = "0x2000"
         let (old, new, manifest) = unmatched();
         let engine = Engine::with_defaults();
         let none = BTreeMap::new();
-        let mut report = engine.repair_across(&manifest, &old, &[], &new, &none);
+        let mut report = engine
+            .repair_across(&manifest, &old, &[], &new, &none)
+            .unwrap();
         let notes = propose_for_unmatched(
             &engine,
             &mut report,
@@ -1798,7 +1803,8 @@ rva = "0x2000"
             &none,
             &PickFirst,
             5,
-        );
+        )
+        .unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("attached for review"), "{notes:?}");
         assert!(!report.repairs[0].is_resolved());
@@ -1825,7 +1831,9 @@ rva = "0x2000"
                 rejected: vec![(Rva(0x10), Rva(0x110))],
             },
         )]);
-        let mut report = engine.repair_across(&manifest, &old, &[], &new, &priors);
+        let mut report = engine
+            .repair_across(&manifest, &old, &[], &new, &priors)
+            .unwrap();
         let notes = propose_for_unmatched(
             &engine,
             &mut report,
@@ -1836,7 +1844,8 @@ rva = "0x2000"
             &priors,
             &PickFirst,
             5,
-        );
+        )
+        .unwrap();
         assert!(notes[0].contains("already rejected"), "{notes:?}");
         assert!(report.review_items[0].candidates.is_empty());
     }

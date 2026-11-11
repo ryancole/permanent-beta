@@ -278,7 +278,7 @@ fn main() -> Result<ExitCode> {
             for dir in &variants {
                 let (truth, old, new) = fixture::load_variant(dir)?;
                 let (t, judged) =
-                    ai_score::score_variant(&truth, &old, &new, &backend, select, limit);
+                    ai_score::score_variant(&truth, &old, &new, &backend, select, limit)?;
                 println!(
                     "{}",
                     ai_score::render_totals(&dir.display().to_string(), &t)
@@ -340,7 +340,7 @@ fn main() -> Result<ExitCode> {
             for dir in &variants {
                 eprintln!("sweeping {}", dir.display());
                 let (truth, old, new) = fixture::load_variant(dir)?;
-                let points = fixture::sweep_variant(&truth, &old, &new, &grid);
+                let points = fixture::sweep_variant(&truth, &old, &new, &grid)?;
                 for (i, p) in points.iter().enumerate() {
                     if p.wrong > 0 {
                         wrong_in[i].push(format!("{} ({})", dir.display(), p.wrong));

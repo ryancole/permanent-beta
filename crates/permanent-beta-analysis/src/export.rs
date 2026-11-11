@@ -96,6 +96,7 @@ mod tests {
                 tool: "test".into(),
                 version: "0".into(),
             },
+            features_version: None,
             functions: Vec::new(),
             code_tables: Vec::new(),
             types: Vec::new(),
