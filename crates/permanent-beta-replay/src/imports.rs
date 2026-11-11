@@ -35,6 +35,21 @@ pub const MAX_STRING: usize = 4096;
 /// Why a stand-in can't answer: the case is inconclusive.
 pub type Refusal = String;
 
+/// What starts a refusal that is a difference from the recording, not a limit of replay: the candidate passed an
+/// import other inputs, or made other import calls, than the old function. Still inconclusive here; the caller
+/// may make it a fail when the candidate ran no function whose code changed ([`is_difference`]).
+pub const DIFFERS: &str = "differs from the recording: ";
+
+/// A refusal for a difference from the recording.
+fn differs(what: String) -> Refusal {
+    format!("{DIFFERS}{what}")
+}
+
+/// Whether `refusal` is a difference from the recording ([`DIFFERS`]), not something replay can't do.
+pub fn is_difference(refusal: &str) -> bool {
+    refusal.starts_with(DIFFERS)
+}
+
 /// What the stand-in does in place of the import: the value it returns, and the bytes it writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Effect {
@@ -243,16 +258,16 @@ impl StandIns {
             ));
         }
         let Some(rec) = self.calls.get(self.next) else {
-            return Err(format!(
+            return Err(differs(format!(
                 "calls {import} after the {} import call(s) the recording has",
                 self.calls.len()
-            ));
+            )));
         };
         if base_name(&rec.call.import) != name {
-            return Err(format!(
+            return Err(differs(format!(
                 "calls {import} where the recording called {}",
                 rec.call.import
-            ));
+            )));
         }
         self.next += 1;
         let r = Recorded(rec);
@@ -424,12 +439,12 @@ impl StandIns {
     pub fn finish(&mut self) -> Result<(), Refusal> {
         self.skip_executed();
         if self.next < self.calls.len() {
-            return Err(format!(
+            return Err(differs(format!(
                 "made {} of the {} recorded import call(s) (next: {})",
                 self.next,
                 self.calls.len(),
                 self.calls[self.next].call.import
-            ));
+            )));
         }
         Ok(())
     }
@@ -456,7 +471,9 @@ fn same_value(
     };
     let (a, b) = (arg_of(now, i, name)? & mask, arg_of(rec, i, name)? & mask);
     if a != b {
-        return Err(format!("calls {name} with {what} {a:#x}, recorded {b:#x}"));
+        return Err(differs(format!(
+            "calls {name} with {what} {a:#x}, recorded {b:#x}"
+        )));
     }
     Ok(())
 }
@@ -575,11 +592,11 @@ fn same_printf(
     let format_rec = read_str(rec, arg_of(rec, format_arg, name)?, MAX_STRING)
         .ok_or_else(|| format!("{name}: the recording doesn't hold the whole format string"))?;
     if format_now != format_rec {
-        return Err(format!(
+        return Err(differs(format!(
             "calls {name} with the format {:?}, recorded {:?}",
             String::from_utf8_lossy(&format_now),
             String::from_utf8_lossy(&format_rec)
-        ));
+        )));
     }
     let slots = slots(&format_now).map_err(|what| format!("{name}: can't compare {what}"))?;
     let (list_now, list_rec) = (arg_of(now, list_arg, name)?, arg_of(rec, list_arg, name)?);
@@ -594,7 +611,9 @@ fn same_printf(
         let b = word(rec, list_rec, k)
             .ok_or_else(|| format!("{name}: the recording doesn't hold argument {k}"))?;
         let differs = |shown_a: String, shown_b: String| {
-            format!("calls {name} with argument {k} {shown_a}, recorded {shown_b}")
+            differs(format!(
+                "calls {name} with argument {k} {shown_a}, recorded {shown_b}"
+            ))
         };
         match *slot {
             Slot::Int(w) => {

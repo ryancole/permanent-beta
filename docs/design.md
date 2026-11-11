@@ -808,6 +808,26 @@ What it still can't excuse is an inlined copy: at /O2 `HUF_decompress4X_usingDTa
 also exists on its own, and `HIST_countFast_wksp` inlined `HIST_count_simple`. Both behave like the target on the
 recorded inputs and nothing in the call graph links them; only matching can separate them.
 
+**Changed callees (2026-11-10).** Given the old build's analysis (`--old-analysis`, and in the engine
+`RecordedCasesRunner::with_addresses`), replay knows which of the new build's functions aren't the old code:
+those without an accepted match, and those whose normalized hash differs from their counterpart's (the same
+normalized code is taken to behave the same **[Guess]**: the hash masks addresses, so a function reading a data
+table whose contents changed counts as unchanged). The emulator puts a breakpoint on each one's entry and notes
+the ones a run enters (the candidate itself excepted). A difference is then attributed:
+
+- a run that entered a changed function and differs (return value, memory, globals, or an import's inputs) is
+  **inconclusive**, naming the function: the difference may be the callee's, and a correct candidate mustn't fail
+  on it (before, a difference in memory or the return value failed the candidate);
+- an import called with other inputs, or other import calls (`imports::DIFFERS`), in a run that entered no
+  changed function and ran through no function pointer mapped by other matches is a **fail**: every function it
+  ran is the old code, so the difference is the candidate's own (before, always inconclusive);
+- without the old analysis, nothing changes.
+
+On the corpus no case outcome changed (zlib and zstd: every correct pair still passes or stays inconclusive for
+the reasons it did; no hook in them calls a modelled import with other inputs). The hook loop now passes
+`--old-analysis`: `ship_order`'s cases at v1 → v2 stay inconclusive and say why, `log_event` (and
+`apply_discount`), whose code changed, ran.
+
 **Known confusions (2026-11-10).** Such pairs, once examined, are listed in
 `corpus/replay/<project>.known-confusions.json` (hook, the function its cases also pass on, flags, new release and
 the reason); `replay-measure.ps1` reports them as known and fails on any confusion not listed, and on a listed one

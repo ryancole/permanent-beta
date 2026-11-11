@@ -13,6 +13,12 @@
 //!   called with other inputs, uncaptured memory or global state, a global or struct layout that doesn't map by
 //!   name, an unknown return type, nothing to compare, ...). Inconclusive is never a pass.
 //!
+//! When the caller knows which of the new build's functions changed since the old one ([`Changed`]), a
+//! difference is attributed: one in a run that entered a changed function (other than the candidate) is
+//! inconclusive, naming it, since the callee may be what differs; and an import called with other inputs, or
+//! other import calls, in a run that entered none is a **fail**: every function it ran is the old code, so the
+//! difference is the candidate's own.
+//!
 //! Depends on `permanent-beta-model` only (design §3.1). Emulation needs the `emulator` feature (icicle, MIT or
 //! Apache-2.0, running Ghidra's x86-64 SLEIGH specification, Apache-2.0); without it every case is inconclusive.
 
@@ -61,6 +67,37 @@ pub struct NewBuild<'a> {
     pub globals: &'a [GlobalVar],
     /// Old-image addresses mapped to the new image ([`address`]); without it they stay as recorded.
     pub addresses: Option<&'a address::AddressMap>,
+    /// The new build's functions whose code changed since the recording's build, for attributing a difference;
+    /// without it, differences are judged as if nothing were known about the callees.
+    pub changed: Option<&'a Changed>,
+}
+
+/// The new build's functions that aren't known to be the old code: those whose normalized code differs from
+/// their old counterpart's, and those without one (no accepted match), by RVA, with a name to show.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Changed {
+    pub functions: std::collections::BTreeMap<u64, String>,
+}
+
+impl Changed {
+    /// The names of `rvas`, for a message.
+    #[cfg_attr(not(feature = "emulator"), allow(dead_code))]
+    fn names(&self, rvas: &[u64]) -> String {
+        let mut shown: Vec<String> = rvas
+            .iter()
+            .take(3)
+            .map(|r| {
+                self.functions
+                    .get(r)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{r:#x}"))
+            })
+            .collect();
+        if rvas.len() > 3 {
+            shown.push(format!("{} more", rvas.len() - 3));
+        }
+        shown.join(", ")
+    }
 }
 
 /// A recorded global as placed for the replay: at the new build's RVA for its name.
@@ -262,6 +299,7 @@ pub fn replay(
         &prepared,
         &globals,
         old_image.as_ref().zip(new.addresses),
+        new.changed,
     )
 }
 
@@ -269,6 +307,7 @@ pub fn replay(
 type Addresses<'a> = Option<(&'a Range<u64>, &'a address::AddressMap)>;
 
 #[cfg(not(feature = "emulator"))]
+#[allow(clippy::too_many_arguments)]
 fn run_and_compare(
     _: &Image,
     _: Rva,
@@ -277,6 +316,7 @@ fn run_and_compare(
     _: &[Prepared],
     _: &[PreparedGlobal],
     _: Addresses,
+    _: Option<&Changed>,
 ) -> CaseOutcome {
     CaseOutcome::inconclusive(
         "built without the emulator (permanent-beta-replay's `emulator` feature)",
@@ -284,6 +324,7 @@ fn run_and_compare(
 }
 
 #[cfg(feature = "emulator")]
+#[allow(clippy::too_many_arguments)]
 fn run_and_compare(
     image: &Image,
     new_rva: Rva,
@@ -292,7 +333,9 @@ fn run_and_compare(
     prepared: &[Prepared],
     globals: &[PreparedGlobal],
     addresses: Addresses,
+    changed: Option<&Changed>,
 ) -> CaseOutcome {
+    let watch: Vec<u64> = changed.map_or(Vec::new(), |c| c.functions.keys().copied().collect());
     let placed: Vec<emulate::Placed> = prepared
         .iter()
         .map(|p| emulate::Placed {
@@ -320,9 +363,10 @@ fn run_and_compare(
             .imports_recorded
             .then(|| imports::StandIns::new(case.imports.clone())),
         addresses,
+        watch: &watch,
     }) {
         Ok(r) => r,
-        Err(why) => return CaseOutcome::inconclusive(why),
+        Err(stop) => return attribute_stop(stop, changed),
     };
     let old_image = case
         .case
@@ -351,7 +395,53 @@ fn run_and_compare(
                 ran.rewritten.functions
             ))
         }
+        // A callee whose code changed ran: the difference may be the callee's, so a correct candidate mustn't
+        // fail on it.
+        CaseOutcome::Fail { detail } if !ran.reached.is_empty() => {
+            let names = changed.map_or_else(String::new, |c| c.names(&ran.reached));
+            CaseOutcome::inconclusive(format!(
+                "{detail}; but it ran {names}, whose code changed since the old build, which may be what differs"
+            ))
+        }
+        CaseOutcome::Fail { detail } if changed.is_some() => CaseOutcome::Fail {
+            detail: format!(
+                "{detail} (it ran no function whose code changed: the difference is its own)"
+            ),
+        },
         other => other,
+    }
+}
+
+/// A run that stopped early: inconclusive, unless it stopped on a difference from the recording (an import
+/// called with other inputs, or other import calls) in a run that entered no changed function, with every
+/// function pointer in its inputs its own: then the difference is the candidate's, a fail.
+#[cfg(feature = "emulator")]
+fn attribute_stop(stop: emulate::Stopped, changed: Option<&Changed>) -> CaseOutcome {
+    let Some(changed) = changed else {
+        return CaseOutcome::inconclusive(stop.why);
+    };
+    if !imports::is_difference(&stop.why) {
+        return CaseOutcome::inconclusive(stop.why);
+    }
+    if !stop.reached.is_empty() {
+        return CaseOutcome::inconclusive(format!(
+            "{}; but it ran {}, whose code changed since the old build, which may be what differs",
+            stop.why,
+            changed.names(&stop.reached)
+        ));
+    }
+    if stop.function_pointers > 0 {
+        return CaseOutcome::inconclusive(format!(
+            "{}; but the case ran through {} function pointer(s) mapped by other functions' matches, which may be \
+             what differs",
+            stop.why, stop.function_pointers
+        ));
+    }
+    let what = stop.why.strip_prefix(imports::DIFFERS).unwrap_or(&stop.why);
+    CaseOutcome::Fail {
+        detail: format!(
+            "{what} (it ran no function whose code changed: the difference is its own)"
+        ),
     }
 }
 

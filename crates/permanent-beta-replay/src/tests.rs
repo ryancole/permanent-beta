@@ -34,6 +34,8 @@ const REALLOC_READ_OLD: u32 = 0x1180; // ... q = realloc(p, 32); return *(int*)p
 const FREE_ARG: u32 = 0x11c0; // free(rcx)
 const READ_AT_4: u32 = 0x11e0; // mov eax, [rcx+4]; ret
 const READ_FIELD_0: u32 = 0x11f0; // mov eax, [rcx]; ret
+const CALLS_DOUBLE: u32 = 0x11f4; // call DOUBLE; ret
+const CALLS_IOB: u32 = 0x11fa; // call CALL_IOB; ret
 
 /// Where the recording process had the old image loaded (cases record `image_size` 0x4000).
 const OLD_BASE: u64 = 0x7ff6_0000_0000;
@@ -132,6 +134,12 @@ fn text() -> Vec<u8> {
     put(FREE_ARG, &f);
     put(READ_AT_4, &[0x8b, 0x41, 0x04, 0xc3]);
     put(READ_FIELD_0, &[0x8b, 0x01, 0xc3]);
+    for (at, callee) in [(CALLS_DOUBLE, DOUBLE), (CALLS_IOB, CALL_IOB)] {
+        let mut c = vec![0xe8];
+        c.extend(rel32(at, 5, callee));
+        c.push(0xc3);
+        put(at, &c);
+    }
     t
 }
 
@@ -461,6 +469,7 @@ fn a_global_the_new_build_lacks_is_inconclusive() {
             layouts: &[],
             globals: &g_x(8),
             addresses: None,
+            changed: None,
         },
     );
     assert!(
@@ -483,8 +492,85 @@ mod emulated {
                 layouts,
                 globals: &g_x(4),
                 addresses: None,
+                changed: None,
             },
         )
+    }
+
+    /// `run`, telling replay which functions changed since the recording's build.
+    fn run_changed(rva: u32, ret: ValueType, c: &LoadedCase, changed: &[u32]) -> CaseOutcome {
+        let changed = Changed {
+            functions: changed
+                .iter()
+                .map(|&r| (u64::from(r), format!("f_{r:x}")))
+                .collect(),
+        };
+        replay(
+            &image(),
+            Rva(u64::from(rva)),
+            &spec(ret),
+            c,
+            &NewBuild {
+                layouts: &[],
+                globals: &g_x(4),
+                addresses: None,
+                changed: Some(&changed),
+            },
+        )
+    }
+
+    #[test]
+    fn a_difference_through_a_changed_callee_is_inconclusive() {
+        let int = ValueType::Int(4);
+        // CALLS_DOUBLE returns DOUBLE's 2x: recorded 42 for 21 passes, whether DOUBLE changed or not.
+        for changed in [&[][..], &[DOUBLE]] {
+            let o = run_changed(CALLS_DOUBLE, int, &case(21, 0, 42, None), changed);
+            assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
+        }
+        // Recorded 63 (the old build tripled): the run differs.
+        let wrong = case(21, 0, 63, None);
+        // Nothing known about the callees: a fail, as before.
+        let o = run(CALLS_DOUBLE, int, &wrong, &[]);
+        assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
+        // DOUBLE changed and ran: the difference may be DOUBLE's, so the caller doesn't fail.
+        let o = run_changed(CALLS_DOUBLE, int, &wrong, &[DOUBLE]);
+        inconclusive(&o, "it ran f_1000, whose code changed");
+        // Negative: another function changed, but this run didn't enter it: the difference is the caller's own.
+        let o = run_changed(CALLS_DOUBLE, int, &wrong, &[TRIPLE]);
+        assert!(
+            matches!(&o, CaseOutcome::Fail { detail } if detail.contains("the difference is its own")),
+            "{o:?}"
+        );
+    }
+
+    #[test]
+    fn other_import_inputs_with_no_changed_callee_fail() {
+        let file = 0x7ff0_0000_0010;
+        let ret = ValueType::Int(8);
+        // The old function asked for stream 2; CALL_IOB asks for stream 1.
+        let other_stream = with_imports(case(0, 0, file, None), Some((2, file)));
+        // Nothing known about the callees: inconclusive, as before.
+        let o = run(CALL_IOB, ret, &other_stream, &[]);
+        inconclusive(&o, "index 0x1, recorded 0x2");
+        // No function it ran changed (the candidate itself doesn't count): the call is its own, a fail.
+        for changed in [&[][..], &[CALL_IOB]] {
+            let o = run_changed(CALL_IOB, ret, &other_stream, changed);
+            assert!(
+                matches!(&o, CaseOutcome::Fail { detail }
+                    if detail.contains("index 0x1, recorded 0x2") && !detail.contains(imports::DIFFERS)),
+                "{o:?}"
+            );
+        }
+        // Negative: through a callee that changed (CALLS_IOB -> CALL_IOB), it may be the callee's: inconclusive.
+        let o = run_changed(CALLS_IOB, ret, &other_stream, &[CALL_IOB]);
+        inconclusive(&o, "it ran f_10a0, whose code changed");
+        // Negative: what replay can't do stays inconclusive, changed callees known or not: no recorded imports.
+        let o = run_changed(CALL_IOB, ret, &case(0, 0, file, None), &[]);
+        inconclusive(&o, "calls the import kernel32.dll!__acrt_iob_func");
+        // Negative: the same inputs still pass.
+        let same = with_imports(case(0, 0, file, None), Some((1, file)));
+        let o = run_changed(CALLS_IOB, ret, &same, &[CALL_IOB]);
+        assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
     }
 
     fn inconclusive(o: &CaseOutcome, why: &str) {
@@ -940,6 +1026,7 @@ fn replay_mapped(
         c,
         &NewBuild {
             addresses: Some(map),
+            changed: None,
             ..NewBuild::default()
         },
     )

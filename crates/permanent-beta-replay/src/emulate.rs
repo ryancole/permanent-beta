@@ -62,6 +62,27 @@ pub struct Setup<'a> {
     pub imports: Option<StandIns>,
     /// The recorded image's range and the address map: inputs holding a mapped old-image address get the new one.
     pub addresses: Option<(&'a Range<u64>, &'a AddressMap)>,
+    /// RVAs of functions to note when the run enters them (the new build's changed functions): [`Ran::reached`]
+    /// and [`Stopped::reached`] list those it entered, in order of first entry. The function run is never noted.
+    pub watch: &'a [u64],
+}
+
+/// Why a run stopped before the function returned: the case can't be judged as a pass or fail from the run's
+/// end state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    pub why: String,
+    /// The watched functions it had entered ([`Setup::watch`]).
+    pub reached: Vec<u64>,
+    /// Function pointers in the inputs rewritten to the new image through other functions' matches.
+    pub function_pointers: usize,
+}
+
+/// What a run notes as it goes, kept when it stops early.
+#[derive(Default)]
+struct Notes {
+    reached: Vec<u64>,
+    function_pointers: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +103,8 @@ pub struct Ran {
     /// Old-image addresses in the inputs rewritten to the new image.
     pub rewritten: Rewritten,
     pub instructions: u64,
+    /// The watched functions it entered ([`Setup::watch`]), in order of first entry.
+    pub reached: Vec<u64>,
 }
 
 fn inside(ranges: &[Range<u64>], a: u64) -> bool {
@@ -267,8 +290,24 @@ impl CallView for EmuView<'_> {
     }
 }
 
-/// Runs the function at `setup.rva` with the recorded entry state. `Err` is why the case can't be judged.
-pub fn run(setup: &Setup) -> Result<Ran, String> {
+/// Runs the function at `setup.rva` with the recorded entry state. `Err` is why the case can't be judged, with
+/// the watched functions it had entered.
+pub fn run(setup: &Setup) -> Result<Ran, Stopped> {
+    let mut notes = Notes::default();
+    match run_noting(setup, &mut notes) {
+        Ok(mut ran) => {
+            ran.reached = notes.reached;
+            Ok(ran)
+        }
+        Err(why) => Err(Stopped {
+            why,
+            reached: notes.reached,
+            function_pointers: notes.function_pointers,
+        }),
+    }
+}
+
+fn run_noting(setup: &Setup, notes: &mut Notes) -> Result<Ran, String> {
     VM.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
@@ -282,7 +321,7 @@ pub fn run(setup: &Setup) -> Result<Ran, String> {
         for b in vm.breakpoints() {
             vm.remove_breakpoint(b);
         }
-        run_on(vm, setup)
+        run_on(vm, setup, notes)
     })
 }
 
@@ -302,7 +341,7 @@ fn map(vm: &mut icicle_vm::Vm, start: u64, len: u64, perm: u8, value: u8) -> Res
     }
 }
 
-fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
+fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ran, String> {
     let image = setup.image;
     // The recorded heap blocks the stand-ins will hand out, reserved like the recorded memory.
     let allocations = setup
@@ -390,6 +429,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         .iter()
         .map(|r| rebased(r.address, &r.bytes, &mut rewritten))
         .collect();
+    notes.function_pointers = rewritten.functions;
 
     // The image: mapped unreadable, then each part given what the function may do with it.
     let mut memory = image.loaded_at(base);
@@ -529,6 +569,16 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
     for i in 0..import_count {
         vm.add_breakpoint(import_trap(i));
     }
+    // Watched functions: a breakpoint at each entry, removed at the first hit (only entering matters).
+    let watched: std::collections::BTreeSet<u64> = setup
+        .watch
+        .iter()
+        .copied()
+        .filter(|&rva| rva != setup.rva && rva < image.size())
+        .collect();
+    for &rva in &watched {
+        vm.add_breakpoint(base + rva);
+    }
     let started_at = vm.cpu.icount;
     vm.icount_limit = started_at.saturating_add(MAX_INSTRUCTIONS);
     vm.cpu.write_pc(base + setup.rva);
@@ -550,6 +600,11 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
                 let pc = vm.cpu.read_pc();
                 if pc == layout.return_trap {
                     break;
+                }
+                if let Some(rva) = pc.checked_sub(base).filter(|r| watched.contains(r)) {
+                    notes.reached.push(rva);
+                    vm.remove_breakpoint(pc);
+                    continue;
                 }
                 let name = layout
                     .import_names
@@ -693,6 +748,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup) -> Result<Ran, String> {
         instructions: vm.cpu.icount - started_at,
         image: base..base + image.size(),
         rewritten,
+        reached: Vec::new(),
     })
 }
 

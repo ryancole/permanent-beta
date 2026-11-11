@@ -15,7 +15,9 @@ use permanent_beta_model::{
     Rva, TypeLayout,
 };
 use permanent_beta_replay::address::AddressMap;
-use permanent_beta_replay::{CaseOutcome, Image, LoadedCase, NewBuild, Recording, imports, replay};
+use permanent_beta_replay::{
+    CaseOutcome, Changed, Image, LoadedCase, NewBuild, Recording, imports, replay,
+};
 use permanent_beta_verify::{BehavioralRunner, VerifyContext};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -27,6 +29,8 @@ pub struct RecordedCasesRunner {
     new_globals: Vec<GlobalVar>,
     /// Per old build, its image's addresses mapped to the new image (design §7.3).
     addresses: Vec<(BuildId, AddressMap)>,
+    /// Per old build, the new build's functions that aren't known to be its old code ([`changed_functions`]).
+    changed: Vec<(BuildId, Changed)>,
 }
 
 /// Every case for one old function, replayed on one new function.
@@ -94,11 +98,14 @@ impl RecordedCasesRunner {
             new_layouts,
             new_globals,
             addresses: Vec::new(),
+            changed: Vec::new(),
         }
     }
 
     /// Maps addresses into `old`'s image to the new image: its data symbols by name (both analyses with `--pdb`)
-    /// and its functions through `functions` (old entry, new entry: the run's accepted matches).
+    /// and its functions through `functions` (old entry, new entry: the run's accepted matches). Also tells
+    /// replay which new functions changed since `old`, to attribute a difference to the candidate or to a
+    /// callee ([`changed_functions`]).
     pub fn with_addresses(
         mut self,
         old: &AnalysisExport,
@@ -108,6 +115,9 @@ impl RecordedCasesRunner {
         self.addresses.retain(|(b, _)| b != &old.build.id);
         self.addresses
             .push((old.build.id.clone(), AddressMap::new(old, new, functions)));
+        self.changed.retain(|(b, _)| b != &old.build.id);
+        self.changed
+            .push((old.build.id.clone(), changed_functions(old, new, functions)));
         self
     }
 
@@ -144,6 +154,11 @@ impl RecordedCasesRunner {
                                 .iter()
                                 .find(|(b, _)| b == &rec.spec.build)
                                 .map(|(_, m)| m),
+                            changed: self
+                                .changed
+                                .iter()
+                                .find(|(b, _)| b == &rec.spec.build)
+                                .map(|(_, c)| c),
                         },
                     ),
                 });
@@ -263,6 +278,32 @@ impl RecordedCasesRunner {
             );
         }
         others
+    }
+}
+
+/// The functions of `new` not known to be `old`'s code: without an accepted match in `functions` (old entry,
+/// new entry), or whose normalized hash differs from (or is missing beside) its counterpart's. A function with
+/// the same normalized code is taken to behave the same **[Guess]**: the hash masks addresses, so code reading a
+/// data table whose contents changed counts as unchanged.
+pub fn changed_functions(
+    old: &AnalysisExport,
+    new: &AnalysisExport,
+    functions: &[(Rva, Rva)],
+) -> Changed {
+    let counterpart: BTreeMap<Rva, Rva> = functions.iter().map(|&(o, n)| (n, o)).collect();
+    Changed {
+        functions: new
+            .functions
+            .iter()
+            .filter(|f| {
+                let old_hash = counterpart
+                    .get(&f.rva)
+                    .and_then(|&o| old.function(o))
+                    .and_then(|o| o.normalized_hash.as_deref());
+                f.normalized_hash.is_none() || old_hash != f.normalized_hash.as_deref()
+            })
+            .map(|f| (f.rva.0, f.name.clone().unwrap_or_else(|| f.rva.to_string())))
+            .collect(),
     }
 }
 
@@ -488,6 +529,58 @@ mod tests {
         let mut o = Others::default();
         o.add(None, Rva(0x10), None, false, false, CheckOutcome::Pass);
         assert_eq!(o.passed, [Rva(0x10)]);
+    }
+
+    fn analysis(id: &str, functions: &[(u64, Option<&str>, &str)]) -> AnalysisExport {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": permanent_beta_model::ANALYSIS_SCHEMA_VERSION,
+            "build": { "id": id, "file_name": "t.exe", "machine": "x64" },
+            "producer": { "tool": "test", "version": "0" },
+            "functions": functions.iter().map(|&(rva, hash, name)| serde_json::json!({
+                "rva": format!("{rva:#x}"), "size": 16, "name": name, "normalized_hash": hash,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn changed_functions_are_those_not_known_to_be_the_old_code() {
+        let old = analysis(
+            "a",
+            &[
+                (0x10, Some("same"), "kept"),
+                (0x20, Some("v1"), "edited"),
+                (0x30, Some("x"), "unhashed"),
+                (0x40, Some("gone"), "gone"),
+            ],
+        );
+        let new = analysis(
+            "b",
+            &[
+                (0x110, Some("same"), "kept"),
+                (0x120, Some("v2"), "edited"),
+                (0x130, None, "unhashed"),
+                (0x150, Some("same"), "added"),
+            ],
+        );
+        let pairs = [
+            (Rva(0x10), Rva(0x110)),
+            (Rva(0x20), Rva(0x120)),
+            (Rva(0x30), Rva(0x130)),
+        ];
+        let changed = changed_functions(&old, &new, &pairs);
+        // Edited code, a function without a hash, and one without an accepted match (even with code identical to
+        // another's) aren't known to be the old code.
+        assert_eq!(
+            changed.functions.keys().copied().collect::<Vec<_>>(),
+            [0x120, 0x130, 0x150]
+        );
+        assert_eq!(changed.functions[&0x120], "edited");
+        // Negative: an accepted match with the same normalized code is the old code.
+        assert!(!changed.functions.contains_key(&0x110));
+        // Negative: without its accepted match, the unchanged function isn't known to be the old code either.
+        let changed = changed_functions(&old, &new, &pairs[1..]);
+        assert!(changed.functions.contains_key(&0x110));
     }
 
     #[test]

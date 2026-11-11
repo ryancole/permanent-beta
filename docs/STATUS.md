@@ -4,7 +4,13 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **review revoke and accepting a function outside the candidates** (design §9.1). `pbeta review
+Latest work: **changed callees in replay** (design §7.3). With the old analysis, replay notes which changed
+functions (no accepted match, or other normalized code) a run entered. A difference through one is inconclusive,
+naming it, so a correct candidate isn't failed for its callee's change; an import called with other inputs in a
+run that entered none is now a fail (it was inconclusive). No case outcome changed on the corpus; the hook loop
+passes `--old-analysis` and names `log_event` for `ship_order`'s v1 → v2 cases.
+
+Before that: **review revoke and accepting a function outside the candidates** (design §9.1). `pbeta review
 revoke` withdraws a reviewer's accepted mapping and reopens the item; `pbeta review accept --function <rva>
 --old-analysis --new-analysis` verifies a function the reviewer names with the engine's checks before recording
 it. Not built, on purpose: the per-project setting that would let policy-passing AI proposals through without a
@@ -469,8 +475,7 @@ What's new:
    arguments capture their heap block; replay is measured on zlib (`corpus/replay-measure.ps1`: 14 of 16 hooks
    replay, the other two aren't called; `inflate` 8 of 8 cases, `inflate_fast` 9 of 9, `updatewindow` 7 of 8).
    Pointer aliases are found in the PDB's locals. Not covered: arrays on the stack (only the element is captured),
-   type punning no local shows. Next: zstd's compression hooks (megabytes of workspace per case), globals reached only through pointers, a target whose callee
-   changed telling "this function changed" from "a callee changed" (today both are inconclusive), and a real target with a changed struct to measure layout
+   type punning no local shows. Next: zstd's compression hooks (megabytes of workspace per case), globals reached only through pointers, and a real target with a changed struct to measure layout
    translation outside unit tests.
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
    Still to choose: contributor terms (DCO or CLA).

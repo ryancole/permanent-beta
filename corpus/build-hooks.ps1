@@ -286,14 +286,16 @@ function Invoke-Loop([string] $flagName) {
             }
         }
 
-        # f. Recorded cases replayed on every resolved hook (all correct, per the answer key): none may fail.
+        # f. Recorded cases replayed on every resolved hook (all correct, per the answer key): none may fail. With
+        #    the old analysis, replay knows which functions changed and names the callee a difference may be due to.
         $replayed = @{}
         if ($Replay) {
             foreach ($r in $repairJson.repairs) {
                 $to = switch ($r.action.action) { 'relocated' { $r.action.new } 'unchanged' { $r.action.rva } default { $null } }
                 if (-not $to) { continue }
                 $j = & $pbeta (@('replay', '--binary', "$dir\$new\app.exe", '--old-rva', $r.old, '--new-rva', $to,
-                    '--new-analysis', "$dir\$new\analysis-pdb.json", '--json') + $cases) | ConvertFrom-Json
+                    '--new-analysis', "$dir\$new\analysis-pdb.json", '--old-analysis', "$dir\$old\analysis-pdb.json",
+                    '--json') + $cases) | ConvertFrom-Json
                 $pass = @($j.cases | Where-Object outcome -eq 'pass').Count
                 $replayed[$r.hook] = "$($j.outcome) ($pass/$(@($j.cases).Count))"
                 if ($j.outcome -eq 'fail') { $script:failures += "$step $($r.hook): recorded case failed replay ($($j.detail))" }
