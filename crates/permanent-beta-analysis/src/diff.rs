@@ -211,6 +211,7 @@ mod tests {
             imports: vec![],
             data_refs: vec![],
             code_refs: vec![],
+            thunk_to: None,
             signature: None,
             inferred_args: None,
             inferred_arg_classes: vec![],

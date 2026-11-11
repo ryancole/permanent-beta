@@ -99,7 +99,28 @@ pub fn matchers_with_similarity(params: SimilarityParams) -> Vec<Box<dyn Matcher
 /// Then each candidate is rechecked by its pass against the final matches ([`Matcher::contradiction`]). If any
 /// is contradicted, those pairs are banned and everything reruns from scratch, so nothing built on a vetoed
 /// pair survives. Each round bans at least one new pair, so this terminates.
+///
+/// Incremental linking thunks ([`FunctionFeatures::thunk_to`]) take no part: the analyzer already counts calls
+/// to one as calls to its target, and a thunk next to its target would only compete with it.
 pub fn run_passes(
+    old: &AnalysisExport,
+    new: &AnalysisExport,
+    matchers: &[Box<dyn Matcher>],
+) -> MatchOutcome {
+    let (old, new) = (without_thunks(old), without_thunks(new));
+    run_passes_on(&old, &new, matchers)
+}
+
+fn without_thunks(a: &AnalysisExport) -> std::borrow::Cow<'_, AnalysisExport> {
+    if a.functions.iter().all(|f| f.thunk_to.is_none()) {
+        return std::borrow::Cow::Borrowed(a);
+    }
+    let mut a = a.clone();
+    a.functions.retain(|f| f.thunk_to.is_none());
+    std::borrow::Cow::Owned(a)
+}
+
+fn run_passes_on(
     old: &AnalysisExport,
     new: &AnalysisExport,
     matchers: &[Box<dyn Matcher>],
@@ -1609,6 +1630,7 @@ mod tests {
             imports: vec![],
             data_refs: vec![],
             code_refs: vec![],
+            thunk_to: None,
             signature: None,
             arg_accesses: vec![],
         }
@@ -2053,6 +2075,35 @@ mod tests {
             "{:?}",
             got.ambiguities
         );
+    }
+
+    /// `rva` is an incremental linking thunk to `target`.
+    fn thunk(rva: u64, target: u64) -> FunctionFeatures {
+        let mut f = body(rva, "jmp", 0, &[target], 5);
+        f.thunk_to = Some(Rva(target));
+        f
+    }
+
+    #[test]
+    fn an_edited_body_behind_its_own_ilt_thunk_is_matched() {
+        // An incremental build: the edited body's thunk calls it, and main's call through the thunk is already
+        // recorded as a call to the body. Unlike a real new wrapper (above), the thunk takes no part.
+        let (mut old, new) = edited(
+            &[0x110],
+            vec![thunk(0x130, 0x110), body(0x110, "h2", 6, &[0x150], 66)],
+        );
+        old.functions.push(thunk(0x30, 0x10));
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(pairs(&old, &new).contains(&(0x10, 0x110)), "{:?}", got);
+        // Negative: neither thunk is ever a candidate or a competitor, even with the same code on both sides.
+        assert!(
+            !got.candidates
+                .iter()
+                .any(|c| c.old == Rva(0x30) || c.new == Rva(0x130)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(!got.ambiguities.iter().any(|a| a.new.contains(&Rva(0x130))));
     }
 
     /// Proposes fixed pairs; `after` makes it wait until that old function is matched.

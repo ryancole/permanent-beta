@@ -238,6 +238,12 @@ pub struct FunctionFeatures {
     /// (design §7.3). Optional, so adding it didn't change the schema version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_refs: Vec<Rva>,
+    /// An incremental-linking thunk (MSVC's ILT, `/INCREMENTAL`): a `jmp` in the table at the start of the code
+    /// that every call to this target goes through. Calls and code pointers to it are recorded as calls to the
+    /// target (`callees`, `code_refs`, `code_tables`), it's never matched itself, and a hook on it is moved to the
+    /// target. Optional, so adding it didn't change the schema version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thunk_to: Option<Rva>,
     pub signature: Option<FunctionSignature>,
     /// Register arguments the code reads before writing (Win64: rcx/xmm0, rdx/xmm1, r8/xmm2, r9/xmm3), up to
     /// the first call, as 1 + the highest slot used. A lower bound on the parameter count: unused trailing

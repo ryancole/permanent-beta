@@ -173,7 +173,7 @@ Per function (fields optional unless noted):
 | `signature` | Calling convention, return type, parameters, typically from PDB or decompiler. |
 
 Per build, **`features_version`** (2026-11-10) names the normalizer that computed the code features and its
-version (`native-1`; `permanent_beta_analysis::native::FEATURES_VERSION`). Every native analysis has it, whatever
+version (`native-2`; `permanent_beta_analysis::native::FEATURES_VERSION`). Every native analysis has it, whatever
 found the boundaries (native discovery or a Ghidra export: the features come from the same code). The engine
 matches, repairs and verifies only between analyses that agree on it (`AnalysisExport::features_comparable`):
 another version, or an analysis without one (written before it existed, or PDB-only), is refused with "analyze
@@ -197,8 +197,20 @@ Target: PE x64. Implemented in `permanent-beta-analysis/src/native` (M1, first v
   analysis, a pattern or a replay goes through it. None of the corpus's 106 binaries or 150 System32 executables
   is refused (2026-11-08). A protector that renames its sections and avoids both shapes isn't caught, and one
   that names an empty section `.textbss` avoids the third. Incremental images were checked on one program only
-  (2026-11-10: two Debug builds of a 270-line app, 0 wrong matches without the PDB, its 5-byte ILT jump thunks
-  matched as functions); the corpus has no incremental variant yet. **[Validate]**
+  (2026-11-10: two Debug builds of a 270-line app, 0 wrong matches without the PDB); the corpus has no
+  incremental variant yet. **[Validate]**
+
+- **Incremental linking tables** (`native/ilt.rs`, 2026-11-10). An `/INCREMENTAL` image starts its code with a
+  table of 5-byte `jmp rel32` thunks, one per function, and every direct call goes through one. Recognized only
+  at the start of an executable section's file data (after `int3` padding): at least 4 **[Guess]** consecutive
+  slots, each jumping to code in the file outside the table. Each slot is its own function (`thunk_to` = its
+  target; a slot nothing calls would otherwise run into the slot before), calls, `lea`s and table slots that
+  name a thunk are recorded as its target's, thunks are never matched (`run_passes` drops them, so a thunk never
+  competes with its own target as a "new wrapper", §5.1 pass 6), and a hook on a thunk is moved to its target
+  and reported as relocated from the thunk. Release images have no table and analyze as before (`native-2` only
+  bumps the version). Measured on CenterWindows Debug v1 → v2 without PDBs: 224 thunks; hooks resolved 6/8 → 7/8,
+  the last an edited function with one correct similarity candidate, in review for evidence as designed;
+  0 wrong matches. **[Validate]** on the corpus once it has an incremental variant.
 
 - Parse headers and sections with `object`; `.pdata` and the import table are parsed by hand from section bytes.
 - Function starts: non-chained `.pdata` entries, the entry point, exports and code pointers stored in data

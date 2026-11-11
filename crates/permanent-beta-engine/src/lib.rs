@@ -129,9 +129,11 @@ impl Engine {
             })
             .collect();
 
+        // Incremental linking thunks are never matched (`run_passes`), so they're not left unmatched either.
         let unmatched = |funcs: &[FunctionFeatures], claimed: &dyn Fn(Rva) -> bool| {
             funcs
                 .iter()
+                .filter(|f| f.thunk_to.is_none())
                 .map(|f| f.rva)
                 .filter(|r| !claimed(*r))
                 .collect::<Vec<_>>()
@@ -296,7 +298,9 @@ impl Engine {
             Some((o, new.function(m.new)?, reviewer))
         });
         if let Some((o, n, reviewer)) = reviewed {
-            return from_review(hook, o, n, reviewer);
+            let mut repair = from_review(hook, o, n, reviewer);
+            off_thunk(&mut repair, hook, old);
+            return repair;
         }
         let rejected = |c_old: Rva, c_new: Rva| prior.rejected.contains(&(c_old, c_new));
         let cand = old_fn
@@ -361,6 +365,7 @@ impl Engine {
         {
             repair.struct_proposals = layout::infer(hook, pair.old, new, o, n);
         }
+        off_thunk(&mut repair, hook, old);
         if !repair.struct_proposals.is_empty() {
             let what: Vec<String> = repair
                 .struct_proposals
@@ -449,8 +454,11 @@ impl<'a> Pair<'a> {
     }
 }
 
+/// The old function a hook is on. A hook on an incremental linking thunk is on the thunk's target: every call
+/// goes through the thunk to it, and Detours follows the `jmp` there anyway.
 fn resolve_old<'a>(hook: &HookSpec, old: &'a AnalysisExport) -> Option<&'a FunctionFeatures> {
-    hook.target
+    let f = hook
+        .target
         .rva
         .and_then(|rva| old.function(rva))
         .or_else(|| {
@@ -458,7 +466,24 @@ fn resolve_old<'a>(hook: &HookSpec, old: &'a AnalysisExport) -> Option<&'a Funct
                 .symbol
                 .as_deref()
                 .and_then(|s| old.function_by_name(s))
-        })
+        })?;
+    Some(f.thunk_to.and_then(|t| old.function(t)).unwrap_or(f))
+}
+
+/// A resolved hook whose locator named an incremental linking thunk moves off it, to where the thunk's target
+/// went (see [`resolve_old`]): reported as relocated from the thunk, even when the target itself stayed put.
+fn off_thunk(repair: &mut HookRepair, hook: &HookSpec, old: &AnalysisExport) {
+    let thunk = hook
+        .target
+        .rva
+        .and_then(|r| old.function(r))
+        .filter(|f| f.thunk_to.is_some());
+    if let (Some(thunk), Some(at)) = (thunk, repair.new_rva()) {
+        repair.action = RepairAction::Relocated {
+            old: thunk.rva,
+            new: at,
+        };
+    }
 }
 
 #[cfg(test)]
@@ -487,6 +512,7 @@ mod tests {
             imports: vec![],
             data_refs: vec![],
             code_refs: vec![],
+            thunk_to: None,
             signature: None,
             mnemonic_counts: Default::default(),
             pseudocode: None,
@@ -534,6 +560,70 @@ mod tests {
                 },
             }],
         }
+    }
+
+    /// `rva` is an incremental linking thunk to `target`.
+    fn thunk(rva: u64, target: u64) -> FunctionFeatures {
+        let mut f = func(rva, "jmp");
+        f.size = 5;
+        f.callees = vec![Rva(target)];
+        f.thunk_to = Some(Rva(target));
+        f
+    }
+
+    #[test]
+    fn a_hook_on_an_ilt_thunk_moves_to_where_its_target_went() {
+        // The manifest names the old thunk 0x10; its target 0x40 is now at 0x140, behind a thunk at 0x200. Main's
+        // calls through the thunks are recorded as calls to the bodies (the analyzer does that).
+        let caller = |rva: u64, to: u64| {
+            let mut f = func(rva, "main");
+            f.callees = vec![Rva(to)];
+            f
+        };
+        let old = export(
+            "a",
+            vec![caller(0x1, 0x40), thunk(0x10, 0x40), func(0x40, "body")],
+        );
+        let new = export(
+            "b",
+            vec![caller(0x2, 0x140), thunk(0x200, 0x140), func(0x140, "body")],
+        );
+        let r = Engine::with_defaults()
+            .repair(&manifest(), &old, &new)
+            .unwrap();
+        assert_eq!(
+            r.repairs[0].action,
+            RepairAction::Relocated {
+                old: Rva(0x10),
+                new: Rva(0x140)
+            }
+        );
+        assert_eq!(r.repairs[0].old, Some(Rva(0x40)));
+        assert_eq!(r.mappings[0].old, Rva(0x40));
+        assert_eq!(r.updated_manifest.hooks[0].target.rva, Some(Rva(0x140)));
+        // Thunks aren't matched, so they're not reported unmatched either.
+        let m = Engine::with_defaults().match_builds(&old, &new).unwrap();
+        assert!(
+            m.unmatched_old.is_empty() && m.unmatched_new.is_empty(),
+            "{m:?}"
+        );
+        assert!(!m.reports.iter().any(|v| v.candidate.new == Rva(0x200)));
+    }
+
+    #[test]
+    fn a_hook_on_a_plain_jump_stays_on_it() {
+        // Negative: the same jump without `thunk_to` (not in an ILT) is an ordinary function, matched as itself.
+        let mut stub = thunk(0x10, 0x40);
+        stub.thunk_to = None;
+        let mut new_stub = thunk(0x110, 0x140);
+        new_stub.thunk_to = None;
+        let old = export("a", vec![stub, func(0x40, "body")]);
+        let new = export("b", vec![new_stub, func(0x140, "body")]);
+        let r = Engine::with_defaults()
+            .repair(&manifest(), &old, &new)
+            .unwrap();
+        assert_eq!(r.repairs[0].old, Some(Rva(0x10)));
+        assert_eq!(r.repairs[0].new_rva(), Some(Rva(0x110)));
     }
 
     /// The hook target 0x10 has two identical copies in the new build: the engine refuses to pick.

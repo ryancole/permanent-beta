@@ -232,8 +232,12 @@ impl RecordedCasesRunner {
         let target_hash = new
             .function(new_rva)
             .and_then(|f| f.normalized_hash.as_deref());
-        let targets: Vec<&FunctionFeatures> =
-            new.functions.iter().filter(|f| f.rva != new_rva).collect();
+        // An incremental linking thunk only jumps to a function that's tested itself.
+        let targets: Vec<&FunctionFeatures> = new
+            .functions
+            .iter()
+            .filter(|f| f.rva != new_rva && f.thunk_to.is_none())
+            .collect();
         // PBETA_REPLAY_THREADS caps it when several replays share the machine (corpus/replay-measure.ps1).
         let threads = std::env::var("PBETA_REPLAY_THREADS")
             .ok()

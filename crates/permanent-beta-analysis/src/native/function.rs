@@ -102,6 +102,9 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
             .copied()
             .filter(|&t| !inside_pdata(t)),
     );
+    // Every slot of an incremental linking table is a function of its own (`super::ilt`): one nothing calls
+    // through would otherwise run into the slot before it.
+    starts.extend(super::ilt::find(image).into_keys());
 
     loop {
         let mut found = Vec::new();
@@ -533,6 +536,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         imports: imports.into_iter().collect(),
         data_refs: data_refs.into_iter().collect(),
         code_refs: code_refs.into_iter().collect(),
+        thunk_to: None,
         signature: None,
         inferred_args: (!insns.is_empty()).then_some(args.0),
         inferred_arg_classes: args.1,

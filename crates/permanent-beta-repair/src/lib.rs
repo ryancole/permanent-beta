@@ -574,6 +574,7 @@ mod tests {
             imports: vec![],
             data_refs: vec![],
             code_refs: vec![],
+            thunk_to: None,
             signature: Some(FunctionSignature {
                 calling_convention: None,
                 return_type: None,
