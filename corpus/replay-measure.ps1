@@ -12,9 +12,11 @@
 
   Each hook's cases are also replayed on every other function of the new build (`pbeta replay --others`), the
   control for replay itself: they must pass on none of them, except a function with identical code (the same
-  normalized hash) or one that calls the target (a forwarding wrapper: zlib's crc32 calls crc32_z). One that
-  passes fails the measurement, like a correct pair failing. -SkipOthers leaves the control out (it's most of the
-  run time).
+  normalized hash), one that calls the target (a forwarding wrapper: zlib's crc32 calls crc32_z) or one the
+  target calls (or takes the address of). One that passes fails the measurement, like a correct pair failing,
+  unless corpus/replay/<project>.known-confusions.json lists it for these flags and new release (examined: an
+  inlined copy, which nothing links to the target); a listed one that no longer happens fails too, so the list
+  can't go stale. -SkipOthers leaves the control out (it's most of the run time).
 
   Speed: hooks are replayed -HookParallel at a time, and each replay's control splits the cores between them
   (PBETA_REPLAY_THREADS, unless set). A recording is reused when nothing it depends on changed (the hook DLL, the
@@ -174,6 +176,7 @@ foreach ($r in $results) {
         Cases        = (@($o.cases | Group-Object outcome | ForEach-Object { "$($_.Name) $($_.Count)" }) -join ', ')
         Others       = if ($o.others) { "pass $(@($o.others.passed).Count), same code $(@($o.others.same_code).Count), wrapper $(@($o.others.calls_target).Count), callee $(@($o.others.called_by_target).Count)" } else { '' }
         OthersPassed = if ($o.others) { @($o.others.passed) } else { @() }
+        Replayed     = [bool] $o.others
         Detail       = if ($o.detail.Length -gt 160) { $o.detail.Substring(0, 160) + '...' } else { $o.detail }
     }
 }
@@ -185,10 +188,33 @@ Write-Host "$Project $Flags $Old -> ${New}: $($passed.Count) of $($rows.Count) h
 # Every pair is correct by the answer key: a failure is replay's error.
 if ($failed.Count) { throw "replay failed a correct pair: $($failed.Hook -join ', ')" }
 # A hook's cases passing on a function with other code: replay can't tell the wrong function from the right one.
-$confused = @($rows | Where-Object { $_.OthersPassed.Count })
-if (-not $SkipOthers) {
-    Write-Host "control: $($confused.Count) of $($rows.Count) hooks' cases pass on another function of $New"
+# Pairs examined and listed in <project>.known-confusions.json (for these flags and new release) are reported
+# apart; any other fails the measurement, and so does a listed pair that no longer happens.
+$knownFile = Join-Path $PSScriptRoot "replay\$Project.known-confusions.json"
+$known = @(if (Test-Path $knownFile) {
+        (Get-Content -Raw $knownFile | ConvertFrom-Json).known | Where-Object { $_.flags -eq $Flags -and $_.new -eq $New }
+    })
+$nameAt = @{}
+foreach ($k in $newRva.Keys) { $nameAt[$newRva[$k]] = $k }
+$unknown = @()
+$seen = @()
+foreach ($r in $rows) {
+    foreach ($rva in $r.OthersPassed) {
+        $name = $nameAt[$rva]
+        $match = @($known | Where-Object { $_.hook -eq $r.Hook -and $_.passes_on -eq $name })
+        if ($match.Count) { $seen += $match[0] } else { $unknown += "$($r.Hook) on $rva$(if ($name) { " ($name)" })" }
+    }
 }
-if ($confused.Count) {
-    throw "replay passed wrong functions: $(($confused | ForEach-Object { "$($_.Hook) on $($_.OthersPassed -join ', ')" }) -join '; ')"
+$stale = @($known | Where-Object {
+        $k = $_
+        ($rows | Where-Object { $_.Hook -eq $k.hook -and $_.Replayed }) -and -not ($seen | Where-Object { $_ -eq $k })
+    })
+if (-not $SkipOthers) {
+    $confused = @($rows | Where-Object { $_.OthersPassed.Count })
+    Write-Host "control: $($confused.Count) of $($rows.Count) hooks' cases pass on another function of $New ($($seen.Count) known, $($unknown.Count) not)"
+    foreach ($k in $seen) { Write-Host "  known: $($k.hook) passes on $($k.passes_on): $($k.reason)" }
+}
+if ($unknown.Count) { throw "replay passed wrong functions: $($unknown -join '; ')" }
+if ($stale.Count) {
+    throw "known confusions no longer seen (remove them from $knownFile): $(($stale | ForEach-Object { "$($_.hook) on $($_.passes_on)" }) -join '; ')"
 }

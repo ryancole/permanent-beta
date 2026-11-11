@@ -1,0 +1,19 @@
+{
+  "about": "Known wrong-target control confusions for corpus/replay-measure.ps1 -Project zstd (design 7.3): a hook's cases that also pass on another function of the new build which nothing in the call graph links to it, examined and accepted as a limit of replay. The gate fails on any confusion not listed here, and on a listed one that no longer happens. Applies to the run with these flags and new release only.",
+  "known": [
+    {
+      "flags": "o2",
+      "new": "v1.5.7",
+      "hook": "HIST_count_simple",
+      "passes_on": "HIST_countFast_wksp",
+      "reason": "HIST_countFast_wksp inlines HIST_count_simple for small inputs; its fifth parameter (the workspace) is never touched on them"
+    },
+    {
+      "flags": "o2",
+      "new": "v1.5.7",
+      "hook": "HUF_decompress4X_usingDTable",
+      "passes_on": "HUF_decompress4X2_usingDTable_internal",
+      "reason": "the hook inlined HUF_decompress4X2_usingDTable_internal, which also exists on its own: the same dispatch to the 4X2 decoder"
+    }
+  ]
+}

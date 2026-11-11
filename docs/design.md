@@ -806,8 +806,15 @@ taken by a RIP-relative `lea` (not hashed, not matched on, optional in the schem
 `HUF_decompress4X2_usingDTable_internal` calls `_default` through `fallbackFn`, and the control now passes there.
 What it still can't excuse is an inlined copy: at /O2 `HUF_decompress4X_usingDTable` inlined `_internal`, which
 also exists on its own, and `HIST_countFast_wksp` inlined `HIST_count_simple`. Both behave like the target on the
-recorded inputs and nothing in the call graph links them; only matching can separate them, so zstd /O2 still
-fails the control gate.
+recorded inputs and nothing in the call graph links them; only matching can separate them.
+
+**Known confusions (2026-11-10).** Such pairs, once examined, are listed in
+`corpus/replay/<project>.known-confusions.json` (hook, the function its cases also pass on, flags, new release and
+the reason); `replay-measure.ps1` reports them as known and fails on any confusion not listed, and on a listed one
+that no longer happens, so the list can't hide a new one or go stale. zstd /O2 lists the two inlined copies above
+and passes. What separates them is matching and the structural checks, not replay: `HIST_countFast_wksp` takes 5
+parameters to `HIST_count_simple`'s 4 (the parameter-count check, with PDB signatures). For these hooks a
+behavioral pass doesn't distinguish the function from its inlined copy.
 
 **Pointer aliases found in the PDB (2026-11-09).** The hand-given hints above are now found automatically:
 `pbeta analyze --pdb` reads each procedure's locals, and a struct field `f` declared `X*` with a local `f` of type
