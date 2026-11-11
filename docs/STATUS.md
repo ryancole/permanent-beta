@@ -470,13 +470,16 @@ What's new:
    costs 108 correct, 3 costs 198, 0 wrong throughout); `WRAPPER_MIN_DIRECT_CALLERS` 2 is calibrated (1 adds 27
    correct and one wrong match in zstd, 3 costs 12). The code-tables fail threshold (now the named constant
    `CODE_TABLE_FAIL_AGREEING`) stays a guess: the check never fails on the corpus at 1, 2 or 3.
-4. **Widen replay further** (§7.3): globals, the UCRT's printing imports and the CRT memory functions are done,
-   pointers inside structs are followed by type, heap calls including `realloc` are modelled, and pointer-to-scalar
-   arguments capture their heap block; replay is measured on zlib (`corpus/replay-measure.ps1`: 14 of 16 hooks
-   replay, the other two aren't called; `inflate` 8 of 8 cases, `inflate_fast` 9 of 9, `updatewindow` 7 of 8).
-   Pointer aliases are found in the PDB's locals. Not covered: arrays on the stack (only the element is captured),
-   type punning no local shows. Next: zstd's compression hooks (megabytes of workspace per case), globals reached only through pointers, and a real target with a changed struct to measure layout
-   translation outside unit tests.
+4. **Widen replay further** (§7.3): globals, the UCRT's printing imports, the CRT memory functions and rotates
+   are done, pointers inside structs are followed by type, heap calls including `realloc` are modelled,
+   pointer-to-scalar arguments capture their heap block, and a difference is attributed to the candidate or to a
+   changed callee. Measured with `corpus/verify.ps1` (about 3.5 minutes): zlib 14 of 16 hooks replay at /O2 and
+   /Od (the other two aren't called; `inflate` 8 of 8 cases, `inflate_fast` 9 of 9, `updatewindow` 8 of 8), zstd
+   11 of 16 at /O2 and 10 of 16 at /Od, 0 fail. zstd is also the real target with changed structs: renamed types,
+   removed and added fields and nested by-value structs are translated there, not only in unit tests. Pointer
+   aliases are found in the PDB's locals. Not covered: arrays on the stack (only the element is captured), type
+   punning no local shows. Next: zstd's compression hooks (megabytes of workspace per case), globals reached only
+   through pointers, and a corpus case that exercises changed-callee attribution (no zlib or zstd case does).
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
    Still to choose: contributor terms (DCO or CLA).
 6. **Outside the code:** talk to legacy-software teams (design §14).
