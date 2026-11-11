@@ -11,7 +11,8 @@
 //! - an executable section with no data in the file (code that only exists once something fills it in at run
 //!   time).
 //!
-//! Neither shape occurs in what MSVC links. A protector that renames its sections and avoids both shapes isn't
+//! None of these shapes occurs in what MSVC links, with one exception allowed for: the empty `.textbss` an
+//! incrementally linked image starts with (`is_msvc_textbss`), accepted only in its exact shape. A protector that renames its sections and avoids both shapes isn't
 //! caught: this is a refusal of the obvious cases, not a guarantee. There's no override.
 
 use super::image::Image;
@@ -69,11 +70,9 @@ pub(crate) fn detect(image: &Image) -> Option<String> {
             s.name
         ));
     }
-    if let Some(s) = image
-        .sections
-        .iter()
-        .find(|s| s.executable && s.data.is_empty() && s.virtual_size > 0)
-    {
+    if let Some(s) = image.sections.iter().find(|s| {
+        s.executable && s.data.is_empty() && s.virtual_size > 0 && !is_msvc_textbss(image, s)
+    }) {
         return Some(format!(
             "executable section {:?} has no data in the file (filled in at run time)",
             s.name
@@ -82,10 +81,28 @@ pub(crate) fn detect(image: &Image) -> Option<String> {
     None
 }
 
+/// The empty `.textbss` MSVC's linker adds to every incrementally linked image (`/INCREMENTAL`, the Debug
+/// default): room for Edit and Continue to put recompiled functions while a debugger is attached. Only in its
+/// exact shape: named `.textbss`, the first section, writable and executable, no data in the file, and nothing
+/// the file holds (entry point, `.pdata`, exports, code pointers in data) inside it. Its code exists only under
+/// a debugger, so there's nothing in it to analyze; the rest of the image is ordinary code.
+fn is_msvc_textbss(image: &Image, s: &super::image::Section) -> bool {
+    let inside = |rva: u32| rva >= s.rva && rva - s.rva < s.virtual_size;
+    s.name == ".textbss"
+        && image.sections.iter().all(|o| o.rva >= s.rva)
+        && s.executable
+        && s.writable
+        && s.data.is_empty()
+        && !image.entry.is_some_and(inside)
+        && !image.pdata.iter().any(|f| inside(f.begin))
+        && !image.exports.iter().any(|&(rva, _)| inside(rva))
+        && !image.code_pointers.iter().any(|&rva| inside(rva))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::image::Section;
+    use crate::native::image::{RuntimeFunction, Section};
 
     fn section(name: &str, rva: u32, data: usize, executable: bool, writable: bool) -> Section {
         Section {
@@ -152,6 +169,61 @@ mod tests {
         // Negative: executable space with nothing in the file.
         let mut i = msvc_like();
         i.sections.push(section(".code2", 0x5000, 0, true, false));
+        assert!(detect(&i).unwrap().contains("no data in the file"));
+    }
+
+    /// An incrementally linked MSVC image: an empty, writable and executable `.textbss` first, then `.text`.
+    fn incremental() -> Image {
+        let mut i = msvc_like();
+        for s in &mut i.sections {
+            s.rva += 0x1000;
+        }
+        i.entry = Some(0x2010);
+        i.sections
+            .insert(0, section(".textbss", 0x1000, 0, true, true));
+        i.pdata = vec![RuntimeFunction {
+            begin: 0x2000,
+            end: 0x2010,
+            chained: false,
+            parent: None,
+        }];
+        i.exports = vec![(0x2000, "f".into())];
+        i.code_pointers = vec![0x2000];
+        i
+    }
+
+    #[test]
+    fn an_incrementally_linked_msvc_image_is_accepted() {
+        assert_eq!(detect(&incremental()), None);
+    }
+
+    #[test]
+    fn textbss_is_refused_outside_its_msvc_shape() {
+        let refused = |i: &Image| detect(i).is_some_and(|w| w.contains("\".textbss\""));
+        // Negative: something the file holds points into it (what an unpacking stub's target looks like).
+        let mut i = incremental();
+        i.entry = Some(0x1000);
+        assert!(detect(&i).is_some());
+        let mut i = incremental();
+        i.pdata[0].begin = 0x1100;
+        assert!(refused(&i));
+        let mut i = incremental();
+        i.exports.push((0x1200, "g".into()));
+        assert!(refused(&i));
+        let mut i = incremental();
+        i.code_pointers.push(0x1300);
+        assert!(refused(&i));
+        // Negative: not the first section, or not writable.
+        let mut i = incremental();
+        let t = i.sections.remove(0);
+        i.sections.push(Section { rva: 0x6000, ..t });
+        assert!(refused(&i));
+        let mut i = incremental();
+        i.sections[0].writable = false;
+        assert!(refused(&i));
+        // Negative: the same shape under another name.
+        let mut i = incremental();
+        i.sections[0].name = ".text2".into();
         assert!(detect(&i).unwrap().contains("no data in the file"));
     }
 }

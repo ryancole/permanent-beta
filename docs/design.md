@@ -191,9 +191,14 @@ Target: PE x64. Implemented in `permanent-beta-analysis/src/native` (M1, first v
 - **Refuses protected and packed binaries** before reading any code (`native/protection.rs`, §12): a section
   with a common protector's or packer's default name (UPX, VMProtect, Themida/WinLicense, Enigma, ASPack, MPRESS,
   PECompact, Petite, NsPack), an entry point in a writable and executable section, or an executable section with
-  no data in the file. No override. Every path to an analysis, a pattern or a replay goes through it. None of the
-  corpus's 106 binaries or 150 System32 executables is refused (2026-11-08). A protector that renames its
-  sections and avoids both shapes isn't caught.
+  no data in the file. One exception: the empty `.textbss` MSVC adds to incrementally linked images (the Debug
+  default; Edit and Continue's room for recompiled code), accepted only as the first section, writable and
+  executable, with no entry point, `.pdata` entry, export or code pointer in it. No override. Every path to an
+  analysis, a pattern or a replay goes through it. None of the corpus's 106 binaries or 150 System32 executables
+  is refused (2026-11-08). A protector that renames its sections and avoids both shapes isn't caught, and one
+  that names an empty section `.textbss` avoids the third. Incremental images were checked on one program only
+  (2026-11-10: two Debug builds of a 270-line app, 0 wrong matches without the PDB, its 5-byte ILT jump thunks
+  matched as functions); the corpus has no incremental variant yet. **[Validate]**
 
 - Parse headers and sections with `object`; `.pdata` and the import table are parsed by hand from section bytes.
 - Function starts: non-chained `.pdata` entries, the entry point, exports and code pointers stored in data
