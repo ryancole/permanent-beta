@@ -38,6 +38,8 @@ stop plausible-but-wrong matching logic from merging.
   same PR.
 - Thresholds are tagged `[Guess]` in the design doc until calibrated. Don't present them as validated.
 - Keep the analysis schema versioned. Bump `ANALYSIS_SCHEMA_VERSION` on breaking changes.
+- Bump `FEATURES_VERSION` (`permanent-beta-analysis/src/native/mod.rs`) on any change to what a hash or code feature
+  covers.
 - No features for unpacking, defeating integrity checks, or evading anti-cheat or anti-tamper (design §12).
 
 ## Commands
