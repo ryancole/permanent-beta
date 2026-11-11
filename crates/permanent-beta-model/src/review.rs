@@ -68,6 +68,9 @@ pub enum DecisionAction {
     Accept { new: Rva },
     /// None of these new-build functions is the counterpart (empty: confirmed there's no candidate to pick).
     Reject { rejected: Vec<Rva> },
+    /// Withdraws the item's accepted mapping onto `new`: the mapping is revoked and the item reopens. Says
+    /// nothing about whether `new` is the counterpart; a reviewer who thinks it isn't rejects it after.
+    Revoke { new: Rva },
 }
 
 /// One reviewer decision. Append-only, like mappings: a correction is a new decision, never an edit.

@@ -352,8 +352,18 @@ enum ReviewCommand {
         /// Review item id, as `review list` prints it.
         id: String,
         /// Which candidate (new-build RVA). Required when the item has more than one.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "function")]
         candidate: Option<Rva>,
+        /// Accept a new-build function that isn't among the candidates. It's verified first with the engine's
+        /// checks and policy, from the two builds' analyses, like any candidate.
+        #[arg(long, requires_all = ["old_analysis", "new_analysis"])]
+        function: Option<Rva>,
+        /// The item's old build's analysis (with --function).
+        #[arg(long)]
+        old_analysis: Option<PathBuf>,
+        /// The item's new build's analysis (with --function).
+        #[arg(long)]
+        new_analysis: Option<PathBuf>,
         /// Who decided. Recorded with the decision and the mapping.
         #[arg(long)]
         reviewer: String,
@@ -367,6 +377,17 @@ enum ReviewCommand {
     },
     /// Reject every candidate of an item: none is the counterpart. They're never proposed for it again.
     Reject {
+        id: String,
+        #[arg(long)]
+        reviewer: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = ".pbeta/store.json")]
+        store: PathBuf,
+    },
+    /// Withdraw the mapping a reviewer accepted for an item: it's revoked, repair stops using it, and the item
+    /// reopens. Doesn't reject the function: reject the item after if it isn't the counterpart.
+    Revoke {
         id: String,
         #[arg(long)]
         reviewer: String,
@@ -539,23 +560,34 @@ fn run(cli: Cli) -> Result<u8> {
             ReviewCommand::Accept {
                 id,
                 candidate,
+                function,
+                old_analysis,
+                new_analysis,
                 reviewer,
                 note,
                 force,
                 store,
-            } => cmd_review_decide(
-                &store,
-                &id,
-                &reviewer,
-                Choice::Accept { candidate, force },
-                note,
-            ),
+            } => {
+                let choice = match (function, old_analysis, new_analysis) {
+                    (Some(f), Some(o), Some(n)) => {
+                        verified_choice(&store, &id, f, &o, &n, &reviewer, note.as_deref(), force)?
+                    }
+                    _ => Choice::Accept { candidate, force },
+                };
+                cmd_review_decide(&store, &id, &reviewer, choice, note)
+            }
             ReviewCommand::Reject {
                 id,
                 reviewer,
                 note,
                 store,
             } => cmd_review_decide(&store, &id, &reviewer, Choice::Reject, note),
+            ReviewCommand::Revoke {
+                id,
+                reviewer,
+                note,
+                store,
+            } => cmd_review_decide(&store, &id, &reviewer, Choice::Revoke, note),
         },
     }
 }
@@ -1643,12 +1675,78 @@ fn cmd_review_list(store: &Path, all: bool) -> Result<u8> {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
+                DecisionAction::Revoke { new } => format!("revoked the mapping onto {new}"),
             };
             println!("  decision: {what} by {}", d.reviewer);
         }
         println!();
     }
     Ok(if open > 0 { EXIT_NEEDS_REVIEW } else { EXIT_OK })
+}
+
+/// `review accept --function`: the reviewer's function verified like any candidate (the engine's checks and the
+/// normal policy, this pair's match as neighbour context), for the store to record with its report. Prints the
+/// verdict and every check, so the reviewer sees what they accept.
+#[allow(clippy::too_many_arguments)]
+fn verified_choice(
+    store: &Path,
+    id: &str,
+    function: Rva,
+    old_analysis: &Path,
+    new_analysis: &Path,
+    reviewer: &str,
+    note: Option<&str>,
+    force: bool,
+) -> Result<Choice> {
+    use permanent_beta_model::{Candidate, Evidence, evidence_kind};
+    let store = JsonFileStore::open(store)?;
+    let item = store
+        .review_items()
+        .into_iter()
+        .find(|i| i.id == id)
+        .with_context(|| format!("no review item with id {id}"))?;
+    let old_rva = item
+        .old
+        .with_context(|| format!("review item {id} has no old function"))?;
+    anyhow::ensure!(
+        !item.candidates.iter().any(|c| c.candidate.new == function),
+        "{function} is one of the candidates of {id}; accept it with --candidate"
+    );
+    let (old, new) = (export::load(old_analysis)?, export::load(new_analysis)?);
+    anyhow::ensure!(
+        old.build.id == item.from_build && new.build.id == item.to_build,
+        "{id} is for {} -> {}, but the analyses are of {} -> {}",
+        item.from_build,
+        item.to_build,
+        old.build.id,
+        new.build.id
+    );
+    let candidate = Candidate {
+        old: old_rva,
+        new: function,
+        source: CandidateSource::Human {
+            reviewer: reviewer.to_owned(),
+        },
+        score: 0.0,
+        evidence: vec![Evidence {
+            kind: evidence_kind::REVIEWER.to_owned(),
+            detail: note.unwrap_or("named by the reviewer").to_owned(),
+        }],
+    };
+    let report = Engine::with_defaults()
+        .verify_candidate(&old, &new, &candidate, Criticality::Normal)?
+        .with_context(|| format!("{function} isn't a function in {}", new_analysis.display()))?;
+    println!(
+        "{old_rva} -> {function}: verification {}",
+        verdict_str(report.verdict)
+    );
+    for c in &report.checks {
+        println!("  {:<16} {:?}: {}", c.check, c.outcome, c.detail);
+    }
+    Ok(Choice::AcceptVerified {
+        report: Box::new(report),
+        force,
+    })
 }
 
 fn cmd_review_decide(
@@ -1673,6 +1771,10 @@ fn cmd_review_decide(
         DecisionAction::Reject { rejected } => println!(
             "{id}: rejected {} candidate(s) for {}; they won't be proposed again",
             rejected.len(),
+            d.old
+        ),
+        DecisionAction::Revoke { new } => println!(
+            "{id}: revoked {} -> {new}; the item is open again (reject it if {new} isn't the counterpart)",
             d.old
         ),
     }

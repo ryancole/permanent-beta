@@ -426,6 +426,7 @@ pub fn explain(item: &ReviewItem, decisions: &[ReviewDecision]) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            DecisionAction::Revoke { new } => format!("revoked the accepted mapping onto {new}"),
         };
         out.push(format!("Decision: {what} by {}.", d.reviewer));
     }

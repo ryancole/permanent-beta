@@ -1008,8 +1008,14 @@ Principles:
   already claims is refused (one-to-one). *Reject* records every listed candidate as "not the counterpart" and
   revokes any live mapping onto them. `repair --store` honors both: a reviewer's mapping resolves its hook, and a
   rejected pair is never used again, as the candidate or as an alternative. A rejected item stays resolved while
-  a rerun offers nothing new and reopens when a new candidate appears. Not yet: revoking a reviewer's own
-  mapping, and accepting a function that isn't among the candidates (it would need its own verification).
+  a rerun offers nothing new and reopens when a new candidate appears. *Revoke* (2026-11-10) withdraws the
+  mapping a reviewer accepted for an item: the mapping is revoked, repair stops using it and the item reopens; it
+  isn't a rejection, so the function can be proposed again. Only the item's last decision can be revoked, and only
+  while its mapping is live (not superseded). *Accept a function outside the candidates* (2026-11-10, `review
+  accept --function` with both builds' analyses): the CLI verifies the pair with `Engine::verify_candidate`
+  (source `human`, evidence kind `reviewer`, which implies no check), prints every check, and the store records
+  it like a candidate's report, with the same `--force` rule for a rejected verdict and the same one-to-one check;
+  a function a reviewer rejected for that item needs `--force` too.
 
 ### 9.2 Storage backends **[Provisional]**
 

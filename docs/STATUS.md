@@ -4,7 +4,13 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **`features_version`** (design §4.1). Native analyses name the normalizer that computed their
+Latest work: **review revoke and accepting a function outside the candidates** (design §9.1). `pbeta review
+revoke` withdraws a reviewer's accepted mapping and reopens the item; `pbeta review accept --function <rva>
+--old-analysis --new-analysis` verifies a function the reviewer names with the engine's checks before recording
+it. Not built, on purpose: the per-project setting that would let policy-passing AI proposals through without a
+reviewer (design §11.2), which CLAUDE.md's rules for `pbeta propose` and the MCP server rule out.
+
+Before that: **`features_version`** (design §4.1). Native analyses name the normalizer that computed their
 hashes (`native-1`), and the engine refuses to match, repair or verify two analyses that disagree on it (or where
 only one has it), instead of comparing hashes that mean different things. Bump `FEATURES_VERSION` on any change to
 what a hash or code feature covers. Corpus unchanged (fixture gates pass, 0 wrong; replay as below).

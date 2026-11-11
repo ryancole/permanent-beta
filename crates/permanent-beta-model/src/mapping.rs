@@ -44,6 +44,9 @@ pub mod evidence_kind {
     /// An AI proposer's rationale (design §8). Set by the server receiving the proposal, never by the model, so
     /// a model can't label its guess as a deterministic kind. Implies no check: every check counts.
     pub const AI: &str = "ai";
+    /// A reviewer named the function by hand (`pbeta review accept --function`). Implies no check: every check
+    /// counts.
+    pub const REVIEWER: &str = "reviewer";
 }
 
 /// A proposed old→new function correspondence. Not accepted until verified.

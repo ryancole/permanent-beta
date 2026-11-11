@@ -6,7 +6,7 @@
 
 use permanent_beta_model::{
     BuildId, CheckOutcome, Decider, DecisionAction, Mapping, MappingStatus, PriorDecisions,
-    ReviewDecision, ReviewItem, ReviewStatus, Rva, Verdict,
+    ReviewDecision, ReviewItem, ReviewStatus, Rva, Verdict, VerificationReport,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -28,13 +28,24 @@ pub enum StoreError {
 }
 
 /// What a reviewer chose for a review item.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Choice {
     /// Accept a candidate: the given one, or the only one. `force` allows a candidate that verification
     /// rejected.
     Accept { candidate: Option<Rva>, force: bool },
+    /// Accept a function that isn't among the item's candidates, which the caller verified with the engine's
+    /// checks and policy (`Engine::verify_candidate`): the report is recorded with the mapping like a
+    /// candidate's. Refused for one of the candidates (use `Accept`), for another old function, and, unless
+    /// `force`, for a function a reviewer rejected for this item; `force` also allows a report verification
+    /// rejected, as for `Accept`.
+    AcceptVerified {
+        report: Box<VerificationReport>,
+        force: bool,
+    },
     /// None of the item's candidates is the counterpart.
     Reject,
+    /// Withdraw the reviewer-accepted mapping that resolved the item: it's revoked and the item reopens.
+    Revoke,
 }
 
 pub trait MappingStore {
@@ -123,7 +134,7 @@ impl JsonFileStore {
             .filter(|d| d.review_id == review_id)
             .filter_map(|d| match &d.action {
                 DecisionAction::Reject { rejected } => Some(rejected.iter().copied()),
-                DecisionAction::Accept { .. } => None,
+                DecisionAction::Accept { .. } | DecisionAction::Revoke { .. } => None,
             })
             .flatten()
             .collect()
@@ -143,9 +154,11 @@ impl JsonFileStore {
         if reviewer.trim().is_empty() {
             return refuse("a reviewer name is required".into());
         }
-        if item.status == ReviewStatus::Resolved {
+        let resolved = item.status == ReviewStatus::Resolved;
+        if resolved && choice != Choice::Revoke {
             return refuse(format!(
-                "review item {} is already resolved; decisions are append-only",
+                "review item {} is already resolved; decisions are append-only (revoke its accepted mapping \
+                 to reopen it)",
                 item.id
             ));
         }
@@ -170,10 +183,67 @@ impl JsonFileStore {
             decided_at,
         };
 
-        match choice {
+        let (report, force) = match choice {
             Choice::Reject => {
                 let rejected = item.candidates.iter().map(|r| r.candidate.new).collect();
-                Ok((decision(DecisionAction::Reject { rejected }), None))
+                return Ok((decision(DecisionAction::Reject { rejected }), None));
+            }
+            Choice::Revoke => {
+                if !resolved {
+                    return refuse(format!(
+                        "review item {} is open: there's no decision to revoke",
+                        item.id
+                    ));
+                }
+                let last = self
+                    .data
+                    .decisions
+                    .iter()
+                    .rev()
+                    .find(|d| d.review_id == item.id);
+                let Some(DecisionAction::Accept { new }) = last.map(|d| &d.action) else {
+                    return refuse(format!(
+                        "review item {} was resolved by rejecting; only an accepted mapping can be revoked",
+                        item.id
+                    ));
+                };
+                let live = self.data.mappings.iter().any(|m| {
+                    m.status == MappingStatus::Accepted
+                        && matches!(m.decided_by, Decider::Human { .. })
+                        && m.from_build == item.from_build
+                        && m.to_build == item.to_build
+                        && m.old == old
+                        && m.new == *new
+                });
+                if !live {
+                    return refuse(format!(
+                        "the mapping {old} -> {new} accepted for {} is no longer live (superseded or revoked)",
+                        item.id
+                    ));
+                }
+                return Ok((decision(DecisionAction::Revoke { new: *new }), None));
+            }
+            Choice::AcceptVerified { report, force } => {
+                let new = report.candidate.new;
+                if report.candidate.old != old {
+                    return refuse(format!(
+                        "the verified pair is for {}, but review item {} is about {old}",
+                        report.candidate.old, item.id
+                    ));
+                }
+                if item.candidates.iter().any(|r| r.candidate.new == new) {
+                    return refuse(format!(
+                        "{new} is one of the candidates of {}; accept it with --candidate",
+                        item.id
+                    ));
+                }
+                if self.rejected_for(&item.id).contains(&new) && !force {
+                    return refuse(format!(
+                        "{new} was rejected for {} by a reviewer; pass --force to accept it anyway",
+                        item.id
+                    ));
+                }
+                (*report, force)
             }
             Choice::Accept { candidate, force } => {
                 let report = match (candidate, item.candidates.as_slice()) {
@@ -204,48 +274,50 @@ impl JsonFileStore {
                         ));
                     }
                 };
-                let new = report.candidate.new;
-                if report.verdict == Verdict::Rejected && !force {
-                    let failing: Vec<String> = report
-                        .checks
-                        .iter()
-                        .filter(|c| c.outcome == CheckOutcome::Fail)
-                        .map(|c| format!("{}: {}", c.check, c.detail))
-                        .collect();
-                    return refuse(format!(
-                        "verification rejected {new} ({}); pass --force to accept it anyway",
-                        failing.join("; ")
-                    ));
-                }
-                if let Some(other) = self.data.mappings.iter().find(|m| {
-                    m.status == MappingStatus::Accepted
-                        && m.from_build == item.from_build
-                        && m.to_build == item.to_build
-                        && m.new == new
-                        && m.old != old
-                }) {
-                    return refuse(format!(
-                        "{new} is already the accepted counterpart of {}; a function maps one-to-one",
-                        other.old
-                    ));
-                }
-                let mapping = Mapping {
-                    from_build: item.from_build.clone(),
-                    to_build: item.to_build.clone(),
-                    old,
-                    new,
-                    decided_by: Decider::Human {
-                        reviewer: reviewer.to_owned(),
-                    },
-                    source: report.candidate.source.clone(),
-                    score: report.candidate.score,
-                    evidence: report.candidate.evidence.clone(),
-                    checks: report.checks.clone(),
-                    status: MappingStatus::Accepted,
-                };
-                Ok((decision(DecisionAction::Accept { new }), Some(mapping)))
+                (report.clone(), force)
             }
+        };
+
+        let new = report.candidate.new;
+        if report.verdict == Verdict::Rejected && !force {
+            let failing: Vec<String> = report
+                .checks
+                .iter()
+                .filter(|c| c.outcome == CheckOutcome::Fail)
+                .map(|c| format!("{}: {}", c.check, c.detail))
+                .collect();
+            return refuse(format!(
+                "verification rejected {new} ({}); pass --force to accept it anyway",
+                failing.join("; ")
+            ));
         }
+        if let Some(other) = self.data.mappings.iter().find(|m| {
+            m.status == MappingStatus::Accepted
+                && m.from_build == item.from_build
+                && m.to_build == item.to_build
+                && m.new == new
+                && m.old != old
+        }) {
+            return refuse(format!(
+                "{new} is already the accepted counterpart of {}; a function maps one-to-one",
+                other.old
+            ));
+        }
+        let mapping = Mapping {
+            from_build: item.from_build.clone(),
+            to_build: item.to_build.clone(),
+            old,
+            new,
+            decided_by: Decider::Human {
+                reviewer: reviewer.to_owned(),
+            },
+            source: report.candidate.source.clone(),
+            score: report.candidate.score,
+            evidence: report.candidate.evidence.clone(),
+            checks: report.checks.clone(),
+            status: MappingStatus::Accepted,
+        };
+        Ok((decision(DecisionAction::Accept { new }), Some(mapping)))
     }
 }
 
@@ -331,13 +403,32 @@ impl MappingStore for JsonFileStore {
                 m.status = MappingStatus::Revoked;
             }
         }
+        let reopen = if let DecisionAction::Revoke { new } = &decision.action {
+            for m in self.data.mappings.iter_mut().filter(|m| {
+                m.status == MappingStatus::Accepted
+                    && matches!(m.decided_by, Decider::Human { .. })
+                    && m.from_build == decision.from_build
+                    && m.to_build == decision.to_build
+                    && m.old == decision.old
+                    && m.new == *new
+            }) {
+                m.status = MappingStatus::Revoked;
+            }
+            true
+        } else {
+            false
+        };
         for i in self
             .data
             .review_queue
             .iter_mut()
             .filter(|i| i.id == review_id)
         {
-            i.status = ReviewStatus::Resolved;
+            i.status = if reopen {
+                ReviewStatus::Open
+            } else {
+                ReviewStatus::Resolved
+            };
         }
         self.data.decisions.push(decision.clone());
         self.save()?;
@@ -371,7 +462,7 @@ impl MappingStore for JsonFileStore {
                     DecisionAction::Reject { rejected } => {
                         Some(rejected.iter().map(move |&n| (d.old, n)))
                     }
-                    DecisionAction::Accept { .. } => None,
+                    DecisionAction::Accept { .. } | DecisionAction::Revoke { .. } => None,
                 })
                 .flatten()
                 .collect(),
@@ -642,6 +733,191 @@ mod tests {
             .unwrap();
         let all = store.mappings(&BuildId("a".into()), &BuildId("b".into()));
         assert_eq!(all[0].status, MappingStatus::Revoked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoking_an_accepted_mapping_reopens_the_item() {
+        let (mut store, dir) = temp_store();
+        store
+            .enqueue_review(&[item(vec![report(0x20, Verdict::NeedsReview)])])
+            .unwrap();
+        // Negative: nothing to revoke on an open item.
+        assert!(
+            store
+                .decide("H:a:b", "ryan", Choice::Revoke, None, 6)
+                .is_err()
+        );
+        store
+            .decide("H:a:b", "ryan", accept(None), None, 7)
+            .unwrap();
+        let d = store
+            .decide("H:a:b", "ryan", Choice::Revoke, Some("wrong one".into()), 8)
+            .unwrap();
+        assert_eq!(d.action, DecisionAction::Revoke { new: Rva(0x20) });
+
+        let reopened = JsonFileStore::open(store.path()).unwrap();
+        let (a, b) = (BuildId("a".into()), BuildId("b".into()));
+        assert_eq!(reopened.mappings(&a, &b)[0].status, MappingStatus::Revoked);
+        let prior = reopened.prior_decisions(&a, &b);
+        assert!(prior.accepted.is_empty(), "repair no longer uses it");
+        // Negative: revoking isn't rejecting; the candidate can be proposed and accepted again.
+        assert!(prior.rejected.is_empty());
+        assert_eq!(reopened.review_items()[0].status, ReviewStatus::Open);
+        let mut store = reopened;
+        store
+            .decide("H:a:b", "ryan", accept(None), None, 9)
+            .unwrap();
+        // Negative: the same mapping can't be revoked twice.
+        store
+            .decide("H:a:b", "ryan", Choice::Revoke, None, 10)
+            .unwrap();
+        assert!(
+            store
+                .decide("H:a:b", "ryan", Choice::Revoke, None, 11)
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rejected_item_or_a_superseded_mapping_cant_be_revoked() {
+        let (mut store, dir) = temp_store();
+        store
+            .enqueue_review(&[item(vec![report(0x20, Verdict::NeedsReview)])])
+            .unwrap();
+        store
+            .decide("H:a:b", "ryan", Choice::Reject, None, 7)
+            .unwrap();
+        let why = store
+            .decide("H:a:b", "ryan", Choice::Revoke, None, 8)
+            .unwrap_err();
+        assert!(why.to_string().contains("rejecting"), "{why}");
+
+        let (mut store, dir2) = temp_store();
+        store
+            .enqueue_review(&[item(vec![report(0x20, Verdict::NeedsReview)])])
+            .unwrap();
+        store
+            .decide("H:a:b", "ryan", accept(None), None, 7)
+            .unwrap();
+        // A later engine mapping for the same old function supersedes the reviewer's.
+        store.put_mappings(&[mapping(0x10, 0x30)]).unwrap();
+        let why = store
+            .decide("H:a:b", "ryan", Choice::Revoke, None, 8)
+            .unwrap_err();
+        assert!(why.to_string().contains("no longer live"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    fn verified(old: u64, new: u64, verdict: Verdict) -> Choice {
+        let mut r = report(new, verdict);
+        r.candidate.old = Rva(old);
+        Choice::AcceptVerified {
+            report: Box::new(r),
+            force: false,
+        }
+    }
+
+    #[test]
+    fn accepting_a_verified_function_outside_the_candidates() {
+        let (mut store, dir) = temp_store();
+        store
+            .enqueue_review(&[item(vec![report(0x20, Verdict::NeedsReview)])])
+            .unwrap();
+        // Negative: a candidate goes through Accept; a pair for another old function, or one verification
+        // rejected, is refused.
+        assert!(
+            store
+                .decide(
+                    "H:a:b",
+                    "ryan",
+                    verified(0x10, 0x20, Verdict::NeedsReview),
+                    None,
+                    1
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .decide(
+                    "H:a:b",
+                    "ryan",
+                    verified(0x11, 0x40, Verdict::NeedsReview),
+                    None,
+                    2
+                )
+                .is_err()
+        );
+        let why = store
+            .decide(
+                "H:a:b",
+                "ryan",
+                verified(0x10, 0x40, Verdict::Rejected),
+                None,
+                3,
+            )
+            .unwrap_err();
+        assert!(why.to_string().contains("--force"), "{why}");
+        let d = store
+            .decide(
+                "H:a:b",
+                "ryan",
+                verified(0x10, 0x40, Verdict::NeedsReview),
+                None,
+                4,
+            )
+            .unwrap();
+        assert_eq!(d.action, DecisionAction::Accept { new: Rva(0x40) });
+        let prior = store.prior_decisions(&BuildId("a".into()), &BuildId("b".into()));
+        assert_eq!(
+            (prior.accepted[0].old, prior.accepted[0].new),
+            (Rva(0x10), Rva(0x40))
+        );
+        assert_eq!(
+            prior.accepted[0].checks.len(),
+            1,
+            "keeps its verification report"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_function_rejected_for_the_item_needs_force() {
+        let (mut store, dir) = temp_store();
+        store
+            .enqueue_review(&[item(vec![report(0x20, Verdict::NeedsReview)])])
+            .unwrap();
+        store
+            .decide("H:a:b", "ryan", Choice::Reject, None, 1)
+            .unwrap();
+        // The rerun offers 0x40, which the reviewer then rejects too.
+        store
+            .enqueue_review(&[item(vec![report(0x40, Verdict::NeedsReview)])])
+            .unwrap();
+        store
+            .decide("H:a:b", "ryan", Choice::Reject, None, 2)
+            .unwrap();
+        store
+            .enqueue_review(&[item(vec![report(0x50, Verdict::NeedsReview)])])
+            .unwrap();
+        // Negative: 0x40 was rejected for this item.
+        let why = store
+            .decide(
+                "H:a:b",
+                "ryan",
+                verified(0x10, 0x40, Verdict::NeedsReview),
+                None,
+                3,
+            )
+            .unwrap_err();
+        assert!(why.to_string().contains("rejected"), "{why}");
+        let mut forced = verified(0x10, 0x40, Verdict::NeedsReview);
+        if let Choice::AcceptVerified { force, .. } = &mut forced {
+            *force = true;
+        }
+        store.decide("H:a:b", "ryan", forced, None, 4).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

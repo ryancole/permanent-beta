@@ -78,7 +78,10 @@ cargo run -p permanent-beta-cli -- review accept ChecksumBlock:111111111111:2222
 `--force` is required for one that verification rejected) and records a mapping decided by the reviewer.
 `review reject` says none of the candidates is the counterpart: they're never proposed for that function again,
 and the item stays closed until new candidates appear. The hook itself stays unresolved until its manifest entry
-is fixed by hand. Decisions are append-only.
+is fixed by hand. `review accept --function <rva> --old-analysis <v1> --new-analysis <v2>` accepts a function that
+isn't among the candidates: it's verified first with the engine's checks, printed, and refused like a candidate
+if verification rejects it (without `--force`). `review revoke` withdraws a mapping a reviewer accepted: it's
+revoked, repair stops using it, and the item reopens (it doesn't reject the function). Decisions are append-only.
 
 ## Exit codes
 
