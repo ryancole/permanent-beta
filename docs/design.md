@@ -688,7 +688,8 @@ isn't enough for real code. `build_tree` also reads old-image addresses recorded
 memory they read, which the emulator checks like any other access, and a build may inline them or call them a
 different number of times without behaving differently. Recorded calls to them are skipped when matching the
 recorded sequence. Up to 16 MiB each **[Guess]**. `memcmp` and `strcmp` aren't: only their result's sign is
-defined, and a caller may keep the value.
+defined, and a caller may keep the value. Since 2026-11-10 also `_rotl`, `_rotr`, `_rotl64` and `_rotr64` (shift
+modulo the width), which /Od builds call instead of inlining: zstd /Od's xxHash and decoder stopped at `_rotl64`.
 
 **Pointers inside structs (2026-11-08).** The recorder follows pointers by type, `pointer_depth` levels from the
 arguments (`pbeta harness-spec --pointer-depth`, default 2 **[Guess]**; 0 turns it off, and a spec without the key
@@ -808,7 +809,9 @@ first measurement on real code. The first run replayed 1 of 16 hooks; what it to
   by field, same-size integers and enums as the same bytes (§7.3 *Layout translation*);
 - the spec carries the layouts of structs held by value; `…Capacity` is a length name and a sized buffer is
   captured up to 256 KiB **[Guess]** (a zstd block is 128 KiB);
-- the recorder: 256 import thunks (zstd has 112 imports; with 64 no case had its imports recorded), whole heap
+- the recorder: 256 import thunks (zstd has 112 imports; with 64 no case had its imports recorded), at most 1024
+  import calls kept per case **[Guess]** (past that the case keeps none and says `imports_recorded = false`: zstd /Od's
+  compression wrote 1.9 million blobs over 6 hours of recording without it), whole heap
   blocks up to 1 MiB **[Guess]** (zstd's stream buffers are ~260 KiB), a 64 KiB window from an `array` pointer into
   a larger block, never past its end, and untyped regions an `array` capture overlaps merged into one (`count` and
   `normalizedCounter` in one workspace); and a pointer one past a heap block's end also captures that block

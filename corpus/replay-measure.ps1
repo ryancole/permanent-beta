@@ -16,6 +16,11 @@
   passes fails the measurement, like a correct pair failing. -SkipOthers leaves the control out (it's most of the
   run time).
 
+  Speed: hooks are replayed -HookParallel at a time, and each replay's control splits the cores between them
+  (PBETA_REPLAY_THREADS, unless set). A recording is reused when nothing it depends on changed (the hook DLL, the
+  launcher, the spec, the hooks, the old binary, the input and the run's arguments: `key.txt` in the recording);
+  -Rerecord records anyway. corpus/verify.ps1 runs every measurement at once.
+
   Local only, like ghidra-diff.ps1. Needs the corpus built (build-projects.ps1, the project) and the hook DLL and
   launcher (build-hooks.ps1). Writes target/replay/<project>/<flags>-<old>-<new>/: the spec, the recordings and
   replay.json with every case's outcome.
@@ -32,7 +37,9 @@ param(
     [string] $Old,
     [string] $New,
     [switch] $NoBuild,
-    [switch] $SkipOthers
+    [switch] $SkipOthers,
+    [switch] $Rerecord,
+    [int] $HookParallel = 4
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
@@ -87,9 +94,24 @@ $runs = @(
     @{ Name = 'compress'; Args = @($p.Compress | ForEach-Object { & $fill $_ }); Stdout = (& $fill $p.CompressStdout) },
     @{ Name = 'decompress'; Args = @($p.Decompress | ForEach-Object { & $fill $_ }); Stdout = (& $fill $p.DecompressStdout) }
 )
+# What a recording depends on: when none of it changed, the recording is reused.
+function Get-RecordingKey($run) {
+    @(
+        (Get-FileHash "$bin\hookdll.dll").Hash, (Get-FileHash "$bin\launcher.exe").Hash,
+        (Get-FileHash "$out\spec.toml").Hash, (Get-FileHash "$out\hooks.toml").Hash,
+        (Get-FileHash "$builds\$Old\$exe.exe").Hash, (Get-FileHash $inputFile).Hash, ($run.Args -join ' ')
+    ) -join "`n"
+}
 $recs = @()
 foreach ($r in $runs) {
     $rec = "$out\rec-$($r.Name)"
+    $key = Get-RecordingKey $r
+    if (-not $Rerecord -and (Test-Path "$rec\key.txt") -and (Test-Path $r.Stdout) -and
+        ([IO.File]::ReadAllText("$rec\key.txt") -eq $key)) {
+        Write-Host "reusing the $($r.Name) recording (nothing it depends on changed)"
+        $recs += $rec
+        continue
+    }
     Remove-Item -Recurse -Force $rec -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $rec | Out-Null
     $env:PBETA_RECORD = $rec
@@ -100,6 +122,7 @@ foreach ($r in $runs) {
     } finally {
         Remove-Item Env:PBETA_RECORD, Env:PBETA_SPEC
     }
+    [IO.File]::WriteAllText("$rec\key.txt", $key)
     $recs += $rec
 }
 if ((Get-FileHash $inputFile).Hash -ne (Get-FileHash "$out\out.txt").Hash) { throw 'the round trip under the recorder changed the data' }
@@ -117,15 +140,33 @@ function Get-MapRvas([string] $map) {
 $oldRva = Get-MapRvas "$builds\$Old\$exe.map"
 $newRva = Get-MapRvas "$builds\$New\$exe.map"
 $caseArgs = @(); foreach ($r in $recs) { $caseArgs += @('--cases', $r) }
+$names = @(Get-Content "$out\hooks.toml" | Select-String '^name = "(.+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+# Each replay's control gets a share of the cores (one emulator per thread).
+if (-not $env:PBETA_REPLAY_THREADS) {
+    $env:PBETA_REPLAY_THREADS = [Math]::Max(1, [int]([Environment]::ProcessorCount / [Math]::Max(1, $HookParallel)))
+}
+$replay = @{
+    Pbeta = $pbeta; Cases = $caseArgs; Binary = "$builds\$New\$exe.exe"; NewJson = "$out\$New.json"
+    OldJson = "$out\$Old.json"; Others = -not $SkipOthers; OldRva = $oldRva; NewRva = $newRva; Names = $names
+}
+$results = @(0..($names.Count - 1) | ForEach-Object -ThrottleLimit ([Math]::Max(1, $HookParallel)) -Parallel {
+        $a = $using:replay
+        $h = $a.Names[$_]
+        $o = $null
+        if ($a.NewRva[$h]) {
+            $j = & $a.Pbeta (@('replay') + $a.Cases + @('--binary', $a.Binary, '--old-rva', $a.OldRva[$h],
+                    '--new-rva', $a.NewRva[$h], '--new-analysis', $a.NewJson, '--old-analysis', $a.OldJson, '--json') +
+                $(if ($a.Others) { @('--others') } else { @() }))
+            $o = ($j | Out-String) | ConvertFrom-Json
+        }
+        [pscustomobject]@{ Index = $_; Hook = $h; Result = $o }
+    } | Sort-Object Index)
 $rows = @()
 $all = @()
-$names = Get-Content "$out\hooks.toml" | Select-String '^name = "(.+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value }
-foreach ($h in $names) {
-    if (-not $newRva[$h]) { $rows += [pscustomobject]@{ Hook = $h; Outcome = "not in $New" }; continue }
-    $j = & $pbeta (@('replay') + $caseArgs + @('--binary', "$builds\$New\$exe.exe", '--old-rva', $oldRva[$h],
-            '--new-rva', $newRva[$h], '--new-analysis', "$out\$New.json", '--old-analysis', "$out\$Old.json", '--json') +
-        $(if ($SkipOthers) { @() } else { @('--others') }))
-    $o = ($j | Out-String) | ConvertFrom-Json
+foreach ($r in $results) {
+    $h = $r.Hook
+    $o = $r.Result
+    if (-not $o) { $rows += [pscustomobject]@{ Hook = $h; Outcome = "not in $New" }; continue }
     $all += [pscustomobject]@{ Hook = $h; Result = $o }
     $rows += [pscustomobject]@{
         Hook         = $h

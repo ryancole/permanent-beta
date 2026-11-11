@@ -328,6 +328,7 @@ constexpr int kImportThunks = 256;
 constexpr int kImportStackArgs = 8;
 constexpr size_t kImportBlock = 512;
 constexpr size_t kImportInner = 256;
+constexpr size_t kMaxImportCalls = 1024;  // per case; past it the case drops its import calls
 
 // Must match record_thunk.asm.
 struct RecordFrame {
@@ -637,6 +638,8 @@ struct PendingGlobal {
 //
 // A case says `imports_recorded` only when every import of the app was patched (none by ordinal, no more than
 // kImportThunks): otherwise its import calls might be incomplete, and a replay mustn't stand in for any.
+// Nor when the call made more than kMaxImportCalls import calls: the case keeps none of them, so it stays small and
+// a replay that reaches an import is inconclusive.
 
 struct Snap {
     unsigned long long address = 0;
@@ -662,6 +665,7 @@ struct RecordCall {
     std::vector<PendingRegion> regions;
     std::vector<PendingGlobal> globals;
     std::vector<ImportRecord> imports;
+    bool imports_overflow = false;  // more than kMaxImportCalls: imports dropped
 };
 
 struct ImpSite {
@@ -1045,7 +1049,8 @@ void finish_case(RecordCall* call, const RecordFrame* f) {
                 ",\"before\":" + quoted(write_blob(g.before)) + ",\"after\":" + quoted(write_blob(after)) + "}";
         first = false;
     }
-    body += std::string("],\"imports_recorded\":") + (g_imports_complete ? "true" : "false") + ",\"imports\":[";
+    body += std::string("],\"imports_recorded\":") + (g_imports_complete && !call->imports_overflow ? "true" : "false") +
+            ",\"imports\":[";
     for (size_t i = 0; i < call->imports.size(); i++) {
         body += (i ? "," : "") + import_json(call->imports[i]);
     }
@@ -1224,7 +1229,11 @@ extern "C" void pbeta_record_after(RecordFrame* f) {
 extern "C" void* pbeta_import_before(RecordFrame* f) {
     ImpSite& site = g_imp_sites[f->slot % kImportThunks];
     f->call = nullptr;
-    if (t_active.empty()) {
+    bool wanted = false;
+    for (const RecordCall* call : t_active) {
+        wanted = wanted || !call->imports_overflow;
+    }
+    if (!wanted) {
         return site.real;
     }
     auto* r = new ImportRecord;
@@ -1268,6 +1277,14 @@ extern "C" void pbeta_import_after(RecordFrame* f) {
         }
     }
     for (RecordCall* call : t_active) {
+        if (call->imports_overflow) {
+            continue;
+        }
+        if (call->imports.size() >= kMaxImportCalls) {
+            call->imports_overflow = true;
+            std::vector<ImportRecord>().swap(call->imports);
+            continue;
+        }
         call->imports.push_back(*r);
     }
     delete r;

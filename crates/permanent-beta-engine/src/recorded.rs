@@ -212,8 +212,12 @@ impl RecordedCasesRunner {
             .and_then(|f| f.normalized_hash.as_deref());
         let targets: Vec<&FunctionFeatures> =
             new.functions.iter().filter(|f| f.rva != new_rva).collect();
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
+        // PBETA_REPLAY_THREADS caps it when several replays share the machine (corpus/replay-measure.ps1).
+        let threads = std::env::var("PBETA_REPLAY_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
             .min(targets.len().max(1));
         let chunk = targets.len().div_ceil(threads).max(1);
         let outcomes: Vec<CheckOutcome> = std::thread::scope(|s| {

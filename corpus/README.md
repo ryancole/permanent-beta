@@ -78,3 +78,13 @@ hooks, and diffs the call traces. See [hooks/README.md](hooks/README.md).
 ```bash
 pwsh corpus/build-hooks.ps1 -Run
 ```
+
+## Running every measurement
+
+`pwsh corpus/verify.ps1` builds once (pbeta and pbeta-corpus with the emulator, the hook DLL and sample apps, the
+fixtures), then runs the replay measurements (zlib and zstd, /O2 and /Od), the hook loop with replay and the
+fixture scorecards as parallel jobs, and prints one summary (logs in `target/verify/`). `-Quick` leaves out the
+wrong-target control, most of the replay time, for iterating; run it without `-Quick` before a commit. `-Only
+zstd-o2,fixtures` runs some of the jobs. Recordings are reused while nothing they depend on changed (`-Rerecord`
+records anyway), and dependencies are built optimized even in debug builds (`[profile.dev.package."*"]` in the
+workspace `Cargo.toml`), since the emulator is most of the time.

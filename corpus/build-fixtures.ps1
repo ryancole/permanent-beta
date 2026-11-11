@@ -19,7 +19,10 @@ param(
     [string[]] $Fixture,
     [string[]] $Flags,
     # After building, analyze, match and score each fixture against its expected.toml (fails on a gate failure).
-    [switch] $Score
+    [switch] $Score,
+    # Use the already built target/debug/pbeta-corpus.exe instead of `cargo run` (corpus/verify.ps1 builds it once,
+    # so parallel jobs never relink a binary another one is running).
+    [switch] $NoBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +33,14 @@ $outRoot = Join-Path $repo 'target/fixtures'
 $fixtureCl = @('/EHsc', '/permissive-', '/W4')
 
 Import-VsDevEnvironment
+
+function Invoke-Corpus([string[]] $arguments) {
+    if ($NoBuild) {
+        Invoke-Native (Join-Path $repo 'target\debug\pbeta-corpus.exe') $arguments
+    } else {
+        Invoke-Native 'cargo' (@('run', '-q', '-p', 'permanent-beta-corpus', '--') + $arguments)
+    }
+}
 
 $fixtureNames = if ($Fixture) { $Fixture } else { Get-ChildItem $fixturesDir -Directory | ForEach-Object Name }
 # PGO needs a training workload, which the fixtures don't have.
@@ -51,7 +62,7 @@ foreach ($name in $fixtureNames) {
                     "$out\fixture.obj", "/OUT:$out\fixture.exe", "/PDB:$out\fixture.pdb", "/MAP:$out\fixture.map"))
         }
 
-        Invoke-Native 'cargo' @('run', '-q', '-p', 'permanent-beta-corpus', '--', 'truth',
+        Invoke-Corpus @('truth',
             '--old', "$variantDir\v1\fixture.map", '--new', "$variantDir\v2\fixture.map",
             '--object', 'fixture.obj', '--out', "$variantDir\truth.json")
         Write-Host "wrote $variantDir\truth.json"
@@ -59,7 +70,7 @@ foreach ($name in $fixtureNames) {
 
     $expected = Join-Path $fixturesDir "$name/expected.toml"
     if ($Score -and (Test-Path $expected)) {
-        Invoke-Native 'cargo' @('run', '-q', '-p', 'permanent-beta-corpus', '--', 'score',
+        Invoke-Corpus @('score',
             '--built', (Join-Path $outRoot $name), '--expected', $expected)
     }
 }

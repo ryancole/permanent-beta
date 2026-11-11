@@ -32,3 +32,8 @@ thiserror = "2"
 toml = "0.8"
 toml_edit = "0.22"
 msvc-demangler = "0.11"
+
+# Dependencies optimized even in debug builds: otherwise replay's emulator (icicle) runs unoptimized, and it is most
+# of the corpus measurements' time. The workspace's own crates stay debug (fast to build, debuggable).
+[profile.dev.package."*"]
+opt-level = 3

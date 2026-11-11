@@ -8,9 +8,16 @@ Latest work: **replay measured on zstd** (design §7.3), the first real target w
 releases. `replay-measure.ps1 -Project zstd`: 1 of 16 hooks replayed at first, **11 of 16** now, 0 fail, after
 general fixes: translation handles renamed types (by structure), removed fields (dropped), added fields
 (unreadable until written), nested by-value structs and same-size integer and enum changes; the recorder patches
-256 imports (was 64), captures whole heap blocks up to 1 MiB, windows into larger ones, merges overlapping arrays
+256 imports (was 64), keeps at most 1024 import calls per case (zstd /Od recorded for 6 hours without it), captures whole heap blocks up to 1 MiB, windows into larger ones, merges overlapping arrays
 and captures the block a one-past-the-end pointer ends. Left inconclusive: compression that indexes megabytes of
 workspace.
+
+- **Open:** the wrong-target control fails on zstd /O2 (interrupted run, 2026-11-09): `HIST_count_simple`'s cases
+  pass on one other function and `HUF_decompress4X_usingDTable`'s on two. Not yet examined (likely variants that
+  do the same work, which replay can't tell apart, or a tail call the wrapper rule doesn't see).
+- **Faster measurements:** `corpus/verify.ps1` runs everything as parallel jobs after one build (`-Quick` without
+  the control); hooks replay in parallel, the control uses all threads, recordings are reused when unchanged, and
+  dependencies are optimized in debug builds.
 
 Before that: **pointer aliases found automatically, and a wrong-target control** (design §7.3). `pbeta analyze
 --pdb` now finds fields code keeps in a local of another struct type (`z_stream_s.state`, an `inflate_state` in
@@ -461,7 +468,7 @@ What's new:
 
 - Replay needs the PDB of both builds for globals (named by it), and is inconclusive for a global without a
   unique PDB name, one only a callee reached through a pointer reads, and any import without a model (three are
-  modelled). The recorder patches at most 256 imports, and its import memory sizes (512 bytes per argument, 256
+  modelled). The recorder patches at most 256 imports, keeps at most 1024 import calls per case, and its import memory sizes (512 bytes per argument, 256
   behind each pointer in that) are guesses. The record spec's `sized` buffers are guessed from parameter names.
   The thunks forward at most 8 stack arguments and don't support variadic functions. The emulator build needs
   CMake, Ninja and libclang; without the `emulator` feature every case is inconclusive (pbeta says so).

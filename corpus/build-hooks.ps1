@@ -47,7 +47,10 @@
 param(
     [string[]] $Flags,
     [switch] $Run,
-    [switch] $Replay
+    [switch] $Replay,
+    # With -Run: use what's already built (Detours, the hook DLL and launcher, the apps, pbeta), as corpus/verify.ps1
+    # does after building them once, so parallel jobs never rebuild a file another one is using.
+    [switch] $NoBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -354,14 +357,18 @@ function Invoke-Loop([string] $flagName) {
 }
 
 Import-VsDevEnvironment
-Build-Detours
-Build-Harness
 $flagNames = if ($Flags) { $Flags } else { @('o2', 'od') }
-foreach ($flagName in $flagNames) { Build-App $flagName }
+if (-not ($NoBuild -and $Run)) {
+    Build-Detours
+    Build-Harness
+    foreach ($flagName in $flagNames) { Build-App $flagName }
+}
 
 if ($Run) {
-    $features = if ($Replay) { @('--features', 'permanent-beta-cli/emulator') } else { @() }
-    Invoke-Native 'cargo' (@('build', '-q', '-p', 'permanent-beta-cli', '-p', 'permanent-beta-corpus') + $features)
+    if (-not $NoBuild) {
+        $features = if ($Replay) { @('--features', 'permanent-beta-cli/emulator') } else { @() }
+        Invoke-Native 'cargo' (@('build', '-q', '-p', 'permanent-beta-cli', '-p', 'permanent-beta-corpus') + $features)
+    }
     $script:failures = @()
     $script:summary = @()
     $script:replaySummary = @()

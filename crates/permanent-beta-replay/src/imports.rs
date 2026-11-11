@@ -126,9 +126,12 @@ pub const MAX_ALLOCATION: u64 = 1 << 26;
 /// CRT functions replay runs itself instead of answering from the recording: their effect follows from their
 /// arguments and the memory they read, which the emulator checks like any other access (unrecorded memory is
 /// refused). A build may inline them, or call them a different number of times, without behaving differently, so
-/// recorded calls to them are skipped when matching the recorded sequence. `memcmp` and `strcmp` aren't here:
-/// only the sign of their result is defined, and a caller may keep the value.
-pub const EXECUTED: [&str; 4] = ["memcpy", "memmove", "memset", "strlen"];
+/// recorded calls to them are skipped when matching the recorded sequence. The rotates are the `_rotl` family an
+/// /Od build calls instead of inlining (zstd's xxHash). `memcmp` and `strcmp` aren't here: only the sign of their
+/// result is defined, and a caller may keep the value.
+pub const EXECUTED: [&str; 8] = [
+    "memcpy", "memmove", "memset", "strlen", "_rotl", "_rotr", "_rotl64", "_rotr64",
+];
 
 /// Most bytes an executed function copies, sets or scans. **[Guess]**
 pub const MAX_EXECUTED: u64 = 1 << 24;
@@ -195,6 +198,21 @@ fn execute_named(name: &str, now: &dyn CallView) -> Result<Effect, Refusal> {
             }
             Ok(Effect {
                 rax: s.len() as u64,
+                writes: Vec::new(),
+                heap: None,
+            })
+        }
+        // `_rotl(unsigned value, int shift)`: the shift is taken modulo the width, a negative one too.
+        "_rotl" | "_rotr" | "_rotl64" | "_rotr64" => {
+            let (value, shift) = (arg(0)?, arg(1)? as u32);
+            let rax = match name {
+                "_rotl" => u64::from((value as u32).rotate_left(shift % 32)),
+                "_rotr" => u64::from((value as u32).rotate_right(shift % 32)),
+                "_rotl64" => value.rotate_left(shift % 64),
+                _ => value.rotate_right(shift % 64),
+            };
+            Ok(Effect {
+                rax,
                 writes: Vec::new(),
                 heap: None,
             })
@@ -871,8 +889,26 @@ mod tests {
         now.put(0x3000, &cstr("hello"));
         now.args = vec![0x3000];
         assert_eq!(execute("x!strlen", &now).unwrap().unwrap().rax, 5);
+        // Rotates: by the shift modulo the width; the 32-bit ones ignore the upper half and return 32 bits.
+        now.args = vec![0x8000_0000_0000_0001, 4];
+        assert_eq!(execute("x!_rotl64", &now).unwrap().unwrap().rax, 0x18);
+        assert_eq!(
+            execute("x!_rotr64", &now).unwrap().unwrap().rax,
+            0x1800_0000_0000_0000
+        );
+        now.args = vec![0x8000_0000_0000_0001, 64 + 4];
+        assert_eq!(execute("x!_rotl64", &now).unwrap().unwrap().rax, 0x18);
+        now.args = vec![0xffff_ffff_8000_0001, 0xffff_ffff_0000_0001];
+        assert_eq!(execute("x!_rotl", &now).unwrap().unwrap().rax, 3);
+        assert_eq!(execute("x!_rotr", &now).unwrap().unwrap().rax, 0xc000_0000);
+        // Negative: a 32-bit rotate isn't a 64-bit one.
+        assert_ne!(
+            execute("x!_rotl", &now).unwrap().unwrap().rax,
+            execute("x!_rotl64", &now).unwrap().unwrap().rax
+        );
         // Other imports aren't executed.
         assert!(execute("x!memcmp", &now).is_none());
+        assert!(execute("x!_rotl8", &now).is_none());
         assert!(execute("x!__acrt_iob_func", &now).is_none());
     }
 
