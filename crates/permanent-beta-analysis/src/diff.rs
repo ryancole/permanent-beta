@@ -210,6 +210,7 @@ mod tests {
             constants: vec![],
             imports: vec![],
             data_refs: vec![],
+            code_refs: vec![],
             signature: None,
             inferred_args: None,
             inferred_arg_classes: vec![],

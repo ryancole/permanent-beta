@@ -374,6 +374,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
     let mut constants = BTreeSet::new();
     let mut imports = BTreeSet::new();
     let mut data_refs = BTreeSet::new();
+    let mut code_refs = BTreeSet::new();
     let mut leaders: BTreeSet<u64> = segments.iter().map(|&(s, _)| s).collect();
     let mut internal_targets = BTreeSet::new();
     let mut mnemonic_counts: BTreeMap<String, u32> = BTreeMap::new();
@@ -428,6 +429,11 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
                                 strings.insert(s);
                             } else if image.is_writable(rva) {
                                 data_refs.insert(Rva(u64::from(rva)));
+                            } else if ins.mnemonic() == Mnemonic::Lea
+                                && image.is_executable(rva)
+                                && internal(ins.ip_rel_memory_address()).is_none()
+                            {
+                                code_refs.insert(Rva(u64::from(rva)));
                             }
                         }
                     } else {
@@ -526,6 +532,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         constants: constants.into_iter().collect(),
         imports: imports.into_iter().collect(),
         data_refs: data_refs.into_iter().collect(),
+        code_refs: code_refs.into_iter().collect(),
         signature: None,
         inferred_args: (!insns.is_empty()).then_some(args.0),
         inferred_arg_classes: args.1,
@@ -882,6 +889,29 @@ mod tests {
         let code = [0x48, 0x8d, 0x0d, 0xf9, 0x0f, 0x00, 0x00, 0xc3];
         let f = features(&image(&code, b"pb-config.ini\0"), &range(0x1000, 0x1008));
         assert_eq!(f.strings, vec!["pb-config.ini".to_string()]);
+    }
+
+    #[test]
+    fn collects_code_addresses_it_takes() {
+        // 0x1000: lea rax, [rip+0x19] → 0x1020 (another function); lea rcx, [rip-0x0e] → 0x1000 (itself);
+        // lea rdx, [rip+0x0feb] → 0x2000 (a string, not code); ret; 0x1020: ret
+        let mut code = vec![0x48, 0x8d, 0x05, 0x19, 0x00, 0x00, 0x00];
+        code.extend([0x48, 0x8d, 0x0d, 0xf2, 0xff, 0xff, 0xff]);
+        code.extend([0x48, 0x8d, 0x15, 0xeb, 0x0f, 0x00, 0x00, 0xc3]);
+        code.resize(0x20, 0xcc);
+        code.push(0xc3);
+        let f = features(&image(&code, b"pb-config.ini\0"), &range(0x1000, 0x1016));
+        // Negative: its own address (a jump table's base, a recursion) and data aren't code refs.
+        assert_eq!(f.code_refs, vec![Rva(0x1020)]);
+        assert_eq!(f.strings, vec!["pb-config.ini".to_string()]);
+        // Negative: a call is a callee, not an address taken.
+        // 0x1000: call 0x1010; ret
+        let mut code = vec![0xe8, 0x0b, 0x00, 0x00, 0x00, 0xc3];
+        code.resize(0x10, 0xcc);
+        code.push(0xc3);
+        let f = features(&image(&code, &[]), &range(0x1000, 0x1006));
+        assert_eq!(f.callees, vec![Rva(0x1010)]);
+        assert!(f.code_refs.is_empty());
     }
 
     #[test]

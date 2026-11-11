@@ -356,6 +356,7 @@ pub fn procedures_export(build: &BuildInfo, symbols: &PdbSymbols) -> AnalysisExp
                 constants: vec![],
                 imports: vec![],
                 data_refs: vec![],
+                code_refs: vec![],
                 signature: single.and_then(|p| p.signature.clone()),
                 inferred_args: None,
                 inferred_arg_classes: vec![],

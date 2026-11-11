@@ -188,6 +188,11 @@ pub struct FunctionFeatures {
     /// (design §7.3). Optional, so adding it didn't change the schema version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_refs: Vec<Rva>,
+    /// Code addresses outside the function that it takes with a RIP-relative `lea` (a function pointer it passes,
+    /// stores or calls), sorted. Not matched on and not hashed; for the call graph the wrong-target control walks
+    /// (design §7.3). Optional, so adding it didn't change the schema version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_refs: Vec<Rva>,
     pub signature: Option<FunctionSignature>,
     /// Register arguments the code reads before writing (Win64: rcx/xmm0, rdx/xmm1, r8/xmm2, r9/xmm3), up to
     /// the first call, as 1 + the highest slot used. A lower bound on the parameter count: unused trailing

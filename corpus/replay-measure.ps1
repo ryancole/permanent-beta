@@ -172,7 +172,7 @@ foreach ($r in $results) {
         Hook         = $h
         Outcome      = $o.outcome
         Cases        = (@($o.cases | Group-Object outcome | ForEach-Object { "$($_.Name) $($_.Count)" }) -join ', ')
-        Others       = if ($o.others) { "pass $(@($o.others.passed).Count), same code $(@($o.others.same_code).Count), wrapper $(@($o.others.calls_target).Count)" } else { '' }
+        Others       = if ($o.others) { "pass $(@($o.others.passed).Count), same code $(@($o.others.same_code).Count), wrapper $(@($o.others.calls_target).Count), callee $(@($o.others.called_by_target).Count)" } else { '' }
         OthersPassed = if ($o.others) { @($o.others.passed) } else { @() }
         Detail       = if ($o.detail.Length -gt 160) { $o.detail.Substring(0, 160) + '...' } else { $o.detail }
     }

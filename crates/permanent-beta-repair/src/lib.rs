@@ -573,6 +573,7 @@ mod tests {
             constants: vec![],
             imports: vec![],
             data_refs: vec![],
+            code_refs: vec![],
             signature: Some(FunctionSignature {
                 calling_convention: None,
                 return_type: None,

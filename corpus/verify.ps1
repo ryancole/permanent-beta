@@ -37,6 +37,7 @@ $jobs = @(
     @{ Name = 'hook-loop'; File = (Join-Path $PSScriptRoot 'build-hooks.ps1'); Args = @('-Run', '-Replay', '-NoBuild'); Replay = $false },
     @{ Name = 'fixtures'; File = (Join-Path $PSScriptRoot 'build-fixtures.ps1'); Args = @('-Score', '-NoBuild'); Replay = $false }
 )
+$Only = @($Only | ForEach-Object { $_ -split ',' } | Where-Object { $_ })  # `pwsh -File` passes a,b as one string
 if ($Only) { $jobs = @($jobs | Where-Object { $Only -contains $_.Name }) }
 if (-not $jobs) { throw "no job named $($Only -join ', ')" }
 

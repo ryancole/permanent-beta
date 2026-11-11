@@ -12,9 +12,11 @@ general fixes: translation handles renamed types (by structure), removed fields 
 and captures the block a one-past-the-end pointer ends. Left inconclusive: compression that indexes megabytes of
 workspace.
 
-- **Open:** the wrong-target control fails on zstd /O2 (interrupted run, 2026-11-09): `HIST_count_simple`'s cases
-  pass on one other function and `HUF_decompress4X_usingDTable`'s on two. Not yet examined (likely variants that
-  do the same work, which replay can't tell apart, or a tail call the wrapper rule doesn't see).
+- **Open:** the wrong-target control still fails on zstd /O2, on inlined copies only: `HIST_count_simple`'s cases
+  pass on `HIST_countFast_wksp` (which inlined it) and `HUF_decompress4X_usingDTable`'s on the standalone copy of
+  the `_internal` it inlined. Nothing in the call graph links them (design §7.3). The target's callees, and
+  functions whose address it takes (`code_refs`, new in the analysis), are now listed apart: zstd /Od and zlib
+  pass the control. To decide: whether the gate should fail on inlined copies, or list them for matching.
 - **Faster measurements:** `corpus/verify.ps1` runs everything as parallel jobs after one build (`-Quick` without
   the control); hooks replay in parallel, the control uses all threads, recordings are reused when unchanged, and
   dependencies are optimized in debug builds.

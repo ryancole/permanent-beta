@@ -675,14 +675,16 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
         if let Some(o) = &others {
             let list = |v: &[Rva]| v.iter().map(Rva::to_string).collect::<Vec<_>>().join(", ");
             println!(
-                "other functions: {} pass ({}), {} with identical code pass ({}), {} calling it pass ({}), {} fail, \
-                 {} inconclusive",
+                "other functions: {} pass ({}), {} with identical code pass ({}), {} calling it pass ({}), {} it \
+                 calls pass ({}), {} fail, {} inconclusive",
                 o.passed.len(),
                 list(&o.passed),
                 o.same_code.len(),
                 list(&o.same_code),
                 o.calls_target.len(),
                 list(&o.calls_target),
+                o.called_by_target.len(),
+                list(&o.called_by_target),
                 o.failed,
                 o.inconclusive
             );

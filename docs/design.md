@@ -790,6 +790,16 @@ has to: identical code (the same normalized hash) and a function that calls the 
 is most of the run time (about 10 and 20 minutes). A behavioral pass therefore says "behaves like the old function
 on these calls", which a forwarding wrapper also does: the candidate's structural evidence has to separate them.
 
+**The target's callees (2026-11-10).** A third kind is listed apart: a function the target calls, directly or
+through other calls (`Others::called_by_target`), the code a dispatcher forwards these inputs to. A function whose
+address the code takes counts as called: the analysis now records `code_refs`, code addresses outside the function
+taken by a RIP-relative `lea` (not hashed, not matched on, optional in the schema). zstd /Od's
+`HUF_decompress4X2_usingDTable_internal` calls `_default` through `fallbackFn`, and the control now passes there.
+What it still can't excuse is an inlined copy: at /O2 `HUF_decompress4X_usingDTable` inlined `_internal`, which
+also exists on its own, and `HIST_countFast_wksp` inlined `HIST_count_simple`. Both behave like the target on the
+recorded inputs and nothing in the call graph links them; only matching can separate them, so zstd /O2 still
+fails the control gate.
+
 **Pointer aliases found in the PDB (2026-11-09).** The hand-given hints above are now found automatically:
 `pbeta analyze --pdb` reads each procedure's locals, and a struct field `f` declared `X*` with a local `f` of type
 `Y*` (`Y` ≠ `X`) somewhere is an alias (`pointer_aliases` in the analysis, with the functions it's seen in; the

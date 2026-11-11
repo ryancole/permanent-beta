@@ -1608,6 +1608,7 @@ mod tests {
             constants: vec![],
             imports: vec![],
             data_refs: vec![],
+            code_refs: vec![],
             signature: None,
             arg_accesses: vec![],
         }

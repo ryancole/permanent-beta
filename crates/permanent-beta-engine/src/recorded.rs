@@ -159,10 +159,13 @@ impl RecordedCasesRunner {
 }
 
 /// The same cases replayed on every other function of the new build: a control for replay itself. The cases of a
-/// function should pass on no function but its counterpart, except two kinds listed apart: one with identical
-/// code (the same normalized hash: a duplicate, an ICF twin), and one that calls the target (a wrapper that
-/// forwards to it, as zlib's `crc32` to `crc32_z`), which behaves the same by construction. Replay can't tell
-/// those from the target; matching has to.
+/// function should pass on no function but its counterpart, except three kinds listed apart: one with identical
+/// code (the same normalized hash: a duplicate, an ICF twin), one that calls the target (a wrapper that forwards
+/// to it, as zlib's `crc32` to `crc32_z`), and one the target calls, directly or through other calls (the
+/// function a dispatcher forwards these inputs to, as zstd's `HUF_decompress4X_usingDTable` to the 4X2 decoder);
+/// a function whose address it takes counts as called (zstd's `fallbackFn`, called through a pointer).
+/// The last two behave the same by construction on the inputs that forward. Replay can't tell any of them from
+/// the target; matching has to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Others {
     /// Functions with other code the cases pass on: replay can't tell them from the target. Should be empty.
@@ -171,6 +174,8 @@ pub struct Others {
     pub same_code: Vec<Rva>,
     /// Functions calling the target that the cases pass on.
     pub calls_target: Vec<Rva>,
+    /// Functions the target calls (or takes the address of), directly or not, that the cases pass on.
+    pub called_by_target: Vec<Rva>,
     pub failed: usize,
     pub inconclusive: usize,
 }
@@ -183,6 +188,7 @@ impl Others {
         rva: Rva,
         hash: Option<&str>,
         calls_target: bool,
+        called_by_target: bool,
         outcome: CheckOutcome,
     ) {
         match outcome {
@@ -190,6 +196,7 @@ impl Others {
                 self.same_code.push(rva)
             }
             CheckOutcome::Pass if calls_target => self.calls_target.push(rva),
+            CheckOutcome::Pass if called_by_target => self.called_by_target.push(rva),
             CheckOutcome::Pass => self.passed.push(rva),
             CheckOutcome::Fail => self.failed += 1,
             CheckOutcome::Inconclusive => self.inconclusive += 1,
@@ -236,6 +243,14 @@ impl RecordedCasesRunner {
                 .flat_map(|h| h.join().expect("a replay thread panicked"))
                 .collect()
         });
+        let reached = reached_from(
+            |rva| {
+                new.function(rva).map_or(Vec::new(), |f| {
+                    f.callees.iter().chain(&f.code_refs).copied().collect()
+                })
+            },
+            new_rva,
+        );
         let mut others = Others::default();
         for (f, outcome) in targets.iter().zip(outcomes) {
             others.add(
@@ -243,11 +258,27 @@ impl RecordedCasesRunner {
                 f.rva,
                 f.normalized_hash.as_deref(),
                 f.callees.contains(&new_rva),
+                reached.contains(&f.rva),
                 outcome,
             );
         }
         others
     }
+}
+
+/// Every function `from` calls, directly or through other calls, given each function's callees and the code
+/// addresses it takes (`from` left out unless it recurses).
+fn reached_from(callees: impl Fn(Rva) -> Vec<Rva>, from: Rva) -> std::collections::HashSet<Rva> {
+    let mut reached = std::collections::HashSet::new();
+    let mut todo = vec![from];
+    while let Some(rva) = todo.pop() {
+        for callee in callees(rva) {
+            if reached.insert(callee) {
+                todo.push(callee);
+            }
+        }
+    }
+    reached
 }
 
 fn summarize(cases: &[CaseResult], old_rva: Rva) -> (CheckOutcome, String) {
@@ -381,28 +412,103 @@ mod tests {
     #[test]
     fn other_functions_passing_are_listed_apart_from_identical_code() {
         let mut o = Others::default();
-        o.add(Some("h1"), Rva(0x10), Some("h1"), false, CheckOutcome::Pass);
-        o.add(Some("h1"), Rva(0x20), Some("h2"), false, CheckOutcome::Pass);
-        o.add(Some("h1"), Rva(0x30), None, false, CheckOutcome::Pass);
-        o.add(Some("h1"), Rva(0x40), Some("h1"), false, CheckOutcome::Fail);
+        o.add(
+            Some("h1"),
+            Rva(0x10),
+            Some("h1"),
+            false,
+            false,
+            CheckOutcome::Pass,
+        );
+        o.add(
+            Some("h1"),
+            Rva(0x20),
+            Some("h2"),
+            false,
+            false,
+            CheckOutcome::Pass,
+        );
+        o.add(
+            Some("h1"),
+            Rva(0x30),
+            None,
+            false,
+            false,
+            CheckOutcome::Pass,
+        );
+        o.add(
+            Some("h1"),
+            Rva(0x40),
+            Some("h1"),
+            false,
+            false,
+            CheckOutcome::Fail,
+        );
         o.add(
             Some("h1"),
             Rva(0x50),
             Some("h3"),
             false,
+            false,
             CheckOutcome::Inconclusive,
         );
-        o.add(Some("h1"), Rva(0x60), Some("h4"), true, CheckOutcome::Pass);
-        // Negative: only the same hash, or calling the target, excuses a pass; another hash or none is replay
-        // failing to tell them apart.
+        o.add(
+            Some("h1"),
+            Rva(0x60),
+            Some("h4"),
+            true,
+            false,
+            CheckOutcome::Pass,
+        );
+        o.add(
+            Some("h1"),
+            Rva(0x70),
+            Some("h5"),
+            false,
+            true,
+            CheckOutcome::Pass,
+        );
+        // Calling the target is listed first when the target calls it back.
+        o.add(
+            Some("h1"),
+            Rva(0x80),
+            Some("h6"),
+            true,
+            true,
+            CheckOutcome::Pass,
+        );
+        // Negative: only the same hash, calling the target or being called by it excuses a pass; another hash or
+        // none is replay failing to tell them apart.
         assert_eq!(o.same_code, [Rva(0x10)]);
-        assert_eq!(o.calls_target, [Rva(0x60)]);
+        assert_eq!(o.calls_target, [Rva(0x60), Rva(0x80)]);
+        assert_eq!(o.called_by_target, [Rva(0x70)]);
         assert_eq!(o.passed, [Rva(0x20), Rva(0x30)]);
         assert_eq!((o.failed, o.inconclusive), (1, 1));
         // Negative: a target without a hash excuses nothing, not even a function without one.
         let mut o = Others::default();
-        o.add(None, Rva(0x10), None, false, CheckOutcome::Pass);
+        o.add(None, Rva(0x10), None, false, false, CheckOutcome::Pass);
         assert_eq!(o.passed, [Rva(0x10)]);
+    }
+
+    #[test]
+    fn the_targets_callees_are_found_through_other_calls() {
+        // 0x10 (the target) -> 0x20 -> 0x30 -> 0x20 (a cycle); 0x40 calls the target; 0x50 is unrelated.
+        let graph: std::collections::HashMap<Rva, Vec<Rva>> = [
+            (Rva(0x10), vec![Rva(0x20)]),
+            (Rva(0x20), vec![Rva(0x30)]),
+            (Rva(0x30), vec![Rva(0x20)]),
+            (Rva(0x40), vec![Rva(0x10)]),
+            (Rva(0x50), vec![Rva(0x30)]),
+        ]
+        .into();
+        let callees = |rva| graph.get(&rva).cloned().unwrap_or_default();
+        let reached = reached_from(callees, Rva(0x10));
+        assert_eq!(reached, [Rva(0x20), Rva(0x30)].into());
+        // Negative: a caller of the target, and a function that only shares a callee with it, aren't reached; nor
+        // is the target itself, which doesn't recurse.
+        for not in [Rva(0x40), Rva(0x50), Rva(0x10)] {
+            assert!(!reached.contains(&not), "{not}");
+        }
     }
 
     #[test]
