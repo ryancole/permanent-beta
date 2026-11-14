@@ -1398,6 +1398,15 @@ the scope above:
   selection rules and the misfit report, negatives included. Each IDA API the adapter calls was checked against
   IDA Home 9.5's IDAPython modules, but not run.
 
+**Packaging and agents (2026-11-14):** the plugin has an `ida-plugin.json` manifest (Hex-Rays' format; HCLI's
+required fields included) and installs as a folder; IDA Home 9.5 loads it that way. `integrations/ida/README.md` describes running Hex-Rays' IDA
+MCP server next to `pbeta-mcp`, so an agent can examine review items in IDA. The servers keep their limits: IDA MCP
+may change databases, `pbeta-mcp` only reads and queues proposals, and decisions stay with `pbeta review`. Tried
+once (the README has the details). On the ambiguous `checksum` item, IDA showed what Permanent Beta's evidence
+couldn't: where each copy is called in `ship_order`, and what is done with its result. Position in the caller
+isn't adopted as matching evidence (§5), but it helps a reviewer. The plugin isn't published to Hex-Rays' plugin
+repository.
+
 #### Later
 
 - **Review window:** Ghidra parity (items, candidates with evidence and checks, go to, accept and reject through

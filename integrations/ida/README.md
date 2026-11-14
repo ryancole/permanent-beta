@@ -11,8 +11,13 @@ Needs IDA Home or Pro 9.x with IDAPython (IDA Free has no IDAPython), and a `pbe
 
 ## Install
 
-Copy `permanent_beta_ida.py` and the `permanent_beta` folder into IDA's plugins directory, either the install's
-`plugins` folder or `%APPDATA%\Hex-Rays\IDA Pro\plugins`, then restart IDA. The plugin adds **Edit > Plugins > Permanent Beta**.
+The plugin is a folder with an `ida-plugin.json` manifest, the format IDA 9 and Hex-Rays' plugin manager (HCLI) use.
+Copy `ida-plugin.json`, `permanent_beta_ida.py` and the `permanent_beta` folder into a folder of their own, such as
+`%APPDATA%\Hex-Rays\IDA Pro\plugins\permanent-beta`, then restart IDA. The `tests` folder isn't needed.
+
+The plugin loads with each database (not on IDA's start screen) and adds **Edit > Plugins > Permanent Beta**. The
+Output window shows `Permanent Beta: added Edit/Plugins/Permanent Beta`. It isn't in the Hex-Rays plugin repository,
+and installing it with `hcli plugin install` hasn't been tried.
 
 ## Use
 
@@ -33,6 +38,63 @@ Copy `permanent_beta_ida.py` and the `permanent_beta` folder into IDA's plugins 
      who decided the mapping (the engine or a reviewer). Applying a second time changes nothing.
 4. A results window lists each function: *carried*, *kept*, *skipped* or *pending*, with the reason. Press Enter
    on a row to jump to it.
+
+## With an AI agent: IDA MCP and `pbeta-mcp`
+
+Tried on 2026-11-14 with the hook loop's /O2 v2 → v3 `checksum` item, which is ambiguous: v3 adds a
+byte-identical `checksum_backup`. `pbeta-mcp` showed both candidates passing the same checks, including the same
+single matched caller. IDA MCP showed what tells them apart. In v2, `ship_order` calls `checksum` once, right
+after printing the receipt. In v3 it calls `0x1040` at that same spot and then `0x1070` on the same data,
+comparing the two results. So `0x1040` is the counterpart, which the map files confirm.
+
+Two things to know:
+
+- In Claude Code's auto mode, IDA MCP's calls are refused: its plugin adds a session field to each call after auto
+  mode checks it. Use another permission mode.
+- IDA MCP's headless workers load the build's PDB when they find it, so an agent sees the real names. Open copies
+  of the binaries away from their PDBs to keep a review honest.
+
+Hex-Rays ships its own MCP server, **IDA MCP** (IDA 9.4 or later, Home or Pro, with idalib). It lets an agent open
+and read databases, and change them. Permanent Beta's server, `pbeta-mcp`, gives the same agent the build
+analyses, candidates with their verification checks, and the review queue. With both, an agent can work through
+the review queue: read an item's explanation from `pbeta-mcp`, look at the old function and each candidate in IDA,
+and tell you what differs.
+
+What each side may do stays as it is:
+
+- `pbeta-mcp` only reads, and adds proposals to the review queue (`propose_mapping`, verified first). No agent can
+  accept a mapping or decide a review item: you do that with `pbeta review` or the Ghidra review window.
+- IDA MCP can change the database (names, types, comments). That's between you and the agent; it never becomes a
+  mapping.
+
+Setup, for Claude Code:
+
+1. IDA MCP: follow Hex-Rays' instructions
+   (https://docs.hex-rays.com/add-ons/mcp/getting-started). Their README gives these Claude Code commands:
+
+   ```bash
+   claude plugin marketplace add HexRaysSA/claude-marketplace
+   claude plugin install ida-mcp@HexRaysSA
+   ```
+
+2. `pbeta-mcp`: add it to the project's `.mcp.json` with the analyses of the builds involved and your review store
+   (paths are examples):
+
+   ```json
+   {
+     "mcpServers": {
+       "pbeta": {
+         "command": "C:/path/to/pbeta-mcp.exe",
+         "args": ["--analysis", "C:/work/v2/analysis.json", "--analysis", "C:/work/v3/analysis.json",
+                  "--store", "C:/work/.pbeta/store.json"]
+       }
+     }
+   }
+   ```
+
+A prompt to start with: *"List the open Permanent Beta review items. For each one, open the old and new builds in
+IDA, compare the old function with each candidate, and tell me which you think is right and why. Don't change the
+databases."*
 
 ## Tests
 

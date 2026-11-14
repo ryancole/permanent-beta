@@ -277,5 +277,20 @@ class PbetaClientTest(unittest.TestCase):
         self.assertEqual([(m.old, m.new, m.decided_by) for m in r.mappings], [(0x10, 0x20, "reviewer ryan")])
 
 
+class ManifestTest(unittest.TestCase):
+    """ida-plugin.json: what IDA and Hex-Rays' plugin manager (HCLI) require of it."""
+
+    def test_has_the_required_fields_and_its_entry_point(self):
+        with open(os.path.join(os.path.dirname(HERE), "ida-plugin.json"), encoding="utf-8") as f:
+            m = json.load(f)
+        self.assertEqual(m["IDAMetadataDescriptorVersion"], 1)
+        p = m["plugin"]
+        for key in ("name", "version", "entryPoint", "urls"):
+            self.assertIn(key, p)
+        self.assertTrue(p["urls"].get("repository"))
+        self.assertTrue(any(a.get("email") for a in p.get("authors", []) + p.get("maintainers", [])))
+        self.assertTrue(os.path.isfile(os.path.join(os.path.dirname(HERE), p["entryPoint"])))
+
+
 if __name__ == "__main__":
     unittest.main()

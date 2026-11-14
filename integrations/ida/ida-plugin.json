@@ -1,0 +1,20 @@
+{
+  "$schema": "https://hcli.docs.hex-rays.com/schemas/ida-plugin.json",
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "permanent-beta",
+    "entryPoint": "permanent_beta_ida.py",
+    "version": "0.0.1",
+    "description": "Carries names, prototypes, comments and types to a new build's database across function mappings Permanent Beta verified or a reviewer accepted.",
+    "idaVersions": ["9.5"],
+    "platforms": ["windows-x86_64"],
+    "requiresPython": ">=3.10",
+    "license": "Apache 2.0",
+    "categories": ["collaboration-and-productivity"],
+    "keywords": ["binary diffing", "function matching", "markup", "version tracking", "hooks"],
+    "urls": {
+      "repository": "https://github.com/ryancole/permanent-beta"
+    },
+    "authors": [{ "name": "Ryan Cole", "email": "ryan@rycole.com" }]
+  }
+}
