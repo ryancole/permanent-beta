@@ -107,9 +107,9 @@ function Build-App([string] $flagName) {
         $out = Join-Path $outRoot "$flagName/$version"
         New-Item -ItemType Directory -Force $out | Out-Null
         Write-Host "building app $version [$flagName]"
-        Invoke-Native 'cl.exe' (@($MsvcCommon.cl) + @('/EHsc', '/permissive-', '/W4') + @($set.cl) + @(
-                '/c', (Join-Path $hooksDir "app/$version/app.cpp"), "/Fo$out\app.obj"))
-        Invoke-Native 'link.exe' (@($MsvcCommon.link) + @($set.link) + @(
+        Invoke-Native 'cl.exe' ((Get-MsvcClFlags $set) + @('/EHsc', '/permissive-', '/W4') + @(
+                '/c', (Join-Path $hooksDir "app/$version/app.cpp"), "/Fo$out\app.obj", "/Fd$out\"))
+        Invoke-Native 'link.exe' ((Get-MsvcLinkFlags $set) + @(
                 "$out\app.obj", "/OUT:$out\app.exe", "/PDB:$out\app.pdb", "/MAP:$out\app.map"))
     }
 }

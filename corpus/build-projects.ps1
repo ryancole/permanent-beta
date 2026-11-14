@@ -76,11 +76,11 @@ function Build-Version($recipe, [string] $tag, [string] $flagName) {
         $pgoCl = @($recipe.PgoCl | ForEach-Object { $_.Replace('{recipe}', $recipeDir) })
     }
     # Trailing backslash: /Fo names each object after its source file inside that directory.
-    Invoke-Native 'cl.exe' (@($MsvcCommon.cl) + @($recipe.Cl) + @($set.cl) + $pgoCl + $defines + $includes +
-        @('/c') + $sources + @("/Fo$out\"))
+    Invoke-Native 'cl.exe' ((Get-MsvcClFlags $set) + @($recipe.Cl) + $pgoCl + $defines + $includes +
+        @('/c') + $sources + @("/Fo$out\", "/Fd$out\"))
     $objs = @($sources | ForEach-Object { Join-Path $out ([IO.Path]::GetFileNameWithoutExtension($_) + '.obj') })
     $exe = $recipe.Exe
-    $link = @($MsvcCommon.link) + @($set.link) + $objs + @("/OUT:$out\$exe.exe", "/PDB:$out\$exe.pdb", "/MAP:$out\$exe.map")
+    $link = (Get-MsvcLinkFlags $set) + $objs + @("/OUT:$out\$exe.exe", "/PDB:$out\$exe.pdb", "/MAP:$out\$exe.map")
     if (-not $set.Pgo) {
         Invoke-Native 'link.exe' $link
         return
@@ -167,6 +167,11 @@ foreach ($name in $projectNames) {
             if ($recipe.Renames -and $recipe.Renames.ContainsKey($new)) {
                 $table = $recipe.Renames[$new]
                 $renames = @($table.Keys | Sort-Object | ForEach-Object { '--rename'; "$_=$($table[$_])" })
+            }
+            # Renames whose old name the newer tag reuses for another function.
+            if ($recipe.ReusedNames -and $recipe.ReusedNames.ContainsKey($new)) {
+                $table = $recipe.ReusedNames[$new]
+                $renames += @($table.Keys | Sort-Object | ForEach-Object { '--rename-reused'; "$_=$($table[$_])" })
             }
             Invoke-Native 'cargo' (@('run', '-q', '-p', 'permanent-beta-corpus', '--', 'truth',
                     '--old', "$variant\v1\$exe.map", '--new', "$variant\v2\$exe.map", '--out', "$variant\truth.json") +

@@ -35,10 +35,15 @@
 # elimination only with an agreeing neighbour, and the broader wrapper rule in similarity. /O2 678 and 688, /O2+ICF 664 and 674, /Od 1732 and 1771 (was 680/688, 666/674, 1739/1778).
 # 2026-11-07, raised: the wrapper rule is overruled when >= 2 matched callers still call the function directly
 # and none calls the would-be wrapper (design §5.1 pass 6). o2-icf__v1.5.5__v1.5.6 664 -> 666, o2-icf__v1.5.6__v1.5.7 674 -> 676, o2__v1.5.5__v1.5.6 678 -> 680, o2__v1.5.6__v1.5.7 688 -> 690, od__v1.5.5__v1.5.6 1732 -> 1737, od__v1.5.6__v1.5.7 1771 -> 1773.
+# 2026-11-13: rebaselined for MSVC 14.52 (Visual Studio 18.12; the earlier baselines were 14.50, whose
+# builds differ) and the new `debug` flag set (VS Debug: /ZI /Od /RTC1 /JMC, incremental linking), with
+# native-4 discovery and the stricter copy rules in the hash and matched-callees passes. 0 wrong.
 [gate.min_correct]
-"o2__v1.5.5__v1.5.6" = 680
-"o2__v1.5.6__v1.5.7" = 690
-"o2-icf__v1.5.5__v1.5.6" = 666
-"o2-icf__v1.5.6__v1.5.7" = 676
-"od__v1.5.5__v1.5.6" = 1737
+"o2__v1.5.5__v1.5.6" = 660
+"o2__v1.5.6__v1.5.7" = 685
+"o2-icf__v1.5.5__v1.5.6" = 644
+"o2-icf__v1.5.6__v1.5.7" = 669
+"od__v1.5.5__v1.5.6" = 1736
 "od__v1.5.6__v1.5.7" = 1773
+"debug__v1.5.5__v1.5.6" = 1752
+"debug__v1.5.6__v1.5.7" = 1775

@@ -20,6 +20,9 @@ o2-icf = 7
 od = 9
 # o2-ltcg (2026-11-07): /GL + /LTCG, the same 6 as /O2.
 o2-ltcg = 6
+# debug (2026-11-13): Visual Studio's Debug configuration (/ZI /Od /RTC1 /JMC, incremental linking: 190
+# incremental linking thunks in v1). 9 of 13, 0 wrong.
+debug = 9
 
 [[scenario]]
 id = "main"

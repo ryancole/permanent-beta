@@ -19,6 +19,14 @@
     Include  = @('include', 'src')
     Defines  = @('_CRT_SECURE_NO_WARNINGS', 'YAML_CPP_STATIC_DEFINE')
     Cl       = @('/W3', '/EHsc', '/std:c++17')
+    # Renames, keyed by the newer tag (old name = new name), each checked by hand against the sources.
+    # 0.9.0's emitterutils.cpp calls std::none_of(str, str + size, ...) instead of std::none_of(str.begin(),
+    # str.end(), ...), so the STL helper it instantiates unwraps a const char* instead of a string iterator.
+    Renames  = @{
+        'yaml-cpp-0.9.0' = @{
+            '??$_Get_unwrapped@AEBV?$_String_const_iterator@V?$_String_val@U?$_Simple_types@D@std@@@std@@@std@@@std@@YA?A_TAEBV?$_String_const_iterator@V?$_String_val@U?$_Simple_types@D@std@@@std@@@0@@Z' = '??$_Get_unwrapped@AEBQEBD@std@@YA?A_TAEBQEBD@Z'
+        }
+    }
     # PGO training (flag set o2-pgo): parse the repository's .clang-format (YAML, present in every scored tag).
     Train    = @(@{ Args = @('{src}\.clang-format') })
 }

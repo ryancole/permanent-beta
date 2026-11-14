@@ -56,9 +56,9 @@ foreach ($name in $fixtureNames) {
             $out = Join-Path $variantDir $version
             New-Item -ItemType Directory -Force $out | Out-Null
             Write-Host "building $name/$flagName/$version"
-            Invoke-Native 'cl.exe' (@($MsvcCommon.cl) + $fixtureCl + @($set.cl) + @(
-                    '/c', $src, "/Fo$out\fixture.obj"))
-            Invoke-Native 'link.exe' (@($MsvcCommon.link) + @($set.link) + @(
+            Invoke-Native 'cl.exe' ((Get-MsvcClFlags $set) + $fixtureCl + @(
+                    '/c', $src, "/Fo$out\fixture.obj", "/Fd$out\"))
+            Invoke-Native 'link.exe' ((Get-MsvcLinkFlags $set) + @(
                     "$out\fixture.obj", "/OUT:$out\fixture.exe", "/PDB:$out\fixture.pdb", "/MAP:$out\fixture.map"))
         }
 

@@ -25,14 +25,19 @@
 # elimination only with an agreeing neighbour, and the broader wrapper rule in similarity. /O2 247 and 231, /O2+ICF 212 and 201, /Od 435 and 425 (was 247/233, 212/204, 436/433).
 # 2026-11-07, new flag sets /LTCG (o2-ltcg: /GL + /LTCG) and PGO (o2-pgo: trained on the recipe's Train
 # workload), first run: o2-ltcg__10.0.0__10.1.0 237, o2-ltcg__9.0.0__10.0.0 259, o2-pgo__10.0.0__10.1.0 298, o2-pgo__9.0.0__10.0.0 317, 0 wrong.
+# 2026-11-13: rebaselined for MSVC 14.52 (Visual Studio 18.12; the earlier baselines were 14.50, whose
+# builds differ) and the new `debug` flag set (VS Debug: /ZI /Od /RTC1 /JMC, incremental linking), with
+# native-4 discovery and the stricter copy rules in the hash and matched-callees passes. 0 wrong.
 [gate.min_correct]
-"o2__9.0.0__10.0.0" = 247
-"o2__10.0.0__10.1.0" = 231
-"o2-icf__9.0.0__10.0.0" = 212
-"o2-icf__10.0.0__10.1.0" = 201
+"o2__9.0.0__10.0.0" = 252
+"o2__10.0.0__10.1.0" = 232
+"o2-icf__9.0.0__10.0.0" = 217
+"o2-icf__10.0.0__10.1.0" = 202
 "od__9.0.0__10.0.0" = 435
 "od__10.0.0__10.1.0" = 425
-"o2-ltcg__10.0.0__10.1.0" = 237
-"o2-ltcg__9.0.0__10.0.0" = 259
-"o2-pgo__10.0.0__10.1.0" = 298
-"o2-pgo__9.0.0__10.0.0" = 317
+"o2-ltcg__10.0.0__10.1.0" = 247
+"o2-ltcg__9.0.0__10.0.0" = 276
+"o2-pgo__10.0.0__10.1.0" = 301
+"o2-pgo__9.0.0__10.0.0" = 316
+"debug__10.0.0__10.1.0" = 427
+"debug__9.0.0__10.0.0" = 442

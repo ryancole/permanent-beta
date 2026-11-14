@@ -1,7 +1,7 @@
 # Shared MSVC build settings for corpus/build-fixtures.ps1 and corpus/build-projects.ps1. Dot-source it.
 #
 # Every build uses:
-#   /INCREMENTAL:NO  incremental linking routes calls through jump thunks, which would confuse matching
+#   /INCREMENTAL:NO  (all but `debug`) incremental linking routes calls through jump thunks
 #   /Z7 + /Brepro    byte-identical .obj files and identical code layout across runs. The .exe still differs in
 #                    the PE timestamp and PDB signature (linker-generated), so its SHA-256 changes per build.
 #   /DEBUG:FULL      a self-contained PDB
@@ -11,6 +11,11 @@
 # cross-object inlining and layout), and /O2 with profile-guided optimization (`Pgo`: built instrumented, run on
 # the recipe's `Train` workload, then relinked with the profile; hot/cold splitting and profile-driven inlining).
 # PGO needs a training workload, so only the real-world projects build it (build-projects.ps1).
+#
+# `debug` is Visual Studio's Debug configuration: /ZI (Edit and Continue: a compiler PDB and an empty `.textbss`),
+# /Od, /RTC1 (runtime checks) and /JMC (Just My Code), linked incrementally, so calls go through the incremental
+# linking table's jump thunks (design 4.2). It replaces /Z7 (`DropCl`), and /INCREMENTAL:NO and /OPT:REF (which
+# turns incremental linking off) (`DropLink`).
 
 $MsvcCommon = @{
     cl   = @('/nologo', '/MD', '/Z7', '/Brepro')
@@ -23,6 +28,20 @@ $MsvcFlagSets = [ordered]@{
     'od'     = @{ cl = @('/Od'); link = @('/OPT:NOICF') }
     'o2-ltcg' = @{ cl = @('/O2', '/GL'); link = @('/LTCG', '/OPT:NOICF') }
     'o2-pgo'  = @{ cl = @('/O2', '/GL'); link = @('/LTCG', '/OPT:NOICF'); Pgo = $true }
+    'debug'   = @{
+        cl = @('/ZI', '/Od', '/RTC1', '/JMC'); DropCl = @('/Z7')
+        link = @('/INCREMENTAL', '/OPT:NOREF', '/OPT:NOICF'); DropLink = @('/INCREMENTAL:NO', '/OPT:REF')
+    }
+}
+
+# The compiler flags for a flag set: the common ones (less the set's `DropCl`), then the set's own.
+function Get-MsvcClFlags($set) {
+    @($MsvcCommon.cl | Where-Object { $set.DropCl -notcontains $_ }) + @($set.cl)
+}
+
+# The link flags for a flag set: the common ones (less the set's `DropLink`), then the set's own.
+function Get-MsvcLinkFlags($set) {
+    @($MsvcCommon.link | Where-Object { $set.DropLink -notcontains $_ }) + @($set.link)
 }
 
 # Flag sets that build without a training workload.

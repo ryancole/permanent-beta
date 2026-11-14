@@ -22,14 +22,19 @@
 #     pairs now need an agreeing matched neighbour.
 # 2026-11-07, new flag sets /LTCG (o2-ltcg: /GL + /LTCG) and PGO (o2-pgo: trained on the recipe's Train
 # workload), first run: o2-ltcg__0.8.0__yaml-cpp-0.9.0 221, o2-ltcg__yaml-cpp-0.7.0__0.8.0 231, o2-pgo__0.8.0__yaml-cpp-0.9.0 311, o2-pgo__yaml-cpp-0.7.0__0.8.0 320, 0 wrong.
+# 2026-11-13: rebaselined for MSVC 14.52 (Visual Studio 18.12; the earlier baselines were 14.50, whose
+# builds differ) and the new `debug` flag set (VS Debug: /ZI /Od /RTC1 /JMC, incremental linking), with
+# native-4 discovery and the stricter copy rules in the hash and matched-callees passes. 0 wrong.
 [gate.min_correct]
-"o2__yaml-cpp-0.7.0__0.8.0" = 269
-"o2__0.8.0__yaml-cpp-0.9.0" = 256
-"o2-icf__yaml-cpp-0.7.0__0.8.0" = 246
-"o2-icf__0.8.0__yaml-cpp-0.9.0" = 236
+"o2__yaml-cpp-0.7.0__0.8.0" = 265
+"o2__0.8.0__yaml-cpp-0.9.0" = 253
+"o2-icf__yaml-cpp-0.7.0__0.8.0" = 241
+"o2-icf__0.8.0__yaml-cpp-0.9.0" = 232
 "od__yaml-cpp-0.7.0__0.8.0" = 2952
-"od__0.8.0__yaml-cpp-0.9.0" = 2913
-"o2-ltcg__0.8.0__yaml-cpp-0.9.0" = 221
-"o2-ltcg__yaml-cpp-0.7.0__0.8.0" = 231
-"o2-pgo__0.8.0__yaml-cpp-0.9.0" = 311
-"o2-pgo__yaml-cpp-0.7.0__0.8.0" = 320
+"od__0.8.0__yaml-cpp-0.9.0" = 2912
+"o2-ltcg__0.8.0__yaml-cpp-0.9.0" = 224
+"o2-ltcg__yaml-cpp-0.7.0__0.8.0" = 235
+"o2-pgo__0.8.0__yaml-cpp-0.9.0" = 312
+"o2-pgo__yaml-cpp-0.7.0__0.8.0" = 321
+"debug__0.8.0__yaml-cpp-0.9.0" = 2957
+"debug__yaml-cpp-0.7.0__0.8.0" = 2993

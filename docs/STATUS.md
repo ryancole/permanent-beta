@@ -4,7 +4,25 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work (2026-11-13): **host follow-ups.** `harness/host/test.ps1` runs in CI (its own Windows job). A function
+Latest work (2026-11-13, later): **corpus `debug` variant and an MSVC update.** A `debug` flag set (Visual
+Studio's Debug configuration: /ZI /Od /RTC1 /JMC, linked /INCREMENTAL, so an empty `.textbss` and every call
+through an incremental linking thunk) for the fixtures and all six projects: 0 wrong, correct counts at or above
+/Od's. Running it showed the corpus no longer met its baselines: Visual Studio updated MSVC from 14.50 to 14.52 on
+2026-11-11 (checked: the same builds score the same with the code from before this work, so it's the builds).
+Every project was rebaselined on 14.52 (some variants up, lua/yaml-cpp/zstd /O2 down by 3–20), after fixing the
+four wrong matches the new builds exposed:
+- **Discovery** (`native-4`): the destructor and copy constructors a throw site's ThrowInfo names are functions.
+  In yaml-cpp's PGO build only one of five identical exception destructors per build was found, so the hash pass
+  paired two different ones as "unique".
+- **Copies:** a neighbour that every copy of identical code has (`__CheckForDebuggerJustMyCode` under /JMC) no
+  longer anchors a copy in the hash and mnemonic passes, and the matched-callees pass no longer pairs the last
+  copies by elimination.
+- **Answer key:** three renames declared (jsoncpp's two `InRange` instantiations, yaml-cpp's `_Get_unwrapped`, both
+  from a changed call site), and zstd's `ZSTD_cwksp_aligned_alloc_size` → `_aligned64_alloc_size`, whose old name
+  went to a new function: a new `ReusedNames` recipe entry (`pbeta-corpus truth --rename-reused`).
+The hook-repair loop (`build-hooks.ps1 -Run`) wasn't run.
+
+Before that (2026-11-13): **host follow-ups.** `harness/host/test.ps1` runs in CI (its own Windows job). A function
 that calls itself is hookable: a call to its own entry runs the hook, as any call does; a jump back to the entry
 (a loop) or any branch into the rest of the patched bytes is still refused (`FEATURES_VERSION` `native-3`, so
 analyses must be redone; corpus scorecards not run). The host test's `fib` is now directly recursive. `pbeta
@@ -25,8 +43,8 @@ it's too short.)
 Before that: **incrementally linked images** (design §4.2). The packed-binary check accepts MSVC's empty
 `.textbss` in its exact shape, and the analyzer finds the incremental linking table: each thunk is its own
 function marked `thunk_to`, calls through one are its target's, thunks are never matched, and a hook on one moves
-to its target (`FEATURES_VERSION` `native-2`). Checked on one Debug program only (0 wrong without PDBs); the
-corpus has no incremental variant yet, and its scorecards weren't run.
+to its target (`FEATURES_VERSION` `native-2`). Checked on one Debug program, then on the corpus's `debug`
+variant (above).
 
 Before that: **changed callees in replay** (design §7.3). With the old analysis, replay notes which changed
 functions (no accepted match, or other normalized code) a run entered. A difference through one is inconclusive,

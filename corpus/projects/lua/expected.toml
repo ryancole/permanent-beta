@@ -34,14 +34,19 @@
 # so argv[0] holds no path). With absolute paths, CI's checkout got a different profile and scored
 # o2-pgo__v5.4.7__v5.4.8 838 (collectargs held for review). The PGO code layout is now identical from three
 # checkout paths. The change is in the build, not matching; 0 wrong before and after.
+# 2026-11-13: rebaselined for MSVC 14.52 (Visual Studio 18.12; the earlier baselines were 14.50, whose
+# builds differ) and the new `debug` flag set (VS Debug: /ZI /Od /RTC1 /JMC, incremental linking), with
+# native-4 discovery and the stricter copy rules in the hash and matched-callees passes. 0 wrong.
 [gate.min_correct]
-"o2__v5.4.6__v5.4.7" = 726
-"o2__v5.4.7__v5.4.8" = 732
-"o2-icf__v5.4.6__v5.4.7" = 726
-"o2-icf__v5.4.7__v5.4.8" = 732
-"od__v5.4.6__v5.4.7" = 1087
-"od__v5.4.7__v5.4.8" = 1092
-"o2-ltcg__v5.4.6__v5.4.7" = 522
-"o2-ltcg__v5.4.7__v5.4.8" = 513
-"o2-pgo__v5.4.6__v5.4.7" = 842
-"o2-pgo__v5.4.7__v5.4.8" = 842
+"o2__v5.4.6__v5.4.7" = 722
+"o2__v5.4.7__v5.4.8" = 725
+"o2-icf__v5.4.6__v5.4.7" = 722
+"o2-icf__v5.4.7__v5.4.8" = 725
+"od__v5.4.6__v5.4.7" = 1088
+"od__v5.4.7__v5.4.8" = 1091
+"o2-ltcg__v5.4.6__v5.4.7" = 521
+"o2-ltcg__v5.4.7__v5.4.8" = 517
+"o2-pgo__v5.4.6__v5.4.7" = 837
+"o2-pgo__v5.4.7__v5.4.8" = 837
+"debug__v5.4.6__v5.4.7" = 1089
+"debug__v5.4.7__v5.4.8" = 1092

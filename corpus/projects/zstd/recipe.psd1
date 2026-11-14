@@ -39,6 +39,15 @@
             'BMK_benchCLevel'                                = 'BMK_benchCLevels'
         }
     }
+    # Renames whose old name the newer tag gives to another function (old name = new name), each checked by hand.
+    # Joined before the answer key joins by name, which would pair the old function with its unrelated namesake.
+    ReusedNames = @{
+        'v1.5.7' = @{
+            # Same signature, body and callers as the declared ZSTD_cwksp_reserve_aligned rename. The old name now
+            # belongs to a new two-parameter ZSTD_cwksp_aligned_alloc_size(size, alignment) that it wraps.
+            'ZSTD_cwksp_aligned_alloc_size' = 'ZSTD_cwksp_aligned64_alloc_size'
+        }
+    }
     Include  = @('lib', 'lib/common')
     Defines  = @('_CRT_SECURE_NO_WARNINGS', 'XXH_NAMESPACE=ZSTD_', 'ZSTD_LEGACY_SUPPORT=0', 'ZSTD_MULTITHREAD')
     Cl       = @('/W3')

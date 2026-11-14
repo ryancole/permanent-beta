@@ -10,14 +10,22 @@
 # /O2+ICF 260 of 271 twice, /Od 1592 of 1654 and 1626 of 1685, /LTCG 215 of 243 twice, PGO 327 of 359 and 329 of
 # 361, 0 wrong. Added to calibrate the C++ guesses: TABLE_MIN_ANCHORS and WRAPPER_MIN_DIRECT_CALLERS were swept
 # over all 64 corpus variants (design §5.1).
+# 2026-11-13: rebaselined for MSVC 14.52 (Visual Studio 18.12; the earlier baselines were 14.50, whose
+# builds differ) and the new `debug` flag set (VS Debug: /ZI /Od /RTC1 /JMC, incremental linking), with
+# native-4 discovery and the stricter copy rules in the hash and matched-callees passes. 0 wrong.
 [gate.min_correct]
-"o2__1.9.6__1.9.7" = 272
-"o2__1.9.7__1.9.8" = 273
-"o2-icf__1.9.6__1.9.7" = 260
-"o2-icf__1.9.7__1.9.8" = 260
+"o2__1.9.6__1.9.7" = 275
+"o2__1.9.7__1.9.8" = 276
+"o2-icf__1.9.6__1.9.7" = 267
+"o2-icf__1.9.7__1.9.8" = 266
 "od__1.9.6__1.9.7" = 1592
 "od__1.9.7__1.9.8" = 1626
-"o2-ltcg__1.9.6__1.9.7" = 215
-"o2-ltcg__1.9.7__1.9.8" = 215
-"o2-pgo__1.9.6__1.9.7" = 327
-"o2-pgo__1.9.7__1.9.8" = 329
+"o2-ltcg__1.9.6__1.9.7" = 221
+"o2-ltcg__1.9.7__1.9.8" = 221
+"o2-pgo__1.9.6__1.9.7" = 331
+"o2-pgo__1.9.7__1.9.8" = 331
+# debug (2026-11-13): Visual Studio's Debug configuration (/ZI /Od /RTC1 /JMC, incremental linking). 1603 of 1662
+# and 1638 of 1691, 0 wrong. Its first run had one "wrong" match: the answer key's, 1.9.7 renamed two InRange
+# instantiations (declared in recipe.psd1).
+"debug__1.9.6__1.9.7" = 1603
+"debug__1.9.7__1.9.8" = 1638

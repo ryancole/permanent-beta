@@ -22,6 +22,15 @@
     Include  = @('include', 'src/lib_json')
     Defines  = @('_CRT_SECURE_NO_WARNINGS')
     Cl       = @('/W3', '/EHsc')
+    # Renames, keyed by the newer tag (old name = new name), each checked by hand against the sources. 1.9.7 passes
+    # `0u` instead of `0` as InRange's lower bound in asUInt, asUInt64, isConvertibleTo and friends, so the same
+    # template's instantiations for those callers change from T = int to T = unsigned int.
+    Renames  = @{
+        '1.9.7' = @{
+            '??$InRange@HI@Json@@YA_NNHI@Z'   = '??$InRange@II@Json@@YA_NNII@Z'
+            '??$InRange@H_K@Json@@YA_NNH_K@Z' = '??$InRange@I_K@Json@@YA_NNI_K@Z'
+        }
+    }
     # PGO training (flag set o2-pgo): the runner parses, rewrites and re-parses four of the project's test files,
     # run from test/data with relative names (it writes `.actual` and `.rewrite` files next to its input and puts
     # the path into strings, so an absolute path would make the profile depend on the checkout's location).

@@ -56,11 +56,12 @@ profile-guided optimization (`o2-pgo`). PGO builds instrumented, runs the recipe
 `Args`, optional `Cwd` and `Stdout`; `{src}`, `{out}` and `{recipe}` expand to the source, build and recipe
 directories), then relinks with the profile. Training must be deterministic, or the profile and the build change from run to run:
 `PgoCl` adds compiler options for PGO builds only (Lua forces in a fixed string-hash seed and `table.sort` pivot). A recipe can opt out of flag sets with `SkipFlags`, giving its
-reason: zstd skips /LTCG and PGO for now. The fixtures build every set except PGO.
+reason: zstd skips /LTCG and PGO for now. The fixtures build every set except PGO. `debug` is Visual Studio's
+Debug configuration (/ZI /Od /RTC1 /JMC, linked /INCREMENTAL): an empty `.textbss` and every call through an
+incremental linking thunk (design §4.2).
 
 Needs git and network access the first time. Only recipes and expected outcomes live here; sources and builds
-stay in `target/` and keep their own licenses. Planned: `/LTCG` and PGO flag sets. The
-extended proprietary corpus lives in a separate repository.
+stay in `target/` and keep their own licenses. The extended proprietary corpus lives in a separate repository.
 
 To see what wasn't matched:
 

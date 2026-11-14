@@ -27,7 +27,7 @@ they appear in the answer key too. That's realistic, so they stay in scope.
 pwsh corpus/build-fixtures.ps1
 ```
 
-Output per flag set (`o2`, `o2-icf`, `od`) in `target/fixtures/basic/<flags>/`:
+Output per flag set (`o2`, `o2-icf`, `od`, `o2-ltcg`, `debug`) in `target/fixtures/basic/<flags>/`:
 `v1/` and `v2/` with `fixture.exe`, `fixture.pdb`, `fixture.map`, and `truth.json` (the answer key).
 
 If you change the sources, regenerate the parser test data:
