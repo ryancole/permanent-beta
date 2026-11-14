@@ -87,6 +87,8 @@ pub enum PatternError {
     NoFunction,
     /// Even the whole main range (this many bytes) occurs elsewhere in the executable code.
     NotUnique { len: usize, matches: usize },
+    /// The whole function is shorter than [`MIN_LEN`] bytes: too short for a pattern, so nothing was searched.
+    TooShort { len: usize },
 }
 
 impl fmt::Display for PatternError {
@@ -96,6 +98,10 @@ impl fmt::Display for PatternError {
             Self::NotUnique { len, matches } => write!(
                 f,
                 "no unique pattern: all {len} bytes of the function match {matches} places in the code"
+            ),
+            Self::TooShort { len } => write!(
+                f,
+                "the function is only {len} bytes, shorter than the {MIN_LEN}-byte minimum"
             ),
         }
     }
@@ -205,6 +211,9 @@ impl PatternIndex {
                 }
             }
         }
+        if pattern.len() < MIN_LEN {
+            return Err(PatternError::TooShort { len: pattern.len() });
+        }
         Err(PatternError::NotUnique {
             len: pattern.len(),
             matches,
@@ -242,6 +251,7 @@ mod tests {
     ///   0x1000: sub rsp,28h; call 0x1040 (rel32, leaves the function); add rsp,28h; ret
     ///   0x1010: mov eax,[rip+0x1000]; add eax,1; ret
     ///   0x1020: same as 0x1000 but its call reaches 0x1040 from a different place
+    ///   0x1030: mov eax,1; ret (6 bytes, under MIN_LEN)
     fn code() -> Vec<u8> {
         let mut c = vec![0xCC; 0x50];
         let f1 = [
@@ -260,6 +270,7 @@ mod tests {
         let mut f3 = f1;
         f3[5] = 0x17; // call 0x1040 from 0x1024: different displacement, same code
         c[0x20..0x20 + f3.len()].copy_from_slice(&f3);
+        c[0x30..0x36].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]); // mov eax, 1; ret
         c[0x40] = 0xC3;
         c
     }
@@ -270,6 +281,7 @@ mod tests {
             (0x1000, "f1".into()),
             (0x1010, "f2".into()),
             (0x1020, "f3".into()),
+            (0x1030, "f4".into()),
         ];
         PatternIndex::from_image(image)
     }
@@ -293,6 +305,18 @@ mod tests {
             "{err}"
         );
         assert!(ix.generate(0x1020).is_err());
+    }
+
+    #[test]
+    fn a_function_under_the_minimum_is_too_short_not_unmatched() {
+        let err = index().generate(0x1030).unwrap_err();
+        assert_eq!(err, PatternError::TooShort { len: 6 });
+        assert!(err.to_string().contains("only 6 bytes"), "{err}");
+        // Negative: a long enough function with a copy is still reported as not unique, with its matches.
+        assert!(matches!(
+            index().generate(0x1000),
+            Err(PatternError::NotUnique { matches: 2, .. })
+        ));
     }
 
     #[test]
