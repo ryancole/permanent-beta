@@ -30,7 +30,10 @@ use std::path::Path;
 ///
 /// 3: a call to the function's own start (recursion) no longer counts as a branch into the patched bytes, so such a
 /// function's entry is hookable.
-pub const FEATURES_VERSION: &str = "native-3";
+///
+/// 4: the destructors and copy constructors a C++ throw site's ThrowInfo names are functions of their own
+/// (they were missed, or taken into the function before them).
+pub const FEATURES_VERSION: &str = "native-4";
 
 pub const PRODUCER: &str = "permanent-beta-native-pe";
 

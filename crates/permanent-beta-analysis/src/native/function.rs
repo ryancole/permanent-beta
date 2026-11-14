@@ -4,7 +4,8 @@
 //! that don't touch the stack, which is common at /O2. So starts are seeded from `.pdata`, the entry point,
 //! exports and code pointers stored in data (base relocations: function tables, callbacks in initialized
 //! structs), then extended to a fixpoint with direct call/jump targets and RIP-relative `lea` operands (an
-//! address taken, e.g. a callback) that land in executable code outside any known function. A function without
+//! address taken, e.g. a callback) that land in executable code outside any known function, plus the destructor
+//! and copy constructors a C++ throw site's ThrowInfo names (`thrown_type_functions`). A function without
 //! `.pdata` ends at the next known start (trailing `int3` padding trimmed). Once nothing else is found, code
 //! that starts on a 16-byte boundary after `int3` padding is a start too (dead code nothing references; see
 //! `padding_starts`), so it isn't taken into the function before it.
@@ -121,7 +122,41 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
             .chain(orphans)
             .collect();
         for (seg_start, seg_end) in segments {
+            // The last `lea rdx, [rip+x]`: a throw site's second argument, its ThrowInfo.
+            let mut throw_info: Option<u32> = None;
             for ins in decode(image, seg_start, seg_end) {
+                if ins.mnemonic() == Mnemonic::Lea
+                    && ins.op0_register() == Register::RDX
+                    && ins.is_ip_rel_memory_operand()
+                {
+                    throw_info = image.va_to_rva(ins.ip_rel_memory_address());
+                } else if ins.flow_control() == FlowControl::Call
+                    || ins.flow_control() == FlowControl::IndirectCall
+                {
+                    let throws = if ins.is_ip_rel_memory_operand() {
+                        is_throw_slot(image, ins.ip_rel_memory_address())
+                    } else {
+                        // `call _CxxThrowException`: the import's `jmp [__imp__CxxThrowException]` stub.
+                        (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)))
+                            && image
+                                .va_to_rva(ins.near_branch_target())
+                                .and_then(|t| decode(image, t, t + 6).first().copied())
+                                .is_some_and(|j| {
+                                    j.flow_control() == FlowControl::IndirectBranch
+                                        && j.is_ip_rel_memory_operand()
+                                        && is_throw_slot(image, j.ip_rel_memory_address())
+                                })
+                    };
+                    if throws {
+                        let named = throw_info.and_then(|ti| thrown_type_functions(image, ti));
+                        for t in named.into_iter().flatten() {
+                            if !starts.contains(&t) && !inside_pdata(t) {
+                                found.push(t);
+                            }
+                        }
+                    }
+                    throw_info = None;
+                }
                 let (t, is_call) = if (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)))
                 {
                     (
@@ -159,6 +194,77 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
         }
         starts.extend(found);
     }
+}
+
+/// An import address table slot for `_CxxThrowException` (VCRUNTIME140.dll and older runtimes).
+fn is_throw_slot(image: &Image, va: u64) -> bool {
+    image
+        .va_to_rva(va)
+        .and_then(|slot| image.iat.get(&slot))
+        .is_some_and(|name| name.rsplit('!').next() == Some("_CxxThrowException"))
+}
+
+/// Most catchable types a ThrowInfo is taken to list (the thrown class and its bases). **[Guess]**
+const MAX_CATCHABLE_TYPES: u32 = 64;
+
+/// The functions a C++ throw site names (design §4.4): `_CxxThrowException(object, &ThrowInfo)` passes a
+/// ThrowInfo whose image-relative RVAs name the thrown type's destructor and, through its CatchableTypeArray,
+/// each catchable type's copy constructor. Nothing else may reference them (a small destructor inlined
+/// everywhere else, laid out without `int3` padding before it), and image-relative RVAs aren't relocated
+/// pointers, so without this they're missed and taken into the function before them.
+///
+/// x64 layout (`ehdata.h`): ThrowInfo `{ attributes, pmfnUnwind, pForwardCompat, pCatchableTypeArray }`;
+/// CatchableTypeArray `{ nCatchableTypes, arrayOfCatchableTypes[] }`; CatchableType `{ properties, pType,
+/// thisDisplacement (3 ints), sizeOrOffset, copyFunction }`, all 32-bit. `None` unless every field is plausible:
+/// structures in read-only data, flags within their defined bits, functions in code or 0.
+fn thrown_type_functions(image: &Image, ti: u32) -> Option<Vec<u32>> {
+    let u32_at = |rva: u32| {
+        image
+            .bytes(rva, 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let read_only = |rva: u32| {
+        rva != 0
+            && image.bytes(rva, 4).is_some()
+            && !image.is_executable(rva)
+            && !image.is_writable(rva)
+    };
+    let code_or_none = |rva: u32| rva == 0 || image.is_executable(rva);
+    if !read_only(ti) {
+        return None;
+    }
+    let (attributes, unwind, compat, array) = (
+        u32_at(ti)?,
+        u32_at(ti + 4)?,
+        u32_at(ti + 8)?,
+        u32_at(ti + 12)?,
+    );
+    if attributes > 0x1f || !code_or_none(unwind) || !code_or_none(compat) || !read_only(array) {
+        return None;
+    }
+    let count = u32_at(array)?;
+    if count == 0 || count > MAX_CATCHABLE_TYPES {
+        return None;
+    }
+    let mut out: Vec<u32> = [unwind, compat].into_iter().filter(|&r| r != 0).collect();
+    for i in 0..count {
+        let ct = u32_at(array + 4 + 4 * i)?;
+        if !read_only(ct) {
+            return None;
+        }
+        let (properties, type_descriptor, copy) = (u32_at(ct)?, u32_at(ct + 4)?, u32_at(ct + 24)?);
+        let in_data =
+            image.bytes(type_descriptor, 1).is_some() && !image.is_executable(type_descriptor);
+        if properties > 0x1f || !in_data || !code_or_none(copy) {
+            return None;
+        }
+        if copy != 0 {
+            out.push(copy);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
 }
 
 /// Alignment MSVC gives function starts (`/ALIGN` default for x64 code is 16, padded with `int3`).
@@ -938,6 +1044,76 @@ mod tests {
         assert_eq!(found[0].end, 0x1006, "trailing int3 padding trimmed");
         let caller = features(&img, &found[0]);
         assert_eq!(caller.callees, vec![Rva(0x1010)]);
+    }
+
+    /// A throw site and the ThrowInfo it passes, for the throw-info tests. Code at 0x1000:
+    ///   0x1000: lea rdx, [0x2010]; call 0x1020; ret; int3 padding
+    ///   0x1020: jmp [0x2000] (the import stub; the slot is `import`)
+    ///   0x1028: mov rax, rcx; ret   (the destructor: 4-byte aligned, no int3 before it)
+    ///   0x102c: mov rax, rcx; ret   (the copy constructor, right after it)
+    /// Read-only data at 0x2000: the IAT slot, ThrowInfo at 0x2010 (`attributes`, unwind 0x1028), its
+    /// CatchableTypeArray at 0x2020 and one CatchableType at 0x2030 (copy constructor 0x102c). The type
+    /// descriptor is in writable data at 0x3000.
+    fn throw_image(import: &str, attributes: u32) -> Image {
+        use crate::native::image::Section;
+        let mut code = vec![0x48, 0x8d, 0x15, 0x09, 0x10, 0x00, 0x00]; // lea rdx, [rip+0x1009] = 0x2010
+        code.extend([0xe8, 0x14, 0x00, 0x00, 0x00, 0xc3]); // call 0x1020; ret
+        code.resize(0x20, 0xcc);
+        code.extend([0xff, 0x25, 0xda, 0x0f, 0x00, 0x00]); // jmp [rip+0xfda] = [0x2000]
+        code.extend([0xcc, 0xcc]);
+        code.extend([0x48, 0x89, 0xc8, 0xc3, 0x48, 0x89, 0xc8, 0xc3]);
+        let mut rdata = vec![0u8; 0x50];
+        let mut put = |at: usize, v: u32| rdata[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(0x10, attributes);
+        put(0x14, 0x1028); // pmfnUnwind
+        put(0x1c, 0x2020); // pCatchableTypeArray
+        put(0x20, 1); // nCatchableTypes
+        put(0x24, 0x2030);
+        put(0x34, 0x3000); // pType
+        put(0x3c, 0xffff_ffff); // thisDisplacement.pdisp = -1
+        put(0x44, 8); // sizeOrOffset
+        put(0x48, 0x102c); // copyFunction
+        let section = |name: &str, rva, data: Vec<u8>, executable, writable| Section {
+            name: name.into(),
+            rva,
+            virtual_size: 0x1000,
+            data,
+            executable,
+            writable,
+        };
+        let mut img = Image {
+            base: 0x1_4000_0000,
+            size_of_image: 0x4000,
+            sections: vec![
+                section(".text", 0x1000, code, true, false),
+                section(".rdata", 0x2000, rdata, false, false),
+                section(".data", 0x3000, vec![0u8; 0x20], false, true),
+            ],
+            entry: Some(0x1000),
+            ..Default::default()
+        };
+        img.iat.insert(0x2000, import.into());
+        img
+    }
+
+    #[test]
+    fn a_throw_sites_destructor_and_copy_constructor_are_functions() {
+        let img = throw_image("VCRUNTIME140.dll!_CxxThrowException", 0);
+        let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
+        assert_eq!(starts, vec![0x1000, 0x1020, 0x1028, 0x102c]);
+    }
+
+    #[test]
+    fn a_throw_info_is_read_only_when_everything_in_it_is_plausible() {
+        // Negative: the same lea and call, but the import is another function: rdx isn't a ThrowInfo, and the
+        // destructor and copy constructor stay inside the stub's range.
+        let img = throw_image("KERNEL32.dll!RaiseException", 0);
+        let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
+        assert_eq!(starts, vec![0x1000, 0x1020]);
+        // Negative: attribute bits ThrowInfo doesn't define: not taken for one, nothing read from it.
+        let img = throw_image("VCRUNTIME140.dll!_CxxThrowException", 0x100);
+        let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
+        assert_eq!(starts, vec![0x1000, 0x1020]);
     }
 
     #[test]
