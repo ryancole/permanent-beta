@@ -20,7 +20,9 @@ four wrong matches the new builds exposed:
 - **Answer key:** three renames declared (jsoncpp's two `InRange` instantiations, yaml-cpp's `_Get_unwrapped`, both
   from a changed call site), and zstd's `ZSTD_cwksp_aligned_alloc_size` → `_aligned64_alloc_size`, whose old name
   went to a new function: a new `ReusedNames` recipe entry (`pbeta-corpus truth --rename-reused`).
-The hook-repair loop (`build-hooks.ps1 -Run`) wasn't run.
+The hook-repair loop (`build-hooks.ps1 -Run -Replay`) is unchanged on 14.52 with these changes: 0 wrong
+relocations, every applied hook's trace identical, resolved 7/6 (/O2) and 6/5 (/Od) as before, 22 of 24 resolved
+hooks replay, and both negative controls caught.
 
 Before that (2026-11-13): **host follow-ups.** `harness/host/test.ps1` runs in CI (its own Windows job). A function
 that calls itself is hookable: a call to its own entry runs the hook, as any call does; a jump back to the entry
