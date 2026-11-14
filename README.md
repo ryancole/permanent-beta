@@ -1,3 +1,5 @@
+![permanent beta](docs/banner.svg)
+
 # Permanent Beta
 
 Keep function hooks working when the program they hook is rebuilt or updated.
