@@ -538,9 +538,11 @@ Generators (all output goes to review unless purely mechanical):
   executable, attaches only that build's hooks, each after its pattern matches, and does nothing in a build the
   config doesn't list. The action is the manifest's `detour`: `log`, `skip` and `return <n>` run through one
   generic thunk (no code per prototype; up to 12 parameters, not variadic), and `<file.dll>!<export>` attaches a
-  handler the user writes (`PBETA_HOOK` in `pbeta_handler.h`: the body only, no Detours, no addresses). Checked on
-  CenterWindows' two Debug builds: every action, a handler that calls through, a handler DLL without the export
-  (refused), and an executable the config doesn't list (no hooks).
+  handler the user writes (`PBETA_HOOK` in `pbeta_handler.h`: the body only, no Detours, no addresses). Tested by
+  `harness/host/test.ps1` (50 checks, seconds): a test app built twice, its hooks located by pbeta in both, run
+  under every action and handlers, with the thunk's hard cases (eight stack arguments, xmm arguments and results,
+  recursion, threads) checked by the app's own results, and three negatives (an unlisted build, a pattern
+  mismatch, a missing handler export). Two deliberately broken thunks fail it.
 - **Prototype adaptation** (implemented for added register parameters): when a candidate reads more Win64
   argument registers than the hook's prototype declares (and the old function didn't), the review item gets a
   proposed prototype, with each added parameter typed from its register class (`intptr_t` or `double`), and a C++

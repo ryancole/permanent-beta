@@ -8,8 +8,11 @@ Latest work: **the hook host** (design §7.2, `harness/host`). One Detours DLL f
 `pbeta host-config` turns the repaired manifests into `pbeta-host.toml`, and `pbeta-launch` starts the program
 with the host, which attaches only the running build's verified hooks (pattern-checked) and nothing in a build it
 doesn't know. Per hook, the manifest's `detour` is the action: `log`, `skip`, `return <n>` (a generic thunk, no
-code per prototype) or a handler in the user's DLL (`PBETA_HOOK`, the body only). Checked by hand on CenterWindows'
-two Debug builds; no automated end-to-end test yet (the C++ side has none).
+code per prototype) or a handler in the user's DLL (`PBETA_HOOK`, the body only). `pwsh harness/host/test.ps1`
+tests it end to end in seconds (50 checks on a test app built twice, its hooks located by pbeta; two deliberately
+broken thunks fail it). Not in CI yet. Found while writing it: a function that calls itself is "not hookable" (its
+recursive call targets the patched bytes), which is safe but needlessly strict for a call; and a function shorter
+than 8 bytes gets "no unique pattern … match 0 places" where it's too short to search.
 
 Before that: **incrementally linked images** (design §4.2). The packed-binary check accepts MSVC's empty
 `.textbss` in its exact shape, and the analyzer finds the incremental linking table: each thunk is its own

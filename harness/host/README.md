@@ -71,6 +71,21 @@ Writes `target/host`: `pbeta-host.dll`, `pbeta-launch.exe` (keep them together) 
 Needs the MSVC x64 toolset; Microsoft Detours (MIT) is cloned at a pinned commit and built if
 `target/hooks-src/Detours` doesn't have it.
 
+## Testing
+
+```
+pwsh harness/host/test.ps1
+```
+
+About ten seconds. Builds a test app twice (`test/hosttest.cpp`; the second build moves every function), lets pbeta
+locate its seven hooks in both, and runs both builds under the host in each scenario: every hook logging (the
+app's output must be identical to an unhooked run), `return` and `skip`, handlers that replace the original or
+call through (`test/hosttest_handlers.cpp`), and three negatives (a build the config doesn't list, a pattern that
+doesn't match, a handler DLL without the export). The functions cover what the thunk must get right: eight stack
+arguments, float and double arguments and results, mixed slots, a void result, strings, recursion, four threads.
+The app prints its own results, so a corrupted register or stack slot fails as a wrong number. Checked against
+two deliberately broken thunks (stack arguments off by one slot, `xmm1` not restored): both fail.
+
 ## Limits
 
 - x64 only. The launcher starts the program; attaching to a running process isn't built.
