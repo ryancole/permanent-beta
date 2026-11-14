@@ -122,6 +122,9 @@ PBETA_HOOK(int, SaveDocument, (Doc* doc, const wchar_t* path)) {
 }
 ```
 
+`pbeta handler-stubs --hooks hooks.toml --out handlers.cpp` writes these declarations for you, from each hooked
+function's prototype (or its PDB signature, with `--analysis`), so you only fill in the bodies.
+
 On the next release: analyze it, repair from `hooks.new.toml`, run `host-config` with every manifest. Nothing gets
 recompiled. More in [harness/host/README.md](harness/host/README.md).
 
@@ -146,7 +149,7 @@ cargo run -p permanent-beta-cli -- review accept ChecksumBlock:111111111111:2222
 ```
 
 `pwsh harness/host/test.ps1` runs the whole path, from analysis to hooks running under the host, on a test app built
-twice, in about ten seconds.
+twice, in about a minute.
 
 ## Commands
 
@@ -158,6 +161,7 @@ twice, in about ten seconds.
 | `repair` | Move a hook manifest to a new build; review items for the rest |
 | `review list / accept / reject / revoke` | Decide the review queue |
 | `host-config` | Manifests → the hook host's configuration |
+| `handler-stubs` | Manifests → a handler DLL's source, declarations written from the prototypes |
 | `header` | Manifests → `hooks.gen.h` for your own hook DLL |
 | `pattern` | Unique byte pattern for a function |
 | `propose` | Ask an AI model about unmatched functions (opt-in, queued for review) |

@@ -20,7 +20,8 @@
 use crate::harness::value_type;
 use crate::prototype::Prototype;
 use permanent_beta_model::{
-    AnalysisExport, ArgSlot, BuildId, FunctionSignature, HookManifest, Rva, SkippedHook, ValueType,
+    AnalysisExport, ArgSlot, BuildId, FunctionSignature, HookManifest, HookSpec, Rva, SkippedHook,
+    ValueType,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -165,15 +166,7 @@ pub fn config(
                 continue;
             };
             let build = &hook.target.build;
-            let signature = analyses
-                .iter()
-                .find(|a| &a.build.id == build)
-                .and_then(|a| a.function(rva))
-                .and_then(|f| f.signature.as_ref());
-            let prototype = hook
-                .prototype
-                .clone()
-                .or_else(|| signature.map(|s| render(&hook.name, s)));
+            let prototype = prototype_of(hook, analyses).map(|(text, _)| text);
             let parsed = prototype.as_deref().and_then(Prototype::parse);
             let mut entry = HostHook {
                 build: build.clone(),
@@ -240,6 +233,220 @@ pub fn config(
         },
         skipped,
     ))
+}
+
+/// The hook's C prototype and where it came from: the manifest's `prototype`, else the PDB signature of the function
+/// at its RVA in its own build's analysis.
+fn prototype_of(hook: &HookSpec, analyses: &[AnalysisExport]) -> Option<(String, &'static str)> {
+    if let Some(p) = &hook.prototype {
+        return Some((p.clone(), "manifest prototype"));
+    }
+    let rva = hook.target.rva?;
+    analyses
+        .iter()
+        .find(|a| a.build.id == hook.target.build)
+        .and_then(|a| a.function(rva))
+        .and_then(|f| f.signature.as_ref())
+        .map(|s| (render(&hook.name, s), "PDB signature"))
+}
+
+/// A handler DLL's source with one `PBETA_HOOK` per handler export (`pbeta handler-stubs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerStubs {
+    pub dll: String,
+    /// C++ source: each handler's declaration from the hooked function's prototype, with a body that calls through
+    /// to the original, so the DLL behaves like the unhooked program until a body is changed.
+    pub text: String,
+    pub exports: Vec<String>,
+    /// Handlers left out: no prototype, or one that can't be taken apart safely. Written by hand.
+    pub skipped: Vec<SkippedHook>,
+}
+
+/// Handler stubs for every hook in `manifests` whose `detour` is a handler in `dll` (or in the only handler DLL
+/// they name). Each declaration comes from the hooked function's prototype ([`prototype_of`]), so its parameters
+/// and return type match the function's, which nothing checks when the DLL is loaded.
+///
+/// An export used by several hooks or builds must have one prototype (types compared; parameter names may differ),
+/// or it's an error: a handler has one prototype.
+pub fn handler_stubs(
+    manifests: &[HookManifest],
+    analyses: &[AnalysisExport],
+    dll: Option<&str>,
+) -> Result<HandlerStubs, String> {
+    // export -> (hook names, prototype text and source, parsed), in first-seen order.
+    type Entry = (Vec<String>, Option<(String, &'static str, Prototype)>);
+    let mut entries: Vec<(String, Entry)> = Vec::new();
+    let mut unparsable: Vec<SkippedHook> = Vec::new();
+    let mut dlls: Vec<String> = Vec::new();
+    for hook in manifests.iter().flat_map(|m| &m.hooks) {
+        let action =
+            Action::parse(hook.detour.as_deref()).map_err(|e| format!("{}: {e}", hook.name))?;
+        let Action::Handler { dll: d, export } = action else {
+            continue;
+        };
+        if dll.is_some_and(|want| !want.eq_ignore_ascii_case(&d)) {
+            continue;
+        }
+        if !dlls.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+            dlls.push(d);
+        }
+        let i = match entries.iter().position(|(e, _)| *e == export) {
+            Some(i) => i,
+            None => {
+                entries.push((export.clone(), (Vec::new(), None)));
+                entries.len() - 1
+            }
+        };
+        let (hooks, proto) = &mut entries[i].1;
+        if !hooks.contains(&hook.name) {
+            hooks.push(hook.name.clone());
+        }
+        let Some((text, source)) = prototype_of(hook, analyses) else {
+            continue;
+        };
+        let Some(parsed) = Prototype::parse(&text).filter(stubbable) else {
+            unparsable.push(SkippedHook {
+                name: export.clone(),
+                reason: format!(
+                    "`{text}` can't be taken apart safely (variadic, function-pointer or array parameter): \
+                     write this handler by hand"
+                ),
+            });
+            continue;
+        };
+        match proto {
+            Some((first, _, p)) if signature_key(p) != signature_key(&parsed) => {
+                return Err(format!(
+                    "{export}: the hooked functions' prototypes differ (`{first}` and `{text}`); a handler has \
+                     one prototype, so give each its own export"
+                ));
+            }
+            Some(_) => {}
+            None => *proto = Some((text, source, parsed)),
+        }
+    }
+    let dll = match (dll, dlls.as_slice()) {
+        (Some(want), _) => want.to_owned(),
+        (None, [one]) => one.clone(),
+        (None, []) => {
+            return Err(
+                "no hook's `detour` names a handler: set it to <file.dll>!<export> first".into(),
+            );
+        }
+        (None, many) => {
+            return Err(format!(
+                "the hooks name several handler DLLs ({}): choose one with --dll",
+                many.join(", ")
+            ));
+        }
+    };
+    if entries.is_empty() {
+        return Err(format!("no hook's `detour` names a handler in {dll}"));
+    }
+
+    let mut skipped = Vec::new();
+    let mut exports = Vec::new();
+    let mut text = format!(
+        "// Handlers for {dll}, generated by `pbeta handler-stubs` from the hook manifests. Each declaration is the\n\
+         // hooked function's prototype: keep it as it is and fill in the body. As generated, every handler calls\n\
+         // the original, so the program behaves as it does unhooked.\n\
+         //\n\
+         // Build: cl /LD /I<pbeta>\\target\\host\\include <this file>  (harness/host/README.md). A parameter of a\n\
+         // struct type passed by value needs that type's definition included first.\n\
+         \n\
+         #include <pbeta_handler.h>\n"
+    );
+    for (export, (hooks, proto)) in &entries {
+        let Some((proto_text, source, p)) = proto else {
+            if !unparsable.iter().any(|s| &s.name == export) {
+                skipped.push(SkippedHook {
+                    name: export.clone(),
+                    reason: "no prototype in the manifest and no PDB signature (pass the build's analysis \
+                             from `pbeta analyze --pdb`)"
+                        .into(),
+                });
+            }
+            continue;
+        };
+        // (type, name); an unnamed parameter is named a<position>.
+        let typed: Vec<(String, String)> = p
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, param)| match &param.name {
+                Some(n) if !only_type_words(&param.ty) => (param.ty.clone(), n.clone()),
+                _ => (param.full(), format!("a{}", i + 1)),
+            })
+            .collect();
+        let names: Vec<&str> = typed.iter().map(|(_, n)| n.as_str()).collect();
+        let params: Vec<String> = typed.iter().map(|(t, n)| format!("{t} {n}")).collect();
+        let call = format!("PBETA_ORIGINAL({export})({})", names.join(", "));
+        let body = if p.returns_void() {
+            format!("    {call};\n")
+        } else {
+            format!("    return {call};\n")
+        };
+        text.push_str(&format!(
+            "\n// {}: {source} `{proto_text}`\nPBETA_HOOK({}, {export}, ({})) {{\n{body}}}\n",
+            hooks.join(", "),
+            p.return_type(),
+            params.join(", "),
+        ));
+        exports.push(export.clone());
+    }
+    skipped.extend(unparsable);
+    if exports.is_empty() {
+        return Err(format!(
+            "no handler in {dll} has a usable prototype: {}",
+            skipped
+                .iter()
+                .map(|s| format!("{}: {}", s.name, s.reason))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    Ok(HandlerStubs {
+        dll,
+        text,
+        exports,
+        skipped,
+    })
+}
+
+/// A prototype a stub can be written from: no array parameters (`int a[4]` doesn't split into type and name).
+fn stubbable(p: &Prototype) -> bool {
+    p.params.iter().all(|q| !q.full().contains('['))
+}
+
+/// `struct Doc` parses as type `struct`, name `Doc`: a parameter whose "type" is only these words is unnamed.
+fn only_type_words(ty: &str) -> bool {
+    ty.split_whitespace().all(|w| {
+        matches!(
+            w,
+            "struct" | "class" | "union" | "enum" | "const" | "volatile" | "unsigned" | "signed"
+        )
+    })
+}
+
+/// What a handler's prototype must agree on: the return type and each parameter's type, spacing aside.
+fn signature_key(p: &Prototype) -> Vec<String> {
+    // `char *` and `char*` are one type: no space around `*` or `&`.
+    let squash = |t: &str| {
+        t.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" *", "*")
+            .replace(" &", "&")
+    };
+    std::iter::once(squash(&p.return_type()))
+        .chain(p.params.iter().map(|q| {
+            if only_type_words(&q.ty) {
+                squash(&q.full())
+            } else {
+                squash(&q.ty)
+            }
+        }))
+        .collect()
 }
 
 /// A C prototype from a PDB signature (names from the PDB when it has them).
@@ -431,8 +638,8 @@ mod tests {
         assert!(config(&[v1, other], &[]).is_err());
     }
 
-    #[test]
-    fn a_pdb_signature_stands_in_for_a_missing_prototype() {
+    /// An analysis of `build` with one function at 0x10 whose PDB signature is `ret (params)`.
+    fn pdb_analysis(build: &str, ret: &str, params: &[(Option<&str>, &str)]) -> AnalysisExport {
         let mut f = FunctionFeatures {
             rva: Rva(0x10),
             size: 64,
@@ -459,16 +666,19 @@ mod tests {
         };
         f.signature = Some(FunctionSignature {
             calling_convention: Some("__cdecl".into()),
-            return_type: Some("int".into()),
-            params: vec![Param {
-                name: None,
-                ty: "struct HWND__*".into(),
-            }],
+            return_type: Some(ret.into()),
+            params: params
+                .iter()
+                .map(|&(name, ty)| Param {
+                    name: name.map(str::to_owned),
+                    ty: ty.into(),
+                })
+                .collect(),
         });
-        let analysis = AnalysisExport {
+        AnalysisExport {
             schema_version: ANALYSIS_SCHEMA_VERSION,
             build: BuildInfo {
-                id: BuildId("v1".into()),
+                id: BuildId(build.into()),
                 file_name: "t.exe".into(),
                 version: None,
                 machine: Machine::X64,
@@ -485,7 +695,12 @@ mod tests {
             globals: vec![],
             data_symbols: vec![],
             pointer_aliases: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn a_pdb_signature_stands_in_for_a_missing_prototype() {
+        let analysis = pdb_analysis("v1", "int", &[(None, "struct HWND__*")]);
         let m = manifest(vec![hook("CenterWindow", "v1", Some(0x10), None, None)]);
         let (c, _) = config(std::slice::from_ref(&m), std::slice::from_ref(&analysis)).unwrap();
         assert_eq!(
@@ -528,5 +743,158 @@ mod tests {
         // Negative: an unknown action stops the whole config.
         let m = manifest(vec![hook("H", "v1", Some(0x10), Some("Hook_H"), None)]);
         assert!(config(&[m], &[]).unwrap_err().contains("unknown action"));
+    }
+
+    #[test]
+    fn handler_stubs_declare_each_handler_by_the_hooked_functions_prototype() {
+        let m = manifest(vec![
+            hook(
+                "add3",
+                "v1",
+                Some(0x20),
+                Some("h.dll!add3"),
+                Some("int __fastcall add3(int a, int b, int)"),
+            ),
+            hook(
+                "store",
+                "v1",
+                Some(0x30),
+                Some("h.dll!OnStore"),
+                Some("void store(int* out, struct Doc)"),
+            ),
+            // No prototype in the manifest: the PDB signature (unsigned __int64 kept whole).
+            hook("fib", "v1", Some(0x10), Some("h.dll!fib"), None),
+            // Not a handler: no stub.
+            hook(
+                "logged",
+                "v1",
+                Some(0x40),
+                Some("log"),
+                Some("int logged(int a)"),
+            ),
+        ]);
+        let analysis = pdb_analysis("v1", "unsigned __int64", &[(Some("n"), "unsigned int")]);
+        let s = handler_stubs(&[m], &[analysis], None).unwrap();
+        assert_eq!(s.dll, "h.dll");
+        assert_eq!(s.exports, ["add3", "OnStore", "fib"]);
+        assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+        assert!(s.text.contains("#include <pbeta_handler.h>"));
+        let stubs = [
+            "// add3: manifest prototype `int __fastcall add3(int a, int b, int)`\n\
+             PBETA_HOOK(int, add3, (int a, int b, int a3)) {\n    \
+             return PBETA_ORIGINAL(add3)(a, b, a3);\n}\n",
+            // `struct Doc` is a type alone, not type `struct` and name `Doc`.
+            "PBETA_HOOK(void, OnStore, (int* out, struct Doc a2)) {\n    \
+             PBETA_ORIGINAL(OnStore)(out, a2);\n}\n",
+            "// fib: PDB signature `unsigned __int64 fib(unsigned int n)`\n\
+             PBETA_HOOK(unsigned __int64, fib, (unsigned int n)) {\n    \
+             return PBETA_ORIGINAL(fib)(n);\n}\n",
+        ];
+        for stub in stubs {
+            assert!(s.text.contains(stub), "{stub}\n--- not in ---\n{}", s.text);
+        }
+        assert!(!s.text.contains("logged"));
+    }
+
+    #[test]
+    fn one_export_for_several_builds_needs_one_prototype() {
+        // The same handler in two builds' manifests, parameter names aside: one stub.
+        let v1 = manifest(vec![hook(
+            "F",
+            "v1",
+            Some(0x10),
+            Some("h.dll!F"),
+            Some("int F(int a, char* s)"),
+        )]);
+        let v2 = manifest(vec![hook(
+            "F",
+            "v2",
+            Some(0x90),
+            Some("h.dll!F"),
+            Some("int F(int count, char *text)"),
+        )]);
+        let s = handler_stubs(&[v1.clone(), v2], &[], None).unwrap();
+        assert_eq!(s.exports, ["F"]);
+        assert_eq!(s.text.matches("PBETA_HOOK(").count(), 1);
+        // Negative: the function gained a parameter in v2; one handler can't fit both, so no stub is guessed.
+        let v2 = manifest(vec![hook(
+            "F",
+            "v2",
+            Some(0x90),
+            Some("h.dll!F"),
+            Some("int F(int a, char* s, int n)"),
+        )]);
+        let e = handler_stubs(&[v1.clone(), v2], &[], None).unwrap_err();
+        assert!(e.contains("prototypes differ"), "{e}");
+        // Negative: a different type in the same position.
+        let v2 = manifest(vec![hook(
+            "F",
+            "v2",
+            Some(0x90),
+            Some("h.dll!F"),
+            Some("int F(int a, wchar_t* s)"),
+        )]);
+        assert!(handler_stubs(&[v1, v2], &[], None).is_err());
+    }
+
+    #[test]
+    fn handler_stubs_refuse_what_they_cannot_write() {
+        // Negative: no handler at all; handlers in two DLLs without a choice.
+        let m = manifest(vec![hook(
+            "A",
+            "v1",
+            Some(0x10),
+            Some("skip"),
+            Some("int A(int a)"),
+        )]);
+        assert!(
+            handler_stubs(&[m], &[], None)
+                .unwrap_err()
+                .contains("names a handler")
+        );
+        let m = manifest(vec![
+            hook(
+                "A",
+                "v1",
+                Some(0x10),
+                Some("one.dll!A"),
+                Some("int A(int a)"),
+            ),
+            hook(
+                "B",
+                "v1",
+                Some(0x20),
+                Some("two.dll!B"),
+                Some("int B(int b)"),
+            ),
+        ]);
+        assert!(
+            handler_stubs(std::slice::from_ref(&m), &[], None)
+                .unwrap_err()
+                .contains("--dll")
+        );
+        let s = handler_stubs(&[m], &[], Some("TWO.dll")).unwrap();
+        assert_eq!(s.exports, ["B"]);
+        // Negative: a variadic prototype and a missing one are skipped with a reason, never guessed.
+        let m = manifest(vec![
+            hook("A", "v1", Some(0x10), Some("h.dll!A"), Some("int A(int a)")),
+            hook(
+                "P",
+                "v1",
+                Some(0x20),
+                Some("h.dll!P"),
+                Some("int P(const char* fmt, ...)"),
+            ),
+            hook("Q", "v1", Some(0x30), Some("h.dll!Q"), None),
+        ]);
+        let s = handler_stubs(&[m], &[], None).unwrap();
+        assert_eq!(s.exports, ["A"]);
+        let reasons: Vec<&str> = s.skipped.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons.contains(&"P") && reasons.contains(&"Q"));
+        assert!(!s.text.contains("PBETA_HOOK(int, P") && !s.text.contains("PBETA_HOOK(int, Q"));
+        // Negative: nothing usable at all is an error, not an empty file.
+        let m = manifest(vec![hook("Q", "v1", Some(0x30), Some("h.dll!Q"), None)]);
+        assert!(handler_stubs(&[m], &[], None).is_err());
     }
 }

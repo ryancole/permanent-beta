@@ -59,17 +59,14 @@ impl Prototype {
     }
 
     pub fn returns_void(&self) -> bool {
-        self.head
-            .split_whitespace()
-            .filter(|w| !w.starts_with("__"))
-            .eq(["void"])
+        self.return_type() == "void"
     }
 
-    /// The return type without calling-convention keywords.
-    pub(crate) fn return_type(&self) -> String {
+    /// The return type without calling-convention keywords (`unsigned __int64 __fastcall` → `unsigned __int64`).
+    pub fn return_type(&self) -> String {
         self.head
             .split_whitespace()
-            .filter(|w| !w.starts_with("__"))
+            .filter(|w| !crate::harness::is_type_qualifier_keyword(w))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -104,6 +101,11 @@ impl ProtoParam {
                 name: Some(name.to_owned()),
             }
         })
+    }
+
+    /// The parameter as written: type and name.
+    pub fn full(&self) -> String {
+        self.render()
     }
 
     fn render(&self) -> String {

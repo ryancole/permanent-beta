@@ -403,9 +403,27 @@ fn significant_words(ty: &str) -> Vec<&str> {
                     *w,
                     "const" | "volatile" | "struct" | "class" | "union" | "signed" | "__restrict"
                 )
-                && !w.starts_with("__") // calling conventions
+                && !is_type_qualifier_keyword(w)
         })
         .collect()
+}
+
+/// MSVC keywords that don't change a type's size or class: calling conventions and pointer qualifiers. Not every
+/// `__` word: `__int64` is a type.
+pub(crate) fn is_type_qualifier_keyword(w: &str) -> bool {
+    matches!(
+        w,
+        "__cdecl"
+            | "__stdcall"
+            | "__fastcall"
+            | "__thiscall"
+            | "__vectorcall"
+            | "__clrcall"
+            | "__ptr64"
+            | "__ptr32"
+            | "__unaligned"
+            | "__restrict"
+    )
 }
 
 /// How a parameter of type `ty` travels in Win64, and how wide it is.
@@ -421,18 +439,19 @@ fn scalar(ty: &str) -> Option<ValueType> {
     use ValueType::{Float, Int, Void};
     Some(match ty {
         "void" => Void,
-        "bool" | "char" | "unsigned char" | "int8_t" | "uint8_t" | "BYTE" | "BOOLEAN" => Int(1),
+        "bool" | "char" | "unsigned char" | "__int8" | "unsigned __int8" | "int8_t" | "uint8_t"
+        | "BYTE" | "BOOLEAN" => Int(1),
         "short" | "unsigned short" | "short int" | "unsigned short int" | "int16_t"
-        | "uint16_t" | "wchar_t" | "WORD" => Int(2),
+        | "uint16_t" | "wchar_t" | "__int16" | "unsigned __int16" | "WORD" => Int(2),
         "int" | "unsigned" | "unsigned int" | "long" | "unsigned long" | "long int"
-        | "unsigned long int" | "int32_t" | "uint32_t" | "DWORD" | "BOOL" | "LONG" | "UINT" => {
-            Int(4)
-        }
+        | "unsigned long int" | "__int32" | "unsigned __int32" | "int32_t" | "uint32_t"
+        | "DWORD" | "BOOL" | "LONG" | "UINT" => Int(4),
         "long long"
         | "unsigned long long"
         | "long long int"
         | "unsigned long long int"
         | "__int64"
+        | "unsigned __int64"
         | "int64_t"
         | "uint64_t"
         | "size_t"
@@ -932,6 +951,19 @@ mod tests {
         assert!(s.layouts.is_empty());
         // A struct by value has no single-register value type.
         assert_eq!(value_type("Order"), ValueType::Unknown);
+    }
+
+    #[test]
+    fn msvc_sized_integer_types_keep_their_width() {
+        // The PDB spells 64-bit integers `__int64`; only calling conventions are dropped, not every `__` word.
+        assert_eq!(value_type("unsigned __int64"), ValueType::Int(8));
+        assert_eq!(value_type("__int64 __fastcall"), ValueType::Int(8));
+        assert_eq!(value_type("unsigned __int16"), ValueType::Int(2));
+        // Negative: `unsigned __int64` must not read as `unsigned` (4 bytes), nor a bare `__int64` as nothing.
+        assert_ne!(value_type("unsigned __int64"), ValueType::Int(4));
+        assert_ne!(value_type("__int64"), ValueType::Unknown);
+        let p = crate::prototype::Prototype::parse("unsigned __int64 __fastcall f(int n)").unwrap();
+        assert_eq!(p.return_type(), "unsigned __int64");
     }
 
     #[test]

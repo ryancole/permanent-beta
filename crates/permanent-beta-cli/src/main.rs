@@ -299,6 +299,26 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Write a handler DLL's source for the hooks whose `detour` is <file.dll>!<export>: one PBETA_HOOK per export,
+    /// declared by the hooked function's prototype (the manifest's, or the build's PDB signature), with a body that
+    /// calls the original. Fill in the bodies.
+    HandlerStubs {
+        /// Hook manifests. Repeatable; an export used in several builds must have one prototype.
+        #[arg(long, required = true)]
+        hooks: Vec<PathBuf>,
+        /// Analyses from `pbeta analyze --pdb`, for hooks without a prototype in their manifest. Repeatable.
+        #[arg(long)]
+        analysis: Vec<PathBuf>,
+        /// The handler DLL to write stubs for, when the hooks name more than one.
+        #[arg(long)]
+        dll: Option<String>,
+        /// The .cpp file to write.
+        #[arg(long)]
+        out: PathBuf,
+        /// Overwrite `out` if it exists (its handler bodies are lost).
+        #[arg(long)]
+        force: bool,
+    },
     /// Replay the cases recorded at an old RVA on a function of a new binary, by emulation (design §7.3). Exit
     /// code 0 if every replayable case matches (and one could be replayed), 1 if one differs or none could.
     Replay {
@@ -559,6 +579,13 @@ fn run(cli: Cli) -> Result<u8> {
             analysis,
             out,
         } => cmd_host_config(&hooks, &analysis, &out),
+        Command::HandlerStubs {
+            hooks,
+            analysis,
+            dll,
+            out,
+            force,
+        } => cmd_handler_stubs(&hooks, &analysis, dll.as_deref(), &out, force),
         Command::TraceDiff {
             old,
             new,
@@ -1547,6 +1574,40 @@ fn cmd_host_config(hooks: &[PathBuf], analyses: &[PathBuf], out: &Path) -> Resul
     }
     println!("host config written to {}", out.display());
     Ok(0)
+}
+
+fn cmd_handler_stubs(
+    hooks: &[PathBuf],
+    analyses: &[PathBuf],
+    dll: Option<&str>,
+    out: &Path,
+    force: bool,
+) -> Result<u8> {
+    use permanent_beta_engine::permanent_beta_repair::host;
+    if out.exists() && !force {
+        anyhow::bail!(
+            "{} exists; its handler bodies would be lost (pass --force to overwrite)",
+            out.display()
+        );
+    }
+    let manifests = hooks
+        .iter()
+        .map(|p| load_manifest(p))
+        .collect::<Result<Vec<_>>>()?;
+    let analyses = analyses
+        .iter()
+        .map(|p| Ok(export::load(p)?))
+        .collect::<Result<Vec<_>>>()?;
+    let stubs = host::handler_stubs(&manifests, &analyses, dll).map_err(anyhow::Error::msg)?;
+    std::fs::write(out, &stubs.text).with_context(|| format!("writing {}", out.display()))?;
+    for e in &stubs.exports {
+        println!("{}!{e}", stubs.dll);
+    }
+    for s in &stubs.skipped {
+        println!("skipped {}: {}", s.name, s.reason);
+    }
+    println!("handler stubs written to {}", out.display());
+    Ok(EXIT_OK)
 }
 
 fn load_manifest(path: &Path) -> Result<HookManifest> {

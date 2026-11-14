@@ -49,7 +49,18 @@ PBETA_HOOK(BOOL, CenterWindow, (HWND hWnd)) {
 Build it as a DLL with `target/host/include` on the include path (`cl /LD /I<...>\target\host\include
 handlers.cpp`), and set `detour = "handlers.dll!CenterWindow"`. The host loads it, attaches `CenterWindow` in the
 original's place and sets `pbeta_original_CenterWindow` to the original. The prototype must match the hooked
-function's exactly: nothing can check that for you.
+function's exactly, and nothing checks it when the DLL is loaded, so let pbeta write the declarations:
+
+```
+pbeta handler-stubs --hooks hooks.toml [--analysis app.json] --out handlers.cpp
+```
+
+For every hook whose `detour` is a handler, it writes the `PBETA_HOOK` declaration from the hooked function's
+prototype (the manifest's, or with `--analysis` the build's PDB signature) and a body that calls the original, so
+the DLL compiles and changes nothing until you edit a body. Pass every build's manifest: an export used in several
+builds must have one prototype in all of them, or it's an error (give each its own export). It doesn't overwrite an
+existing file without `--force`, and lists the hooks it can't write (no prototype; a variadic, function-pointer or
+array parameter).
 
 ## Running
 
@@ -77,17 +88,19 @@ Needs the MSVC x64 toolset; Microsoft Detours (MIT) is cloned at a pinned commit
 pwsh harness/host/test.ps1
 ```
 
-About ten seconds. Builds a test app twice (`test/hosttest.cpp`; the second build moves every function), lets pbeta
-locate its seven hooks in both, and runs both builds under the host in each scenario: every hook logging (the
-app's output must be identical to an unhooked run), `return` and `skip`, handlers that replace the original or
-call through (`test/hosttest_handlers.cpp`), and three negatives (a build the config doesn't list, a pattern that
+About a minute (more the first time, when Detours is built). Builds a test app twice (`test/hosttest.cpp`; the
+second build moves every function), lets pbeta locate its seven hooks in both, and runs both builds under the host
+in each scenario: every hook logging (the app's output must be identical to an unhooked run), `return` and `skip`,
+handlers that replace the original or call through (`test/hosttest_handlers.cpp`), every hook handled by stubs from
+`pbeta handler-stubs` (two declared from PDB signatures; output unchanged), and three negatives (a build the config doesn't list, a pattern that
 doesn't match, a handler DLL without the export). The functions cover what the thunk must get right: eight stack
-arguments, float and double arguments and results, mixed slots, a void result, strings, recursion, four threads.
+arguments, float and double arguments and results, mixed slots, a void result, strings, direct recursion, four threads.
 The app prints its own results, so a corrupted register or stack slot fails as a wrong number. Checked against
 two deliberately broken thunks (stack arguments off by one slot, `xmm1` not restored): both fail.
 
 ## Limits
 
 - x64 only. The launcher starts the program; attaching to a running process isn't built.
-- A handler's prototype isn't checked against the function.
+- A handler's prototype isn't checked against the function when the DLL loads; `pbeta handler-stubs` writes it
+  from the function's prototype instead.
 - The log is plain text, one line per call, unbuffered: very hot functions slow the program down.

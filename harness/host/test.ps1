@@ -187,6 +187,36 @@ foreach ($b in 'v1', 'v2') {
     Check (Has $r.Log 'handler: sum12 -> 650') "$b handler logs through the host"
 }
 
+Write-Host 'handler stubs: pbeta handler-stubs writes every handler, each calls through'
+# Every hook handled by a generated stub. fib and count_chars lose their manifest prototype, so their stubs come
+# from the PDB signatures (unsigned __int64, const wchar_t*). A stub with a wrong prototype corrupts a result.
+$actions = @{}
+foreach ($name in $prototypes.Keys) { $actions[$name] = "stubs.dll!$name" }
+$config = New-Config 'stubs' $actions
+foreach ($b in 'v1', 'v2') {
+    $path = "$work\stubs.$b.toml"
+    $text = Get-Content $path -Raw
+    foreach ($name in 'fib', 'count_chars') {
+        $text = $text -replace "(name = `"$name`"\r?\n(?:[a-z]+ = `"[^`"]*`"\r?\n)*?)prototype = `"[^`"]*`"\r?\n", '$1'
+    }
+    Set-Content $path $text -NoNewline
+}
+Check (-not ((Get-Content "$work\stubs.v1.toml" -Raw) -match 'prototype = "[^"]*fib\(')) 'fib has no manifest prototype'
+Invoke-Native $pbeta @('handler-stubs', '--hooks', "$work\stubs.v1.toml", '--hooks', "$work\stubs.v2.toml",
+    '--analysis', "$work\v1.json", '--analysis', "$work\v2.json", '--out', "$work\stubs.cpp") | Out-Null
+$stubs = Get-Content "$work\stubs.cpp" -Raw
+Check (([regex]::Matches($stubs, 'PBETA_HOOK\(')).Count -eq 7) '7 stubs generated'
+Check ($stubs -match '// fib: PDB signature') 'fib stub from the PDB signature'
+Invoke-Native 'cl.exe' ($cl + @('/LD', "/I$host_\include", "$work\stubs.cpp", "/Fo$work\", "/Fd$work\stubs-cl.pdb",
+        "/Fe$work\stubs.dll", '/link', "/IMPLIB:$work\stubs.lib")) | Out-Null
+foreach ($b in 'v1', 'v2') {
+    $r = Invoke-Hosted $config $b 'stubs'
+    Check ($r.Code -eq 0 -and (Lines $r.Output) -eq $baseline) "$b output unchanged through the stubs"
+    Check (@($r.Log | Where-Object { $_ -match ', handled by stubs\.dll!' }).Count -eq 7) "$b 7 stubs attached"
+}
+& $pbeta handler-stubs --hooks "$work\stubs.v1.toml" --out "$work\stubs.cpp" 2>&1 | Out-Null
+Check ($LASTEXITCODE -ne 0) 'negative: an existing handler file is not overwritten'
+
 Write-Host 'negative: a build the config does not list'
 $config = New-Config 'v2only' @{ add3 = 'return 42' } @('v2')
 $r = Invoke-Hosted $config 'v1' 'v2only'
