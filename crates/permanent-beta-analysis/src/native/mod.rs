@@ -27,7 +27,10 @@ use std::path::Path;
 ///
 /// 2: calls and code pointers to an incremental linking thunk are the thunk's target's (`ilt`), and each thunk is
 /// its own function.
-pub const FEATURES_VERSION: &str = "native-2";
+///
+/// 3: a call to the function's own start (recursion) no longer counts as a branch into the patched bytes, so such a
+/// function's entry is hookable.
+pub const FEATURES_VERSION: &str = "native-3";
 
 pub const PRODUCER: &str = "permanent-beta-native-pe";
 

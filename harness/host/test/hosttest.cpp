@@ -53,17 +53,10 @@ NOINLINE size_t count_chars(const char* s, const wchar_t* w) {
     return std::strlen(s) + std::wcslen(w);
 }
 
-// Recursion through a helper: a function that calls or jumps to its own entry has a branch into the bytes a hook
-// patches, and pbeta sends it to review as not hookable (at /O2 the compiler also turns direct recursion into a
-// loop back to the entry).
-NOINLINE unsigned long long fib_rest(unsigned n);
-
+// Direct recursion: each call fib makes to itself goes through the hook (pbeta takes a call to a function's own
+// entry as hookable; a jump back to it, a loop, is not).
 NOINLINE unsigned long long fib(unsigned n) {
-    return n < 2 ? n : fib_rest(n);
-}
-
-NOINLINE unsigned long long fib_rest(unsigned n) {
-    return fib(n - 1) + fib(n - 2);
+    return n < 2 ? n : fib(n - 1) + fib(n - 2);
 }
 
 namespace {

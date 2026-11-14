@@ -401,7 +401,12 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
                         nh.update([segment]);
                         nh.update(offset.to_le_bytes());
                         leaders.insert(t);
-                        internal_targets.insert(t);
+                        // A call to the function's own start (recursion) reaches the patch at its first byte and
+                        // runs the hook, as a call from anywhere else does: not a hazard. A jump there (a loop back
+                        // to the entry) or any branch into the rest of the patched bytes is.
+                        if !(t == start_va && ins.flow_control() == FlowControl::Call) {
+                            internal_targets.insert(t);
+                        }
                     } else {
                         nh.update(b"x");
                         if let Some(rva) = image.va_to_rva(t).filter(|&r| image.is_executable(r)) {
@@ -1293,6 +1298,37 @@ mod tests {
         let e = analyze(&[0xff, 0xc9, 0x75, 0xfc, 0xc3, 0x90, 0x90])
             .entry
             .unwrap();
+        assert!(e.branch_into_patch);
+        assert!(!e.hazards().is_empty());
+    }
+
+    #[test]
+    fn a_function_that_calls_itself_is_hookable() {
+        // 0x1000: sub rsp, 28h; call 0x1000; add rsp, 28h; ret  → the recursive call runs the hook, as it should
+        let e = analyze(&[
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0xf7, 0xff, 0xff, 0xff, 0x48, 0x83, 0xc4, 0x28, 0xc3,
+        ])
+        .entry
+        .unwrap();
+        assert!(!e.branch_into_patch);
+        assert!(e.hazards().is_empty(), "{:?}", e.hazards());
+    }
+
+    #[test]
+    fn a_jump_to_the_entry_or_a_call_into_the_patch_is_not_hookable() {
+        // Negative: 0x1000: sub rsp, 28h; add rsp, 28h; jmp 0x1000  → a loop back to the entry, not a call
+        let e = analyze(&[0x48, 0x83, 0xec, 0x28, 0x48, 0x83, 0xc4, 0x28, 0xeb, 0xf6])
+            .entry
+            .unwrap();
+        assert!(e.branch_into_patch);
+        // Negative: 0x1000: nop; sub rsp, 28h; call 0x1001; add rsp, 28h; ret  → a call into the middle of the
+        // patched bytes, which the hook's jmp overwrites
+        let e = analyze(&[
+            0x90, 0x48, 0x83, 0xec, 0x28, 0xe8, 0xf7, 0xff, 0xff, 0xff, 0x48, 0x83, 0xc4, 0x28,
+            0xc3,
+        ])
+        .entry
+        .unwrap();
         assert!(e.branch_into_patch);
         assert!(!e.hazards().is_empty());
     }
