@@ -11,7 +11,11 @@ Built so far for the corpus hook app, in `corpus/hooks/hookdll/` (design §7.3):
 - **Replay / compare (new build):** scenario trace diff (`pbeta trace-diff`, `repair --old-trace`) and emulation of
   the candidate on recorded cases (`permanent-beta-replay`, `pbeta replay`, `repair --cases`).
 
-Not yet: callee sequences, memory reachable through pointers inside structs, redaction rules, and a harness DLL
-for other targets (the corpus DLL's logging detours are written per prototype).
+- **Hook host (any program):** `host/` (its README). One DLL that attaches every hook pbeta verified for the
+  running build, with built-in actions (log, skip, return a value) or the user's handler functions, configured by
+  `pbeta host-config`.
+
+Not yet: callee sequences, memory reachable through pointers inside structs, and recording in the hook host (the
+recorder is still the corpus DLL's).
 
 Recordings may contain whatever data the target was processing. Keep them local and support redaction rules.

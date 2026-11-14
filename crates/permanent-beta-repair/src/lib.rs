@@ -7,6 +7,7 @@
 
 pub mod harness;
 pub mod header;
+pub mod host;
 pub mod layout;
 pub mod prototype;
 

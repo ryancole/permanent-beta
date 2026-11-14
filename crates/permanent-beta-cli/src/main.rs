@@ -285,6 +285,20 @@ enum Command {
         #[arg(long)]
         pointer_alias: Vec<String>,
     },
+    /// Write the generic hook host's configuration (harness/host): per build, each hook's RVA, pattern, action
+    /// (the manifest's `detour`: log, skip, return <n> or <file.dll>!<export>) and how to decode its arguments.
+    HostConfig {
+        /// Hook manifests, e.g. every repaired manifest of a release line: each hook is listed for the build it's
+        /// bound to. Repeatable.
+        #[arg(long, required = true)]
+        hooks: Vec<PathBuf>,
+        /// Analyses from `pbeta analyze --pdb`: a hook without a prototype in its manifest gets the PDB signature
+        /// of its build, so the log can decode its arguments. Repeatable.
+        #[arg(long)]
+        analysis: Vec<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Replay the cases recorded at an old RVA on a function of a new binary, by emulation (design §7.3). Exit
     /// code 0 if every replayable case matches (and one could be replayed), 1 if one differs or none could.
     Replay {
@@ -540,6 +554,11 @@ fn run(cli: Cli) -> Result<u8> {
             !no_import_memory,
             pointer_depth,
         ),
+        Command::HostConfig {
+            hooks,
+            analysis,
+            out,
+        } => cmd_host_config(&hooks, &analysis, &out),
         Command::TraceDiff {
             old,
             new,
@@ -829,7 +848,7 @@ fn cmd_harness_spec(
     }
     let text = format!(
         "# Record spec for the recording hook DLL (pbeta harness-spec; design §7.3). Edit `capture` to change what\n\
-         # is recorded, `redact` to never record an argument or global. Recordings can contain customer data: keep\n\
+         # is recorded, `redact` to never record an argument or global. Recordings hold the target's own data: keep\n\
          # them local.\n{}",
         toml::to_string_pretty(&spec)?
     );
@@ -1491,6 +1510,43 @@ fn cmd_header(hooks: &[PathBuf], out: &Path) -> Result<u8> {
     std::fs::write(out, text).with_context(|| format!("writing {}", out.display()))?;
     println!("offsets header written to {}", out.display());
     Ok(EXIT_OK)
+}
+
+fn cmd_host_config(hooks: &[PathBuf], analyses: &[PathBuf], out: &Path) -> Result<u8> {
+    use permanent_beta_engine::permanent_beta_repair::host;
+    let manifests = hooks
+        .iter()
+        .map(|p| load_manifest(p))
+        .collect::<Result<Vec<_>>>()?;
+    let analyses = analyses
+        .iter()
+        .map(|p| Ok(export::load(p)?))
+        .collect::<Result<Vec<_>>>()?;
+    let (config, skipped) = host::config(&manifests, &analyses).map_err(anyhow::Error::msg)?;
+    let text = format!(
+        "# Hook host configuration (pbeta host-config; harness/host), generated from hook manifests. Change a\n\
+         # hook's action with its `detour` in the manifest and run host-config again. The host attaches a hook\n\
+         # only in the build it's listed for.\n{}",
+        toml::to_string_pretty(&config)?
+    );
+    std::fs::write(out, text).with_context(|| format!("writing {}", out.display()))?;
+    for h in &config.hooks {
+        let short = h.build.0.get(..12).unwrap_or(&h.build.0);
+        println!(
+            "{short}  {:<24} {:<10} {:<14} {}",
+            h.name,
+            h.rva.to_string(),
+            h.action,
+            h.prototype
+                .as_deref()
+                .unwrap_or("(no prototype: logs raw registers)")
+        );
+    }
+    for s in &skipped {
+        println!("skipped {}: {}", s.name, s.reason);
+    }
+    println!("host config written to {}", out.display());
+    Ok(0)
 }
 
 fn load_manifest(path: &Path) -> Result<HookManifest> {

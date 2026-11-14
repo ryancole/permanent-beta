@@ -491,7 +491,7 @@ consume the same manifest via generators.
 ```toml
 [[hook]]
 name        = "SaveDocument"
-detour      = "Hook_SaveDocument"        # symbol in the hook DLL
+detour      = "Hook_SaveDocument"        # symbol in the hook DLL; for the hook host, its action (§7.2)
 criticality = "normal"                   # low | normal | high
 prototype   = "int __fastcall SaveDocument(Doc* doc, const wchar_t* path)"
 
@@ -531,6 +531,16 @@ Generators (all output goes to review unless purely mechanical):
 - **Offsets header** (implemented): `pbeta header --hooks <manifest>... --out hooks.gen.h`: RVAs and patterns per
   build, for hook DLLs that use hardcoded tables, with a lookup by the executable's SHA-256. A hook without a
   verified locator for a build has RVA 0 there.
+- **Hook host** (implemented 2026-11-13, `harness/host`): one Detours DLL for any x64 program, so a user writes no
+  hook plumbing. `pbeta host-config --hooks <manifest>... [--analysis <a>...] --out pbeta-host.toml` lists every
+  hook for the build its locator is bound to (a hook in review stays on its verified build), with its RVA, pattern,
+  action and argument slots (from the manifest's prototype, or the build's PDB signature). The host hashes the
+  executable, attaches only that build's hooks, each after its pattern matches, and does nothing in a build the
+  config doesn't list. The action is the manifest's `detour`: `log`, `skip` and `return <n>` run through one
+  generic thunk (no code per prototype; up to 12 parameters, not variadic), and `<file.dll>!<export>` attaches a
+  handler the user writes (`PBETA_HOOK` in `pbeta_handler.h`: the body only, no Detours, no addresses). Checked on
+  CenterWindows' two Debug builds: every action, a handler that calls through, a handler DLL without the export
+  (refused), and an executable the config doesn't list (no hooks).
 - **Prototype adaptation** (implemented for added register parameters): when a candidate reads more Win64
   argument registers than the hook's prototype declares (and the old function didn't), the review item gets a
   proposed prototype, with each added parameter typed from its register class (`intptr_t` or `double`), and a C++

@@ -12,7 +12,8 @@ pub struct HookManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookSpec {
     pub name: String,
-    /// Symbol of the detour function in the hook DLL.
+    /// Symbol of the detour function in the hook DLL. For the generic hook host (`pbeta host-config`), the action:
+    /// `log`, `skip`, `return <n>` or `<file.dll>!<export>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detour: Option<String>,
     #[serde(default)]

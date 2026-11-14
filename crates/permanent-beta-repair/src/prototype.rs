@@ -66,7 +66,7 @@ impl Prototype {
     }
 
     /// The return type without calling-convention keywords.
-    fn return_type(&self) -> String {
+    pub(crate) fn return_type(&self) -> String {
         self.head
             .split_whitespace()
             .filter(|w| !w.starts_with("__"))

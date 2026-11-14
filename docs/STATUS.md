@@ -4,7 +4,14 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **incrementally linked images** (design §4.2). The packed-binary check accepts MSVC's empty
+Latest work: **the hook host** (design §7.2, `harness/host`). One Detours DLL for any x64 program:
+`pbeta host-config` turns the repaired manifests into `pbeta-host.toml`, and `pbeta-launch` starts the program
+with the host, which attaches only the running build's verified hooks (pattern-checked) and nothing in a build it
+doesn't know. Per hook, the manifest's `detour` is the action: `log`, `skip`, `return <n>` (a generic thunk, no
+code per prototype) or a handler in the user's DLL (`PBETA_HOOK`, the body only). Checked by hand on CenterWindows'
+two Debug builds; no automated end-to-end test yet (the C++ side has none).
+
+Before that: **incrementally linked images** (design §4.2). The packed-binary check accepts MSVC's empty
 `.textbss` in its exact shape, and the analyzer finds the incremental linking table: each thunk is its own
 function marked `thunk_to`, calls through one are its target's, thunks are never matched, and a hook on one moves
 to its target (`FEATURES_VERSION` `native-2`). Checked on one Debug program only (0 wrong without PDBs); the
