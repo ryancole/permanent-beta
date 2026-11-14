@@ -464,7 +464,11 @@ impl Matcher for NormalizedHashMatcher {
             );
             if o <= 1 && n <= 1 {
                 kept.push(c);
-            } else if let Some(anchor) = MnemonicHashMatcher::anchor(ctx, c.old, c.new) {
+            } else if let Some(anchor) =
+                MnemonicHashMatcher::anchor(ctx, c.old, c.new, &|f: &FunctionFeatures| {
+                    f.normalized_hash.as_deref() == Some(h.as_str())
+                })
+            {
                 c.evidence.push(anchor);
                 kept.push(c);
             } else {
@@ -473,7 +477,8 @@ impl Matcher for NormalizedHashMatcher {
                     old: vec![c.old],
                     new: vec![c.new],
                     detail: format!(
-                        "suggestion only: identical code with {o} and {n} copies, the last unmatched                          on each side, but no matched neighbour agrees"
+                        "suggestion only: identical code with {o} and {n} copies, the last unmatched on each side, \
+                         but no matched neighbour agrees"
                     ),
                 });
             }
@@ -599,14 +604,40 @@ pub const MNEMONIC_MIN_SIZE: u32 = 32;
 
 impl MnemonicHashMatcher {
     /// A matched neighbour that agrees with pairing `old` with `new`, as evidence.
-    fn anchor(ctx: &MatchContext<'_>, old: Rva, new: Rva) -> Option<Evidence> {
+    ///
+    /// When the old build has other copies of the same code (`same_code`), the neighbour must tell this copy
+    /// apart: a callee that every copy calls, or a caller that calls every copy, says nothing about which copy
+    /// this is. In a /JMC (Debug) build every function calls `__CheckForDebuggerJustMyCode`, so 66 identical
+    /// empty functions in yaml-cpp each "agreed" through it with whichever new copy was left.
+    fn anchor(
+        ctx: &MatchContext<'_>,
+        old: Rva,
+        new: Rva,
+        same_code: &dyn Fn(&FunctionFeatures) -> bool,
+    ) -> Option<Evidence> {
         let (o, n) = (ctx.old.function(old)?, ctx.new.function(new)?);
+        let copies: Vec<&FunctionFeatures> = ctx
+            .old
+            .functions
+            .iter()
+            .filter(|f| f.rva != old && same_code(f))
+            .collect();
+        let callee_tells_apart =
+            |c: &Rva| copies.is_empty() || copies.iter().any(|f| !f.callees.contains(c));
+        let caller_tells_apart = |caller: &FunctionFeatures| {
+            copies.is_empty() || copies.iter().any(|f| !caller.callees.contains(&f.rva))
+        };
         let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|p| (p.old, p.new)).collect();
-        if let Some((oc, nc)) = o.callees.iter().filter(|c| **c != old).find_map(|c| {
-            map.get(c)
-                .filter(|m| n.callees.contains(m))
-                .map(|m| (*c, *m))
-        }) {
+        if let Some((oc, nc)) = o
+            .callees
+            .iter()
+            .filter(|c| **c != old && callee_tells_apart(c))
+            .find_map(|c| {
+                map.get(c)
+                    .filter(|m| n.callees.contains(m))
+                    .map(|m| (*c, *m))
+            })
+        {
             return Some(Evidence {
                 kind: evidence_kind::CALLEES.to_owned(),
                 detail: format!("both call matched {oc} -> {nc}"),
@@ -615,7 +646,7 @@ impl MnemonicHashMatcher {
         ctx.old
             .functions
             .iter()
-            .filter(|f| f.rva != old && f.callees.contains(&old))
+            .filter(|f| f.rva != old && f.callees.contains(&old) && caller_tells_apart(f))
             .find_map(|caller| {
                 let nc = map.get(&caller.rva)?;
                 ctx.new
@@ -663,7 +694,13 @@ impl Matcher for MnemonicHashMatcher {
             };
             if let Some(reason) = self.contradiction(ctx, &c) {
                 proposals.ambiguities.push(suggestion(reason));
-            } else if let Some(anchor) = Self::anchor(ctx, c.old, c.new) {
+            } else if let Some(anchor) = Self::anchor(ctx, c.old, c.new, &|f: &FunctionFeatures| {
+                let mh = ctx
+                    .old
+                    .function(c.old)
+                    .and_then(|o| o.mnemonic_hash.as_deref());
+                mh.is_some() && f.mnemonic_hash.as_deref() == mh
+            }) {
                 c.evidence.push(anchor);
                 kept.push(c);
             } else {
@@ -741,12 +778,52 @@ impl Matcher for MatchedCalleesMatcher {
             &new_key,
             &describe,
         );
-        for c in &mut proposals.candidates {
+        // Unique among the unmatched isn't unique: when other functions in either build (matched ones too) have
+        // the same code calling the same functions, the callees don't tell the copies apart, and the last two
+        // left were paired by elimination. A suggestion only, as in the hash pass.
+        fn count<K: Hash + Eq>(
+            e: &AnalysisExport,
+            key: &dyn Fn(&FunctionFeatures) -> Option<K>,
+        ) -> HashMap<K, usize> {
+            let mut c = HashMap::new();
+            for k in e.functions.iter().filter_map(key) {
+                *c.entry(k).or_default() += 1;
+            }
+            c
+        }
+        let (old_count, new_count) = (count(ctx.old, &old_key), count(ctx.new, &new_key));
+        let mut kept = Vec::new();
+        for mut c in proposals.candidates {
+            let o = ctx
+                .old
+                .function(c.old)
+                .and_then(old_key)
+                .and_then(|k| old_count.get(&k).copied());
+            let n = ctx
+                .new
+                .function(c.new)
+                .and_then(new_key)
+                .and_then(|k| new_count.get(&k).copied());
+            let (o, n) = (o.unwrap_or(0), n.unwrap_or(0));
+            if o > 1 || n > 1 {
+                proposals.ambiguities.push(Ambiguity {
+                    matcher: self.name().to_owned(),
+                    old: vec![c.old],
+                    new: vec![c.new],
+                    detail: format!(
+                        "suggestion only: identical code calling the same functions, {o} and {n} copies, the last \
+                         unmatched on each side"
+                    ),
+                });
+                continue;
+            }
             c.evidence.push(Evidence {
                 kind: evidence_kind::NORMALIZED_HASH.to_owned(),
                 detail: "identical normalized code".into(),
             });
+            kept.push(c);
         }
+        proposals.candidates = kept;
         proposals
     }
 }
@@ -2830,22 +2907,52 @@ mod tests {
         assert!(pairs(&old, &new).contains(&(0x20, 0x120)));
     }
 
-    /// Two copies of the same code on each side; the first pair is matched by name. The second copies call `x`
-    /// only if `anchored`.
-    fn copies(anchored: bool) -> (AnalysisExport, AnalysisExport) {
-        let callees: &[u64] = if anchored { &[0x50] } else { &[] };
-        let new_callees: &[u64] = if anchored { &[0x150] } else { &[] };
+    /// Which copies call the matched function `x` in [`copies`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum CallsX {
+        None,
+        /// Only the second copies: `x` tells them apart from the first.
+        Second,
+        /// Every copy, like `__CheckForDebuggerJustMyCode` in a /JMC build: tells nothing apart.
+        All,
+    }
+
+    /// Two copies of the same code on each side; the first pair is matched by name.
+    fn copies(calls_x: CallsX) -> (AnalysisExport, AnalysisExport) {
+        let x = |rva: u64, second: bool| -> Vec<Rva> {
+            match calls_x {
+                CallsX::All => vec![Rva(rva)],
+                CallsX::Second if second => vec![Rva(rva)],
+                _ => vec![],
+            }
+        };
         let mut a = func(0x20, Some("a"), Some("dup"));
-        a.callees = callees.iter().map(|&r| Rva(r)).collect();
+        a.callees = x(0x50, false);
         let mut b = func(0x30, None, Some("dup"));
-        b.callees = callees.iter().map(|&r| Rva(r)).collect();
+        b.callees = x(0x50, true);
         let old = export("a", vec![named_calling(0x50, "x", &[]), a, b]);
         let mut a2 = func(0x120, Some("a"), Some("dup"));
-        a2.callees = new_callees.iter().map(|&r| Rva(r)).collect();
+        a2.callees = x(0x150, false);
         let mut b2 = func(0x130, None, Some("dup"));
-        b2.callees = new_callees.iter().map(|&r| Rva(r)).collect();
+        b2.callees = x(0x150, true);
         let new = export("b", vec![named_calling(0x150, "x", &[]), a2, b2]);
         (old, new)
+    }
+
+    #[test]
+    fn a_neighbour_every_copy_has_does_not_anchor_a_copy() {
+        // Negative (yaml-cpp 0.9.0 Debug: 66 empty functions, each calling only __CheckForDebuggerJustMyCode):
+        // a matched callee that every copy calls says nothing about which copy this is.
+        let (old, new) = copies(CallsX::All);
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x30)),
+            "{:?}",
+            got.candidates
+        );
+        // Control: only the second copies call x, so it tells them apart.
+        let (old, new) = copies(CallsX::Second);
+        assert!(pairs(&old, &new).contains(&(0x30, 0x130)));
     }
 
     #[test]
@@ -2853,7 +2960,7 @@ mod tests {
         // Negative (yaml-cpp 0.9.0, an 11-byte helper with 66 copies per build): once the other copies are
         // matched, the last two left are unique only among the unmatched. Without a matched neighbour that
         // agrees, that's a review suggestion.
-        let (old, new) = copies(false);
+        let (old, new) = copies(CallsX::None);
         let got = run_passes(&old, &new, &default_matchers());
         assert!(
             !got.candidates.iter().any(|c| c.old == Rva(0x30)),
@@ -2868,7 +2975,7 @@ mod tests {
             got.ambiguities
         );
         // Control: both call matched x, so the pair is anchored.
-        let (old, new) = copies(true);
+        let (old, new) = copies(CallsX::Second);
         assert!(pairs(&old, &new).contains(&(0x30, 0x130)));
     }
 
