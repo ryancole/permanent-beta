@@ -1,18 +1,26 @@
-# Status — where we left off (2026-11-10)
+# Status — where we left off (2026-11-13)
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work: **the hook host** (design §7.2, `harness/host`). One Detours DLL for any x64 program:
+Latest work (2026-11-13): **host follow-ups.** `harness/host/test.ps1` runs in CI (its own Windows job). A function
+that calls itself is hookable: a call to its own entry runs the hook, as any call does; a jump back to the entry
+(a loop) or any branch into the rest of the patched bytes is still refused (`FEATURES_VERSION` `native-3`, so
+analyses must be redone; corpus scorecards not run). The host test's `fib` is now directly recursive. `pbeta
+handler-stubs` writes a handler DLL's `PBETA_HOOK` declarations from the hooked functions' prototypes (manifest or
+PDB signature), each calling the original, so a handler author only writes bodies; the host test compiles and runs
+generated stubs for all seven hooks. Fixed on the way: a PDB type `unsigned __int64` was read as `unsigned`
+(4 bytes) by the record spec and the host log, because every `__` word was dropped as a calling convention.
+
+Before that: **the hook host** (design §7.2, `harness/host`). One Detours DLL for any x64 program:
 `pbeta host-config` turns the repaired manifests into `pbeta-host.toml`, and `pbeta-launch` starts the program
 with the host, which attaches only the running build's verified hooks (pattern-checked) and nothing in a build it
 doesn't know. Per hook, the manifest's `detour` is the action: `log`, `skip`, `return <n>` (a generic thunk, no
 code per prototype) or a handler in the user's DLL (`PBETA_HOOK`, the body only). `pwsh harness/host/test.ps1`
-tests it end to end in seconds (50 checks on a test app built twice, its hooks located by pbeta; two deliberately
-broken thunks fail it). Not in CI yet. Found while writing it: a function that calls itself is "not hookable" (its
-recursive call targets the patched bytes), which is safe but needlessly strict for a call. (A function shorter
-than 8 bytes used to get "no unique pattern … match 0 places"; it now says it's too short.)
+tests it end to end (58 checks on a test app built twice, its hooks located by pbeta; two deliberately broken
+thunks fail it). (A function shorter than 8 bytes used to get "no unique pattern … match 0 places"; it now says
+it's too short.)
 
 Before that: **incrementally linked images** (design §4.2). The packed-binary check accepts MSVC's empty
 `.textbss` in its exact shape, and the analyzer finds the incremental linking table: each thunk is its own

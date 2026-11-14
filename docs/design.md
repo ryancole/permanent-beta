@@ -172,7 +172,7 @@ Per function (fields optional unless noted):
 | `signature` | Calling convention, return type, parameters, typically from PDB or decompiler. |
 
 Per build, **`features_version`** (2026-11-10) names the normalizer that computed the code features and its
-version (`native-2`; `permanent_beta_analysis::native::FEATURES_VERSION`). Every native analysis has it, whatever
+version (`native-3`; `permanent_beta_analysis::native::FEATURES_VERSION`). Every native analysis has it, whatever
 found the boundaries (native discovery or a Ghidra export: the features come from the same code). The engine
 matches, repairs and verifies only between analyses that agree on it (`AnalysisExport::features_comparable`):
 another version, or an analysis without one (written before it existed, or PDB-only), is refused with "analyze
@@ -510,7 +510,7 @@ Each locator is bound to a specific `build`. A repaired manifest re-binds it to 
 |---|---|---|
 | `unchanged` | Verified, same RVA | Locator re-bound to the new build. |
 | `relocated` | Verified, new RVA | New RVA, and with `--new-binary` a regenerated AOB pattern (below). |
-| `needs_review` | Unmatched, ambiguous, verification failed, insufficient evidence, signature changed, not hookable (the new function is under 5 bytes, a branch targets the patched bytes, or it is only a jump thunk), or stale locator (bound to another build than the one repaired from, e.g. a hook an earlier repair sent to review: its RVA says nothing about the old build) | Review item; the locator stays bound to the old build. |
+| `needs_review` | Unmatched, ambiguous, verification failed, insufficient evidence, signature changed, not hookable (the new function is under 5 bytes, a branch targets the patched bytes (a recursive call to its own start does not count), or it is only a jump thunk), or stale locator (bound to another build than the one repaired from, e.g. a hook an earlier repair sent to review: its RVA says nothing about the old build) | Review item; the locator stays bound to the old build. |
 
 A hook whose locator is still bound to an older build (an earlier repair sent it to review) is repaired from that
 build directly when its analysis is given (`pbeta repair --earlier`), e.g. v1 → v3. Without it, it's a stale
@@ -538,11 +538,15 @@ Generators (all output goes to review unless purely mechanical):
   executable, attaches only that build's hooks, each after its pattern matches, and does nothing in a build the
   config doesn't list. The action is the manifest's `detour`: `log`, `skip` and `return <n>` run through one
   generic thunk (no code per prototype; up to 12 parameters, not variadic), and `<file.dll>!<export>` attaches a
-  handler the user writes (`PBETA_HOOK` in `pbeta_handler.h`: the body only, no Detours, no addresses). Tested by
-  `harness/host/test.ps1` (50 checks, seconds): a test app built twice, its hooks located by pbeta in both, run
-  under every action and handlers, with the thunk's hard cases (eight stack arguments, xmm arguments and results,
-  recursion, threads) checked by the app's own results, and three negatives (an unlisted build, a pattern
-  mismatch, a missing handler export). Two deliberately broken thunks fail it.
+  handler the user writes (`PBETA_HOOK` in `pbeta_handler.h`: the body only, no Detours, no addresses). `pbeta
+  handler-stubs` (2026-11-13) writes the handlers' declarations from the hooked functions' prototypes (manifest or
+  PDB signature), each with a body that calls the original, since nothing checks a handler's prototype when it
+  loads; an export used in several builds must have one prototype (types compared, names aside), or it's an error.
+  Tested by `harness/host/test.ps1` (58 checks, about a minute; in CI): a test app built twice, its hooks located
+  by pbeta in both, run under every action, handlers and generated stubs, with the thunk's hard cases (eight stack
+  arguments, xmm arguments and results, direct recursion, threads) checked by the app's own results, and three
+  negatives (an unlisted build, a pattern mismatch, a missing handler export). Two deliberately broken thunks fail
+  it.
 - **Prototype adaptation** (implemented for added register parameters): when a candidate reads more Win64
   argument registers than the hook's prototype declares (and the old function didn't), the review item gets a
   proposed prototype, with each added parameter typed from its register class (`intptr_t` or `double`), and a C++

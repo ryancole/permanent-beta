@@ -36,6 +36,17 @@ jobs:
       - name: replay tests with the emulator (icicle running Ghidra's x86-64 SLEIGH specification)
         run: cargo test -p permanent-beta-replay -p permanent-beta-cli --features permanent-beta-replay/emulator
 
+  host:
+    # The hook host end to end (harness/host/test.ps1, about a minute): builds Detours, the host and a test app
+    # twice, locates its hooks with pbeta and runs both builds under every action, handlers and generated stubs.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: hook host end-to-end test
+        shell: pwsh
+        run: ./harness/host/test.ps1
+
   corpus:
     if: github.event_name == 'workflow_dispatch' && inputs.corpus
     runs-on: windows-latest
