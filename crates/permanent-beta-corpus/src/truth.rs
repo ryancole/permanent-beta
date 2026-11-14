@@ -21,6 +21,10 @@
 //!    recipe. Lua 5.4.7 renamed `luaK_exp2RK` to a static `exp2RK`: without the declaration, matching the two
 //!    is scored as wrong. A declaration whose old name still exists in the new build is an error, so the list
 //!    can't go stale.
+//! 5. declared reused names, joined before everything else: zstd 1.5.7 renamed `ZSTD_cwksp_aligned_alloc_size`
+//!    to `ZSTD_cwksp_aligned64_alloc_size` and gave the old name to a new function, so joining by name would pair
+//!    the old function with an unrelated one. Skipped where either function was inlined away; an error when
+//!    either name is ambiguous.
 //!
 //! Leftovers named after a lambda (`<lambda_HASH>`, a per-build hash) join only within their object file, and
 //! those still unjoined are out of scope: two `(char)` lambdas in one file can't be told apart by name.
@@ -103,6 +107,20 @@ impl GroundTruth {
         scope: &Scope,
         renames: &[(String, String)],
     ) -> Result<Self, String> {
+        Self::from_maps_with_declarations(old, new, scope, renames, &[])
+    }
+
+    /// Like [`Self::from_maps_with_renames`], and first joins each declared reused name `(old name, new name)`:
+    /// the old build's function named `old name` with the new build's `new name`, while the new build's `old
+    /// name` (another function) joins nothing by that name. Skipped when either is missing (inlined away); an
+    /// error when the old build has more than one `old name` or the new build more than one `new name`.
+    pub fn from_maps_with_declarations(
+        old: &MapFile,
+        new: &MapFile,
+        scope: &Scope,
+        renames: &[(String, String)],
+        reused: &[(String, String)],
+    ) -> Result<Self, String> {
         let in_scope = |map: &'_ MapFile| -> Vec<MapSymbol> {
             map.symbols
                 .iter()
@@ -112,15 +130,46 @@ impl GroundTruth {
         };
         let (old_syms, new_syms) = (in_scope(old), in_scope(new));
 
+        let mut new_used = vec![false; new_syms.len()];
+        let mut joined: Vec<(Option<&MapSymbol>, Option<&MapSymbol>)> = Vec::new();
+
+        // Stage 0: declared reused names. Where the renamed function was inlined away (an optimized build of
+        // a header static), the old one is deleted; the namesake may be inlined away too, so it isn't required.
+        let mut old_reused = vec![false; old_syms.len()];
+        for (from, to) in reused {
+            let find = |syms: &[MapSymbol], name: &str| -> Vec<usize> {
+                (0..syms.len()).filter(|&i| syms[i].name == name).collect()
+            };
+            let (olds, new_to) = (find(&old_syms, from), find(&new_syms, to));
+            match (olds.as_slice(), new_to.as_slice()) {
+                ([o], [n]) => {
+                    old_reused[*o] = true;
+                    new_used[*n] = true;
+                    joined.push((Some(&old_syms[*o]), Some(&new_syms[*n])));
+                }
+                // The renamed function was inlined away: the old one has no counterpart, and never its namesake.
+                ([o], []) => {
+                    old_reused[*o] = true;
+                    joined.push((Some(&old_syms[*o]), None));
+                }
+                ([], _) => {}
+                _ => {
+                    return Err(format!(
+                        "reused name {from} -> {to} is ambiguous: {} old function(s) named {from}, {} new named {to}",
+                        olds.len(),
+                        new_to.len()
+                    ));
+                }
+            }
+        }
+
         // Stage 1: by (name, object).
         let mut new_by_key: HashMap<(&str, &str), usize> = HashMap::new();
         for (i, s) in new_syms.iter().enumerate() {
             new_by_key.entry((&s.name, &s.object)).or_insert(i);
         }
-        let mut new_used = vec![false; new_syms.len()];
-        let mut joined: Vec<(Option<&MapSymbol>, Option<&MapSymbol>)> = Vec::new();
         let mut old_left: Vec<&MapSymbol> = Vec::new();
-        for o in &old_syms {
+        for (o, _) in old_syms.iter().zip(&old_reused).filter(|(_, r)| !**r) {
             match new_by_key.get(&(o.name.as_str(), o.object.as_str())) {
                 Some(&i) if !new_used[i] => {
                     new_used[i] = true;
@@ -511,6 +560,78 @@ mod tests {
         let r = renames(&[("f", "g")]);
         assert!(
             GroundTruth::from_maps_with_renames(&old, &new, &Scope::ProjectObjects, &r).is_err()
+        );
+    }
+
+    #[test]
+    fn a_reused_name_joins_the_renamed_function_not_the_namesake() {
+        // zstd 1.5.7: aligned_alloc_size became aligned64_alloc_size, and the old name went to a new function.
+        let old = map(vec![sym("aligned", 0x10, "a.obj", false)]);
+        let new = map(vec![
+            sym("aligned", 0x90, "a.obj", false),
+            sym("aligned64", 0xa0, "a.obj", false),
+        ]);
+        let reused = renames(&[("aligned", "aligned64")]);
+        let t = GroundTruth::from_maps_with_declarations(
+            &old,
+            &new,
+            &Scope::ProjectObjects,
+            &[],
+            &reused,
+        )
+        .unwrap();
+        let pairs: Vec<_> = t.functions.iter().map(|e| (e.old, e.new)).collect();
+        assert!(
+            pairs.contains(&(Some(Rva(0x10)), Some(Rva(0xa0)))),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&(None, Some(Rva(0x90)))),
+            "the namesake is added: {pairs:?}"
+        );
+        // Without the declaration, the name joins: the namesake is the old function's answer.
+        let t = GroundTruth::from_maps(&old, &new, &Scope::ProjectObjects);
+        assert!(
+            t.functions
+                .iter()
+                .any(|e| (e.old, e.new) == (Some(Rva(0x10)), Some(Rva(0x90))))
+        );
+    }
+
+    #[test]
+    fn a_reused_name_must_be_unambiguous() {
+        let old = map(vec![sym("f", 0x10, "a.obj", false)]);
+        let reused = renames(&[("f", "g")]);
+        // The renamed function inlined away in the new build: nothing joined, f is deleted.
+        let new = map(vec![sym("f", 0x90, "a.obj", false)]);
+        let t = GroundTruth::from_maps_with_declarations(
+            &old,
+            &new,
+            &Scope::ProjectObjects,
+            &[],
+            &reused,
+        )
+        .unwrap();
+        assert!(
+            t.functions
+                .iter()
+                .any(|e| (e.old, e.new) == (Some(Rva(0x10)), None))
+        );
+        // Negative: two functions with the new name.
+        let new = map(vec![
+            sym("f", 0x90, "a.obj", false),
+            sym("g", 0xa0, "a.obj", false),
+            sym("g", 0xb0, "b.obj", false),
+        ]);
+        assert!(
+            GroundTruth::from_maps_with_declarations(
+                &old,
+                &new,
+                &Scope::ProjectObjects,
+                &[],
+                &reused
+            )
+            .is_err()
         );
     }
 

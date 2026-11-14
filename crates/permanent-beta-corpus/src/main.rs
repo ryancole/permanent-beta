@@ -43,6 +43,11 @@ enum Command {
         /// hand; an error if it doesn't name exactly one otherwise-unjoined function on each side.
         #[arg(long = "rename", value_parser = parse_rename)]
         renames: Vec<(String, String)>,
+        /// A function renamed between the builds whose old name the new build gives to another function, as
+        /// `old=new`. Repeatable. Joined before anything else; an error unless `old` is in both builds once and
+        /// `new` in the new build once.
+        #[arg(long = "rename-reused", value_parser = parse_rename)]
+        reused: Vec<(String, String)>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -511,12 +516,18 @@ fn main() -> Result<ExitCode> {
             new,
             object,
             renames,
+            reused,
             out,
         } => {
             let scope = object.map(Scope::Object).unwrap_or(Scope::ProjectObjects);
-            let truth =
-                GroundTruth::from_maps_with_renames(&load(&old)?, &load(&new)?, &scope, &renames)
-                    .map_err(anyhow::Error::msg)?;
+            let truth = GroundTruth::from_maps_with_declarations(
+                &load(&old)?,
+                &load(&new)?,
+                &scope,
+                &renames,
+                &reused,
+            )
+            .map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
                 !truth.functions.is_empty(),
                 "no in-scope functions ({}) found in either map file",
