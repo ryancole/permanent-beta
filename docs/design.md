@@ -11,7 +11,7 @@ Every claim that isn't settled carries a tag:
 | **[Decided]** | Chosen by the owner; change only deliberately. |
 | **[Provisional]** | A recommended default the skeleton is built on; cheap to change now, expensive later. |
 | **[Guess]** | An estimate or belief that has not been checked. |
-| **[Validate]** | Needs market, legal or technical validation before relying on it. |
+| **[Validate]** | Needs legal or technical validation before relying on it. |
 
 Untagged text describes the design intent, not established fact.
 
@@ -75,8 +75,7 @@ Detecting breakage is easy. **Repairing** it is the valuable part, and it requir
 - **Cost.** The owner reads C# natively and Rust less fluently, so review is slower. Mitigation: strict crate
   boundaries, small modules, and the corpus metrics gate (§10) as the main correctness signal.
 
-C# was the close second: owner fluency, Iced/AsmResolver, strong Azure tooling. The hosted service (§9.4) may still
-be written in C# and share only the schema.
+C# was the close second: owner fluency, Iced/AsmResolver, strong Azure tooling.
 
 ---
 
@@ -895,7 +894,7 @@ enforced by icicle's per-byte memory permissions, and the traps are breakpoints.
 pinned to a git commit. Measured the same as with Unicorn: all 23 replay unit tests (negatives included) and the
 hook loop's 22 of 24 replaying hook repairs, the negative control failing.
 
-**Privacy:** recorded memory can contain customer data. Recordings stay local by default. **Redaction**
+**Privacy:** recorded memory can contain whatever data the target was processing. Recordings stay local by default. **Redaction**
 (implemented 2026-11-08): an argument or global marked `redact` in the spec (`pbeta harness-spec --redact
 hook.param`) is never recorded, nor any import call's memory that overlaps a redacted argument seen so far in the
 run. That part is best effort: an import can be handed text derived from a redacted value (a receipt formatted
@@ -903,7 +902,7 @@ from a name), or the value at an address no redacted argument pointed to. `impor
 (`--no-import-memory`) captures no import memory at all, which is the guarantee. The hook loop checks it: v1
 recorded with the customer names' arguments redacted and import memory off contains no customer name in any
 file, while the ordinary recording contains 83–97 (with import memory on, redaction alone leaves 36 blobs with a
-name, down from 77). A replay that reads redacted memory is inconclusive. **[Validate]** with target customers.
+name, down from 77). A replay that reads redacted memory is inconclusive. **[Validate]** on real targets.
 
 ---
 
@@ -1063,9 +1062,8 @@ Principles:
 
 ### 9.2 Storage backends **[Provisional]**
 
-- Local and on-prem: **SQLite** file per project plus a content-addressed blob directory (analysis snapshots,
-  traces, memory blobs). The skeleton uses a JSON file (`JsonFileStore`) behind the same `MappingStore` trait.
-- Hosted: PostgreSQL + object storage, same schema.
+- **SQLite** file per project plus a content-addressed blob directory (analysis snapshots, traces, memory blobs).
+  The skeleton uses a JSON file (`JsonFileStore`) behind the same `MappingStore` trait.
 
 ### 9.3 SQL sketch
 
@@ -1105,12 +1103,6 @@ CREATE TABLE review_item (
 CREATE TABLE review_decision (review_id INTEGER REFERENCES review_item, actor TEXT, action TEXT,
   chosen_candidate_id INTEGER, note TEXT, at TEXT);
 ```
-
-### 9.4 Hosted service (later, proprietary)
-
-Version history across teams, a shared signature database, and corpus hosting. It must also ship as an on-prem
-deployable (container plus Postgres), since customers may require it. Shared signatures derived from third-party
-binaries raise legal questions (§12). **[Validate]**
 
 ---
 
@@ -1309,8 +1301,7 @@ validated on the corpus.
 
 | Component | License |
 |---|---|
-| Core crates, CLI, MCP server, Ghidra extension, harness | **Apache-2.0** (decided 2026-11-08): its patent grant, and the same license as Ghidra and icicle. `LICENSE`, `NOTICE`, `license = "Apache-2.0"` on every crate. |
-| Signature database, test corpus (beyond the public ground-truth set), hosted history service | Proprietary, in **separate repositories**. |
+| Everything in this repository: core crates, CLI, MCP server, Ghidra extension, harness, corpus tooling | **Apache-2.0** (decided 2026-11-08): its patent grant, and the same license as Ghidra and icicle. `LICENSE`, `NOTICE`, `license = "Apache-2.0"` on every crate. |
 
 **No GPL code** (2026-11-08). Replay first emulated with Unicorn (GPL-2.0), which made any `pbeta` built with
 replay GPL-2.0 as a whole; GPL-2.0 and Apache-2.0 are generally considered incompatible. It now uses icicle (MIT or
@@ -1326,18 +1317,17 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | Risk | Impact | Mitigation |
 |---|---|---|
 | **False-positive matches** (silent wrong repair) | Hook patches the wrong function: crashes, data corruption, and loss of trust. Worse than a broken hook. | Uniqueness rule, independent verification, criticality policy, behavioral gate for high-criticality hooks, corpus precision gate, default to review. |
-| **Legal: reverse-engineering restrictions** | EULAs may prohibit reverse engineering. Statutory interoperability exceptions are narrow and vary by jurisdiction (e.g. US DMCA §1201(f), EU Software Directive Art. 6). | Not legal advice: get counsel before launch. Product terms require users to have the right to analyze and instrument the target. Position the product as interoperability and maintenance of software the customer owns or licenses. |
+| **Legal: reverse-engineering restrictions** | EULAs may prohibit reverse engineering. Statutory interoperability exceptions are narrow and vary by jurisdiction (e.g. US DMCA §1201(f), EU Software Directive Art. 6). | Not legal advice. The README says to analyze and instrument only software you have the right to. The project is for interoperability and maintenance of software the user owns or licenses. |
 | **Legal: circumvention** | DRM, anti-tamper and anti-cheat circumvention is prohibited in many jurisdictions regardless of purpose. | Non-goal. No features for unpacking, defeating integrity checks or evading detection. Refuse to process known-protected targets (detect common protectors and stop): implemented in the analyzer (§4.2). |
-| **Dual use: cheat maintenance** | Keeping hooks working across game patches is exactly what cheat developers need. That's reputational, legal and platform risk (e.g. GitHub takedowns, anti-cheat vendor hostility). | Game segment = studios and anti-cheat teams analyzing their *own* builds. Authorization attestation, customer vetting for paid tiers, no public signature DB for third-party games. **[Validate]** whether the open-source core itself attracts this use and how to respond. |
-| **Authorization** | Users analyzing third-party software without the right to. | Explicit authorization statement in docs and ToS. Hosted service records the claimed basis per product. On-prem can't be enforced technically. |
-| **Shared signature database** | Distributing data derived from third-party copyrighted binaries. | Counsel review before building the paid DB. Prefer customer-private databases. **[Validate]** |
+| **Dual use: cheat maintenance** | Keeping hooks working across game patches is exactly what cheat developers need. That's reputational, legal and platform risk (e.g. GitHub takedowns, anti-cheat vendor hostility). | The README states the intended use (software you have the right to analyze), the analyzer refuses protected binaries, and there's no public signature DB for third-party games. **[Validate]** whether the tool attracts this use and how to respond. |
+| **Authorization** | Users analyzing third-party software without the right to. | Explicit statement in the README (Legal). It can't be enforced technically. |
+| **Shared signature database** | Distributing data derived from third-party copyrighted binaries. | Counsel review before building one. Prefer per-user databases. **[Validate]** |
 | **Compiler effects** | ICF folding, inlining, LTO, PGO and hot/cold splitting make "the same function" ill-defined. | Model fold, inline and split outcomes explicitly. Corpus builds cover these flags. Hookability check. |
 | **Analysis gaps** | Leaf functions without `.pdata`, tail calls, jump tables. Ghidra and the native analyzer disagree on boundaries. | Hybrid analysis. Rust computes all hashes. Disagreement is reported, not silently resolved. |
 | **Behavioral test flakiness** | Nondeterminism (time, threads, ASLR, global state) causes false failures. | Comparison rules per test (`compare.ignore`), multiple recordings, emulation for leaf functions, failures go to review. |
-| **Recorded data is sensitive** | Traces capture customer data. | Local-only by default, redaction in the record spec (§7.3, implemented), encrypted blob store option (not built). |
+| **Recorded data is sensitive** | Traces capture whatever data the target was processing. | Local-only by default, redaction in the record spec (§7.3, implemented), encrypted blob store option (not built). |
 | **AI-specific** | Hallucinated matches; prompt injection via binary strings; binaries leaving the premises. | Proposer-only role, same gates, strict output schemas, local models by default, remote opt-in with logging. |
 | **AI-written codebase** | Plausible but wrong logic that compiles and passes weak tests. Slower owner review in Rust. | Corpus metrics gate in CI, small crates with enforced dependency rules, property tests for matchers, review checklist in `CLAUDE.md`. |
-| **Market** | Ghidra Version Tracking, BinDiff and Diaphora are free. Willingness to pay for repair is unproven. | Validate with the target segments before the hosted service is built (§14). **[Validate]** |
 | **Ecosystem maturity** | Rust PDB and MCP crates may have gaps. | Spike early (M1). Isolate behind the `analysis` and `mcp` crates. |
 
 ---
@@ -1351,17 +1341,17 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 4. Hook libraries: Detours only, or MinHook, PolyHook 2, EasyHook, Frida, custom trampolines?
 5. How do your *existing* hooks locate targets today: RVA tables, AOB patterns, symbols? This decides the first
    repair generator.
-6. Will customer targets usually have PDBs? (Changes everything about type and struct repair.)
+6. Will targets usually have PDBs? (Changes everything about type and struct repair.)
 
 **Analysis and matching**
-7. Hybrid analysis vs Ghidra-only for v1? Is a JVM on CI agents acceptable to target customers? (Provisional,
+7. Hybrid analysis vs Ghidra-only for v1? Is a JVM on CI agents acceptable to users? (Provisional,
    from M1: native boundaries, Ghidra for pseudocode and types only, §4.4. The JVM question stays open; the
    Ghidra diff runs locally only.)
 8. Reuse vs reimplement: BinDiff (open-sourced by Google in 2023; license **[Validate]**, believed Apache-2.0),
-   Diaphora (believed AGPL-3.0 **[Validate]**, so its *code* can't be mixed into proprietary parts and maybe not
-   into the Apache core), Ghidra Version Tracking and BSim (Apache-2.0). Options: reimplement the published ideas,
+   Diaphora (believed AGPL-3.0 **[Validate]**, so its *code* can't be mixed into the Apache-2.0
+   core), Ghidra Version Tracking and BSim (Apache-2.0). Options: reimplement the published ideas,
    import their outputs as candidate sources, or build on Ghidra VT.
-9. Acceptance thresholds: set per customer, per hook, or globally from corpus calibration?
+9. Acceptance thresholds: set per project, per hook, or globally from corpus calibration?
 
 **Behavioral testing**
 10. Test corpus representation: the JSON + content-addressed blobs proposed in §7.3, or a binary format
@@ -1375,23 +1365,23 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 13. Reuse existing behavioral-diffing research (e.g. blanket execution / BLEX-style approaches, differential
     tracing)? Needs a literature and tool survey. **[Validate]**
 
-**Product and business**
-14. Target-segment priority. Which segment do you interview first?
-15. Hosted service: is it worth building if most paying customers require on-prem anyway?
-16. Open-source license: decided 2026-11-08, Apache-2.0. Still open: contributor terms (DCO vs CLA).
-17. Product name: decided as Permanent Beta (CLI `pbeta`). Trademark and crates.io availability not yet checked. **[Validate]**
-18. Who reviews AI-written code besides you, and what review is required to merge (e.g. corpus gate + owner
+**Project**
+14. Open-source license: decided 2026-11-08, Apache-2.0. Still open: contributor terms (DCO vs CLA).
+15. Project name: decided as Permanent Beta (CLI `pbeta`). Trademark and crates.io availability not yet checked. **[Validate]**
+16. Who reviews AI-written code besides you, and what review is required to merge (e.g. corpus gate + owner
     approval)?
 
 ---
 
-## 14. Target users (to validate)
+## 14. Who it's for
 
-| Segment | Hypothesis | What would confirm it |
-|---|---|---|
-| Legacy-software teams | Pay for support. Long-lived instrumentation of vendor or legacy binaries with no source. **[Guess]** | 5+ interviews describing recurring hook breakage with a measurable cost. |
-| Game studios and anti-cheat / security teams | Bigger budgets, on-prem required, analyze their own or customer builds. **[Guess]** | A design partner willing to share builds under NDA. |
-| Mod communities | Large, low willingness to pay; free tier or donations. Highest dual-use and legal exposure. **[Guess]** | Mostly a reach channel. Validate that it doesn't dominate the project's reputation. |
+Permanent Beta is a free, open-source tool. Likely users, all **[Guess]**:
+
+| Users | What they'd use it for |
+|---|---|
+| Teams maintaining legacy software | Long-lived instrumentation of vendor or legacy binaries with no source, where hooks break on every update. |
+| Game studios, anti-cheat and security teams | Hooks into their own builds, kept working across releases. |
+| Mod communities | Mods that hook a game, kept working across patches. The highest dual-use and legal exposure (§12). |
 
 ---
 
@@ -1402,8 +1392,8 @@ Still to decide: contributor terms (DCO vs CLA). A CLA keeps future relicensing 
 | **M0 Skeleton** (done 2026-11-05) | Crate boundaries, model types, 3 matching passes, 3 structural checks, policy, repair decisions, JSON store, CLI, demo fixtures | `cargo test` green; demo `repair` produces expected outcomes |
 | **M1 Spikes** (done 2026-11-07) | Native PE x64 analyzer on one real binary; Ghidra headless exporter; `pdb` crate on MSVC PDBs | Both analyzers export the same functions for a sample binary (diff report). Native analyzer, `pdb` crate (names and signatures), Ghidra headless exporter (§4.3) and `pbeta analysis-diff`, with a three-way diff report (native, Ghidra, PDB) on the newest tag of every corpus project and flag set (§4.4). Native stays the source of boundaries |
 | **M2 Corpus** (done 2026-11-06) | Ground-truth corpus (3–5 projects × versions × flags), metrics harness, CI gate | Precision and recall reported per pass. Three projects (zlib, Lua, zstd) × 3 tags × 3 flag sets, plus the `basic` fixture. Since grown (2026-11-07) to five projects (+ TinyXML-2 and yaml-cpp, C++) and five flag sets (+ /LTCG and PGO; zstd not under those two): 50 variants, 0 wrong |
-| **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression. Done 2026-11-07 apart from the SQLite store (deferred until history size or the hosted service needs it) |
+| **M3 Matching depth** | Mnemonic hash, call-graph propagation, structural similarity, independence-aware policy, SQLite store | Measured improvement with no precision regression. Done 2026-11-07 apart from the SQLite store (deferred until history size needs it) |
 | **M4 Repair loop** | Detours harness (record + scenario trace diff), AOB generator, offsets header, struct and prototype proposals | End-to-end repair of the sample app's hooks across 3 versions. Done 2026-11-07 (at /O2 7 of 8 hooks resolved v1 → v2 and 6 of 8 v2 → v3, at /Od 6 and 5, including a high-criticality hook and two hooks without structural evidence through their trial runs; 0 wrong; all applied hooks behave the same; review hooks repaired from their own build; patterns, offsets header and prototype proposals checked by the loop). Struct-layout proposals added 2026-11-07 (PDB types; checked on the `basic` fixture). Recording harness added 2026-11-08 (per-call test cases recorded by the hook DLL, replayed by emulation, with globals and import calls recorded: 22 of 24 resolved hook repairs replay, all passing; the swapped negative control fails replay; §7.3) |
 | **M5 MCP + AI proposer** | `permanent-beta-mcp`, local-model proposer, review explanations | AI proposals measured separately on the corpus. MCP server, review explanations, the proposer (`pbeta propose`) and its corpus scoring (`pbeta-corpus score-ai`) built 2026-11-07, first measured on Lua and zstd /O2: 31 of 32 proposals correct, the wrong one not passing verification (§8). `pbeta repair --propose` added 2026-11-07; latest measurement 75 of 77 proposals correct (/O2 and /Od), no wrong one passing verification |
 | **M6 Ghidra extension** | Exporter + review UI | Usable by an external tester. Exporter done (M1). Review UI built 2026-11-08 (`integrations/ghidra/PermanentBeta`, §11.3): review items with evidence and checks, Function Comparison, accept and reject through `pbeta review`; verified end to end in Ghidra 12.2 on the hook loop. Open: an external tester |
-| Later | Hosted / on-prem history service, IDA plugin, ELF | Driven by §14 validation |
+| Later | Shared history service, IDA plugin, ELF | As users ask for them |

@@ -12,6 +12,6 @@ Built so far for the corpus hook app, in `corpus/hooks/hookdll/` (design §7.3):
   the candidate on recorded cases (`permanent-beta-replay`, `pbeta replay`, `repair --cases`).
 
 Not yet: callee sequences, memory reachable through pointers inside structs, redaction rules, and a harness DLL
-for customer targets (the corpus DLL's logging detours are written per prototype).
+for other targets (the corpus DLL's logging detours are written per prototype).
 
-Recordings may contain customer data. Keep them local and support redaction rules.
+Recordings may contain whatever data the target was processing. Keep them local and support redaction rules.

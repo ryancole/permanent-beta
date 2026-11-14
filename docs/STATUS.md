@@ -442,10 +442,9 @@ What's new:
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
 | Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; review extension (M6) built and verified end to end in the GUI; external tester pending |
-| Hosted service, IDA plugin | Not started (designed) |
+| IDA plugin | Not started (designed) |
 | AI fallback | Built and measured (M5), in `propose` and `repair --propose`: 75 of 77 proposals correct on Lua and zstd, /O2 and /Od (remeasured 2026-11-07); `none` on 11 of 12 deleted functions; no wrong proposal passes verification (design §8) |
 | License choice | Apache-2.0 (2026-11-08); contributor terms open |
-| Market validation | Open |
 
 ## Suggested next steps
 
@@ -488,7 +487,7 @@ What's new:
    through pointers, and a corpus case that exercises changed-callee attribution (no zlib or zstd case does).
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
    Still to choose: contributor terms (DCO or CLA).
-6. **Outside the code:** talk to legacy-software teams (design §14).
+6. **Outside the code:** try it on real targets people hook today (design §14 lists likely users).
 
 ## Known rough edges
 
