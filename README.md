@@ -11,7 +11,7 @@ function, and rewrites your hook list with the new addresses. Anything it isn't 
 instead of being guessed. A generic hook DLL, the **hook host**, then attaches your hooks in whichever build is
 running, so you don't write hook plumbing or hard-code addresses.
 
-Windows x64 PE binaries, built with MSVC. Free and open source (Apache-2.0).
+Windows PE binaries, x64 and x86 (32-bit), built with MSVC. Free and open source (Apache-2.0).
 
 ## Principles
 
@@ -32,7 +32,7 @@ tags and optimization settings (`/O2`, `/Od`, identical-code folding, `/LTCG`, P
 
 | Part | State |
 |---|---|
-| Analysis of PE x64 binaries, with or without a PDB | Built |
+| Analysis of PE x64 and x86 binaries, with or without a PDB | Built (x86: corpus scorecards not yet built) |
 | Matching (names, code hashes, strings, call graph, vtables, similarity) and verification | Built |
 | Hook repair, review queue, AOB patterns, offsets header | Built |
 | Prototype and struct-layout change proposals | Built (exact with PDBs; inferred without) |
@@ -42,12 +42,12 @@ tags and optimization settings (`/O2`, `/Od`, identical-code folding, `/LTCG`, P
 | MCP server for agents (read, explain, propose; never accept) | Built (`pbeta-mcp`) |
 | Ghidra: headless exporter and review UI | Built ([integrations/ghidra](integrations/ghidra/README.md)) |
 | IDA plugin: markup carry-forward | Built; names checked in IDA ([integrations/ida](integrations/ida/README.md)) |
-| ELF, ARM64, x86 | Not started |
+| ELF, ARM64 | Not started |
 
 ## Build
 
 Needs the stable Rust toolchain ([rustup.rs](https://rustup.rs)). The hook host also needs Visual Studio's C++
-x64 toolset and git (it fetches Microsoft Detours at a pinned commit).
+x64 toolset (and the x86 one for 32-bit programs) and git (it fetches Microsoft Detours at a pinned commit).
 
 ```
 cargo build --release
@@ -178,7 +178,7 @@ twice, in about a minute.
 ```
 crates/
   permanent-beta-model/     shared types: analysis schema, candidates, evidence, mappings, hooks, review items
-  permanent-beta-analysis/  binary → analysis (native PE x64 analyzer, PDB reader, Ghidra export loader)
+  permanent-beta-analysis/  binary → analysis (native PE x64/x86 analyzer, PDB reader, Ghidra export loader)
   permanent-beta-match/     matching passes → candidates (never decides acceptance)
   permanent-beta-verify/    structural and behavioral checks, acceptance policy
   permanent-beta-repair/    per-hook repair decisions, patterns, header, host config, proposals

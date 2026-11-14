@@ -19,6 +19,13 @@
 //! displacements that are addresses inside the image. Branch targets inside the function are kept as offsets
 //! from the function start, so control-flow changes still change the hash. A RIP-relative operand that is an
 //! import address table slot is hashed by the imported function's name instead.
+//!
+//! x86 (32-bit) differs in three ways, handled where they matter. There's no `.pdata`, so every function's
+//! bounds come from discovery (the next known start, padding). Data and imports are reached through absolute
+//! operands (`call [__imp_f]`, `push offset str`, `mov eax, [g]`), not RIP-relative ones: an absolute address
+//! inside the image counts where x64 counts a RIP-relative one ([`absolute_address`]), and an immediate that is
+//! a relocated address is a reference too. And arguments are on the stack (or in ecx/edx for `__thiscall` and
+//! `__fastcall`): see `super::x86_args`.
 
 use super::image::Image;
 use iced_x86::{
@@ -51,7 +58,12 @@ fn decode(image: &Image, start: u32, end: u32) -> Vec<Instruction> {
     let Some(bytes) = image.bytes(start, end.saturating_sub(start) as usize) else {
         return Vec::new();
     };
-    let mut decoder = Decoder::with_ip(64, bytes, image.base + start as u64, DecoderOptions::NONE);
+    let mut decoder = Decoder::with_ip(
+        image.bitness(),
+        bytes,
+        image.base + start as u64,
+        DecoderOptions::NONE,
+    );
     let mut out = Vec::new();
     let mut ins = Instruction::default();
     while decoder.can_decode() {
@@ -64,6 +76,69 @@ fn decode(image: &Image, start: u32, end: u32) -> Vec<Instruction> {
     out
 }
 
+/// The address in the image a memory operand names directly, if it does: RIP-relative on x64; on x86, the
+/// displacement of an operand with no base or index register (`[g]`, `call [__imp_f]`) when it's an address in
+/// the image. Indexed tables (`[table + ecx*4]`) aren't: x64 reaches the same tables through a `lea` first.
+fn absolute_address(image: &Image, ins: &Instruction) -> Option<u64> {
+    if ins.is_ip_rel_memory_operand() {
+        return Some(ins.ip_rel_memory_address());
+    }
+    let memory = (0..ins.op_count()).any(|op| ins.op_kind(op) == OpKind::Memory);
+    let address = u64::from(ins.memory_displacement32());
+    (image.x86
+        && memory
+        && ins.memory_base() == Register::None
+        && ins.memory_index() == Register::None
+        && image.contains_va(address))
+    .then_some(address)
+}
+
+/// x86: each immediate operand of `ins` that is a relocated address inside the image (`push offset f`, `mov
+/// eax, offset s`). Constants that only look like addresses are left out when the image has relocations.
+fn address_immediates(image: &Image, ins: &Instruction) -> Vec<u64> {
+    if !image.x86 {
+        return Vec::new();
+    }
+    let rva = (ins.ip() - image.base) as u32;
+    (0..ins.op_count())
+        .filter(|&op| is_immediate(ins.op_kind(op)))
+        .map(|op| ins.immediate(op) & 0xffff_ffff)
+        .filter(|&v| image.contains_va(v) && image.relocated(rva, ins.len() as u32))
+        .collect()
+}
+
+pub(crate) fn is_immediate(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Immediate8
+            | OpKind::Immediate8_2nd
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64
+    )
+}
+
+/// A code address `ins` takes without calling it (a callback): `lea reg, [rip+f]` on x64; on x86 `push offset
+/// f`, `mov reg, offset f` or `lea reg, [f]`.
+fn taken_address(image: &Image, ins: &Instruction) -> Option<u64> {
+    if ins.mnemonic() == Mnemonic::Lea {
+        return if image.x86 {
+            absolute_address(image, ins)
+                .filter(|_| image.relocated((ins.ip() - image.base) as u32, ins.len() as u32))
+        } else {
+            ins.is_ip_rel_memory_operand()
+                .then(|| ins.ip_rel_memory_address())
+        };
+    }
+    address_immediates(image, ins)
+        .into_iter()
+        .find(|&v| image.va_to_rva(v).is_some_and(|r| image.is_executable(r)))
+}
+
 fn is_near_branch(kind: OpKind) -> bool {
     matches!(
         kind,
@@ -72,7 +147,27 @@ fn is_near_branch(kind: OpKind) -> bool {
 }
 
 /// Find function starts and boundaries.
+///
+/// On x86, discovery is redone once it has found SEH blocks (`seh_scope_blocks`) it didn't know of: a block taken
+/// for a function start has already made its own jumps into starts, so they're found again without it. The set
+/// only grows, so this ends.
 pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
+    let mut seh_blocks = BTreeSet::new();
+    loop {
+        let (ranges, found) = discover_except(image, &seh_blocks);
+        if found.is_subset(&seh_blocks) {
+            return ranges;
+        }
+        seh_blocks.extend(found);
+    }
+}
+
+/// Discovery that never takes the addresses in `seh_blocks` for function starts. Also returns every SEH block
+/// found on the way.
+fn discover_except(
+    image: &Image,
+    seh_blocks: &BTreeSet<u32>,
+) -> (Vec<FunctionRange>, BTreeSet<u32>) {
     let pdata: Vec<_> = image
         .pdata
         .iter()
@@ -106,6 +201,10 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
     // Every slot of an incremental linking table is a function of its own (`super::ilt`): one nothing calls
     // through would otherwise run into the slot before it.
     starts.extend(super::ilt::find(image).into_keys());
+    // x86: the `__except` filters and handlers an SEH scope table names are blocks of the function that pushes
+    // the table, not functions, though the table's relocated pointers to them make them look like starts.
+    starts.retain(|s| !seh_blocks.contains(s));
+    let mut seh_found: BTreeSet<u32> = BTreeSet::new();
 
     loop {
         let mut found = Vec::new();
@@ -122,19 +221,32 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
             .chain(orphans)
             .collect();
         for (seg_start, seg_end) in segments {
-            // The last `lea rdx, [rip+x]`: a throw site's second argument, its ThrowInfo.
-            let mut throw_info: Option<u32> = None;
+            // A throw site's ThrowInfo: x64 passes it in rdx (the last `lea rdx, [rip+x]`); x86 pushes it (one of
+            // the addresses pushed since the last call, each tried).
+            let mut throw_info: Vec<u32> = Vec::new();
             for ins in decode(image, seg_start, seg_end) {
-                if ins.mnemonic() == Mnemonic::Lea
+                if !image.x86
+                    && ins.mnemonic() == Mnemonic::Lea
                     && ins.op0_register() == Register::RDX
                     && ins.is_ip_rel_memory_operand()
                 {
-                    throw_info = image.va_to_rva(ins.ip_rel_memory_address());
+                    throw_info = image
+                        .va_to_rva(ins.ip_rel_memory_address())
+                        .into_iter()
+                        .collect();
+                } else if image.x86 && ins.mnemonic() == Mnemonic::Push {
+                    for pushed in address_immediates(image, &ins)
+                        .into_iter()
+                        .filter_map(|v| image.va_to_rva(v))
+                    {
+                        throw_info.push(pushed);
+                        seh_found.extend(seh_scope_blocks(image, pushed, seg_start));
+                    }
                 } else if ins.flow_control() == FlowControl::Call
                     || ins.flow_control() == FlowControl::IndirectCall
                 {
-                    let throws = if ins.is_ip_rel_memory_operand() {
-                        is_throw_slot(image, ins.ip_rel_memory_address())
+                    let throws = if let Some(slot) = absolute_address(image, &ins) {
+                        is_throw_slot(image, slot)
                     } else {
                         // `call _CxxThrowException`: the import's `jmp [__imp__CxxThrowException]` stub.
                         (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)))
@@ -143,19 +255,22 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
                                 .and_then(|t| decode(image, t, t + 6).first().copied())
                                 .is_some_and(|j| {
                                     j.flow_control() == FlowControl::IndirectBranch
-                                        && j.is_ip_rel_memory_operand()
-                                        && is_throw_slot(image, j.ip_rel_memory_address())
+                                        && absolute_address(image, &j)
+                                            .is_some_and(|slot| is_throw_slot(image, slot))
                                 })
                     };
                     if throws {
-                        let named = throw_info.and_then(|ti| thrown_type_functions(image, ti));
+                        let named = throw_info
+                            .iter()
+                            .rev()
+                            .find_map(|&ti| thrown_type_functions(image, ti));
                         for t in named.into_iter().flatten() {
                             if !starts.contains(&t) && !inside_pdata(t) {
                                 found.push(t);
                             }
                         }
                     }
-                    throw_info = None;
+                    throw_info.clear();
                 }
                 let (t, is_call) = if (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)))
                 {
@@ -163,9 +278,9 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
                         ins.near_branch_target(),
                         ins.flow_control() == FlowControl::Call,
                     )
-                } else if ins.mnemonic() == Mnemonic::Lea && ins.is_ip_rel_memory_operand() {
+                } else if let Some(t) = taken_address(image, &ins) {
                     // Address taken: treated like a jump (a new start only outside the current range).
-                    (ins.ip_rel_memory_address(), false)
+                    (t, false)
                 } else {
                     continue;
                 };
@@ -185,15 +300,81 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
                 }
             }
         }
+        found.retain(|f| !seh_blocks.contains(f));
         if found.is_empty() {
             // Nothing reaches the rest: look for code that starts after padding (dead code, design §4.4).
             found = padding_starts(image, &ranges, &starts);
+            found.retain(|f| !seh_blocks.contains(f));
             if found.is_empty() {
-                return ranges;
+                return (ranges, seh_found);
             }
         }
         starts.extend(found);
     }
+}
+
+/// Farthest an SEH block is taken to be from the start of its function. **[Guess]**
+const MAX_SEH_BLOCK_DISTANCE: u32 = 0x10000;
+
+/// x86 structured exception handling: the filter and handler blocks of the scope table at `table`, if it is one,
+/// pushed by the function starting at `owner`. MSVC's `__try`/`__except` prologue pushes the function's scope
+/// table (`push offset table; ... call __SEH_prolog4`, or `push offset __except_handler3`), whose records point
+/// at the filter expression and handler blocks laid out inside the function.
+///
+/// Two layouts: EH4 (Visual C++ 2005 on, `__except_handler4`) starts with four 32-bit cookie offsets, then the
+/// records; EH3 (older) is the records alone. A record is `{ enclosing level, filter, handler }`: the outermost's
+/// level is -2 (EH4) or -1 (EH3), an inner one's the index of a record before it; the filter is 0 for a
+/// `__finally`. Read only while every record is plausible: in read-only data, its blocks in code after `owner`
+/// and within [`MAX_SEH_BLOCK_DISTANCE`] of it. Empty unless at least one record is.
+fn seh_scope_blocks(image: &Image, table: u32, owner: u32) -> Vec<u32> {
+    if !image.x86 || image.is_executable(table) || image.is_writable(table) {
+        return Vec::new();
+    }
+    let u32_at = |rva: u32| {
+        image
+            .bytes(rva, 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let block = |va: u32| {
+        image
+            .va_to_rva(u64::from(va))
+            .filter(|&r| image.is_executable(r) && r > owner && r - owner < MAX_SEH_BLOCK_DISTANCE)
+    };
+    let records = |first: u32, outermost: u32| -> Vec<u32> {
+        let mut out = Vec::new();
+        for i in 0..64u32 {
+            let at = first + 12 * i;
+            let (Some(level), Some(filter), Some(handler)) =
+                (u32_at(at), u32_at(at + 4), u32_at(at + 8))
+            else {
+                break;
+            };
+            let level_ok = level == outermost || level < i;
+            let filter_ok = filter == 0 || block(filter).is_some();
+            let Some(handler) = block(handler).filter(|_| level_ok && filter_ok) else {
+                break;
+            };
+            // Each record's pointers are relocated: a table in a /FIXED image has none to check.
+            if image.has_relocs && !(image.code_pointer_slots.iter().any(|&(s, _)| s == at + 8)) {
+                break;
+            }
+            out.push(handler);
+            out.extend(block(filter));
+        }
+        out
+    };
+    // EH4: GSCookieOffset is -2 (no GS cookie) or a frame offset below ebp; EHCookieOffset is a frame offset.
+    let frame_offset = |v: u32| (v as i32) < 0 && (v as i32) > -0x10000;
+    if let (Some(gs), Some(eh)) = (u32_at(table), u32_at(table + 8))
+        && (gs == 0xffff_fffe || frame_offset(gs))
+        && frame_offset(eh)
+    {
+        let found = records(table + 16, 0xffff_fffe);
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    records(table, 0xffff_ffff)
 }
 
 /// An import address table slot for `_CxxThrowException` (VCRUNTIME140.dll and older runtimes).
@@ -213,15 +394,27 @@ const MAX_CATCHABLE_TYPES: u32 = 64;
 /// everywhere else, laid out without `int3` padding before it), and image-relative RVAs aren't relocated
 /// pointers, so without this they're missed and taken into the function before them.
 ///
-/// x64 layout (`ehdata.h`): ThrowInfo `{ attributes, pmfnUnwind, pForwardCompat, pCatchableTypeArray }`;
+/// Layout (`ehdata.h`): ThrowInfo `{ attributes, pmfnUnwind, pForwardCompat, pCatchableTypeArray }`;
 /// CatchableTypeArray `{ nCatchableTypes, arrayOfCatchableTypes[] }`; CatchableType `{ properties, pType,
-/// thisDisplacement (3 ints), sizeOrOffset, copyFunction }`, all 32-bit. `None` unless every field is plausible:
-/// structures in read-only data, flags within their defined bits, functions in code or 0.
+/// thisDisplacement (3 ints), sizeOrOffset, copyFunction }`, all 32-bit, so the offsets are the same on x64 and
+/// x86. On x64 the references are image-relative RVAs; on x86 they're addresses (relocated pointers), read here
+/// as RVAs. `None` unless every field is plausible: structures in read-only data, flags within their defined
+/// bits, functions in code or 0.
 fn thrown_type_functions(image: &Image, ti: u32) -> Option<Vec<u32>> {
-    let u32_at = |rva: u32| {
+    let raw = |rva: u32| {
         image
             .bytes(rva, 4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let u32_at = raw;
+    // A reference field: an RVA (x64), or an address in the image (x86); 0 is none.
+    let ref_at = |rva: u32| -> Option<u32> {
+        let v = raw(rva)?;
+        if !image.x86 || v == 0 {
+            Some(v)
+        } else {
+            image.va_to_rva(u64::from(v))
+        }
     };
     let read_only = |rva: u32| {
         rva != 0
@@ -235,9 +428,9 @@ fn thrown_type_functions(image: &Image, ti: u32) -> Option<Vec<u32>> {
     }
     let (attributes, unwind, compat, array) = (
         u32_at(ti)?,
-        u32_at(ti + 4)?,
-        u32_at(ti + 8)?,
-        u32_at(ti + 12)?,
+        ref_at(ti + 4)?,
+        ref_at(ti + 8)?,
+        ref_at(ti + 12)?,
     );
     if attributes > 0x1f || !code_or_none(unwind) || !code_or_none(compat) || !read_only(array) {
         return None;
@@ -248,11 +441,11 @@ fn thrown_type_functions(image: &Image, ti: u32) -> Option<Vec<u32>> {
     }
     let mut out: Vec<u32> = [unwind, compat].into_iter().filter(|&r| r != 0).collect();
     for i in 0..count {
-        let ct = u32_at(array + 4 + 4 * i)?;
+        let ct = ref_at(array + 4 + 4 * i)?;
         if !read_only(ct) {
             return None;
         }
-        let (properties, type_descriptor, copy) = (u32_at(ct)?, u32_at(ct + 4)?, u32_at(ct + 24)?);
+        let (properties, type_descriptor, copy) = (u32_at(ct)?, ref_at(ct + 4)?, ref_at(ct + 24)?);
         let in_data =
             image.bytes(type_descriptor, 1).is_some() && !image.is_executable(type_descriptor);
         if properties > 0x1f || !in_data || !code_or_none(copy) {
@@ -399,6 +592,20 @@ fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
             while end > start + 1 && image.bytes(end - 1, 1) == Some(&[0xcc]) {
                 end -= 1;
             }
+            // MSVC follows a call that doesn't return with an `int3` of the function's own; on x86, where every
+            // function ends this way, keep it. (On x64 a function that calls has `.pdata`, so exact bounds.)
+            if image.x86
+                && end < next.min(section_end)
+                && decode(image, start, end).last().is_some_and(|i| {
+                    i.next_ip() == image.base + u64::from(end)
+                        && matches!(
+                            i.flow_control(),
+                            FlowControl::Call | FlowControl::IndirectCall
+                        )
+                })
+            {
+                end += 1;
+            }
             Some(FunctionRange {
                 start,
                 end,
@@ -414,11 +621,12 @@ fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
 /// gives table-slot matching nothing to anchor on.
 const MIN_TABLE_SLOTS: usize = 2;
 
-/// Tables of code pointers in data (vtables, function tables): runs of consecutive 8-byte slots, each a
+/// Tables of code pointers in data (vtables, function tables): runs of consecutive pointer slots, each a
 /// relocated pointer to the start of a function in `ranges`. A slot pointing anywhere else (RTTI locator, a
 /// string, the middle of a function) ends the run.
 pub(crate) fn code_tables(image: &Image, ranges: &[FunctionRange]) -> Vec<CodeTable> {
     let starts: BTreeSet<u32> = ranges.iter().map(|r| r.start).collect();
+    let stride = image.pointer_size();
     let mut tables = Vec::new();
     let mut run: Vec<(u32, u32)> = Vec::new();
     let mut flush = |run: &mut Vec<(u32, u32)>| {
@@ -431,7 +639,7 @@ pub(crate) fn code_tables(image: &Image, ranges: &[FunctionRange]) -> Vec<CodeTa
         run.clear();
     };
     for &(slot, target) in &image.code_pointer_slots {
-        let follows = run.last().is_some_and(|&(prev, _)| prev + 8 == slot);
+        let follows = run.last().is_some_and(|&(prev, _)| prev + stride == slot);
         if !follows {
             flush(&mut run);
         }
@@ -527,9 +735,9 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
                     nh.update((ins.memory_base() as u16).to_le_bytes());
                     nh.update((ins.memory_index() as u16).to_le_bytes());
                     nh.update(ins.memory_index_scale().to_le_bytes());
-                    if ins.is_ip_rel_memory_operand() {
+                    if let Some(address) = absolute_address(image, ins) {
                         nh.update(b"r");
-                        if let Some(rva) = image.va_to_rva(ins.ip_rel_memory_address()) {
+                        if let Some(rva) = image.va_to_rva(address) {
                             if let Some(name) = image.iat.get(&rva) {
                                 // The imported function's name is stable across builds, unlike the slot's
                                 // address, so it's hashed: otherwise every import thunk (`jmp [slot]`) hashes
@@ -545,7 +753,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
                                 data_refs.insert(Rva(u64::from(rva)));
                             } else if ins.mnemonic() == Mnemonic::Lea
                                 && image.is_executable(rva)
-                                && internal(ins.ip_rel_memory_address()).is_none()
+                                && internal(address).is_none()
                             {
                                 code_refs.insert(Rva(u64::from(rva)));
                             }
@@ -571,6 +779,9 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
                     let v = ins.immediate(op);
                     if image.contains_va(v) {
                         nh.update(b"a");
+                    } else if image.x86 && image.contains_va(v & 0xffff_ffff) {
+                        // `push offset s` on x86: an address (sign-extended by the decoder), masked the same way.
+                        nh.update(b"a");
                     } else {
                         nh.update(v.to_le_bytes());
                         if is_interesting_constant(v) {
@@ -579,6 +790,21 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // x86 passes addresses as immediates (`push offset s`): the same references a RIP-relative `lea` gives
+        // on x64.
+        for v in address_immediates(image, ins) {
+            let Some(rva) = image.va_to_rva(v) else {
+                continue;
+            };
+            if let Some(s) = image.string_literal(rva) {
+                strings.insert(s);
+            } else if image.is_writable(rva) {
+                data_refs.insert(Rva(u64::from(rva)));
+            } else if image.is_executable(rva) && internal(v).is_none() {
+                code_refs.insert(Rva(u64::from(rva)));
             }
         }
 
@@ -629,8 +855,20 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
 
     let args = if insns.is_empty() {
         (0, Vec::new())
+    } else if image.x86 {
+        // One class per register argument (ecx, edx): the slots before the stack words.
+        let regs = super::x86_args::register_args(&insns);
+        (
+            super::x86_args::inferred_args(&insns),
+            vec![ArgClass::Integer; usize::from(regs)],
+        )
     } else {
         inferred_args(&insns)
+    };
+    let accesses = if image.x86 {
+        super::x86_args::arg_accesses(&insns)
+    } else {
+        arg_accesses(&insns)
     };
     FunctionFeatures {
         rva: Rva(range.start as u64),
@@ -651,7 +889,7 @@ pub(crate) fn features(image: &Image, range: &FunctionRange) -> FunctionFeatures
         signature: None,
         inferred_args: (!insns.is_empty()).then_some(args.0),
         inferred_arg_classes: args.1,
-        arg_accesses: arg_accesses(&insns),
+        arg_accesses: accesses,
         entry: (!insns.is_empty()).then(|| entry_info(&insns, start_va, &internal_targets)),
         pseudocode: None,
         mnemonic_counts,
@@ -1568,5 +1806,262 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // x86 (32-bit) images.
+
+    const X86_BASE: u32 = 0x40_0000;
+
+    fn va(rva: u32) -> [u8; 4] {
+        (X86_BASE + rva).to_le_bytes()
+    }
+
+    /// An x86 image based at 0x400000: `.text` at 0x1000, read-only `.rdata` at 0x2000, writable `.data` at
+    /// 0x3000. Without relocations, so every absolute operand counts as an address (`Image::relocated`).
+    fn x86_image(code: &[u8], rdata: &[u8], data: &[u8]) -> Image {
+        use crate::native::image::Section;
+        let section = |name: &str, rva, data: &[u8], executable, writable| Section {
+            name: name.into(),
+            rva,
+            virtual_size: 0x1000,
+            data: data.to_vec(),
+            executable,
+            writable,
+        };
+        Image {
+            x86: true,
+            base: u64::from(X86_BASE),
+            size_of_image: 0x4000,
+            sections: vec![
+                section(".text", 0x1000, code, true, false),
+                section(".rdata", 0x2000, rdata, false, false),
+                section(".data", 0x3000, data, false, true),
+            ],
+            entry: Some(0x1000),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn x86_import_calls_hash_by_imported_name() {
+        // call dword ptr [slot]; ret
+        let call = |slot: u32| {
+            let mut c = vec![0xff, 0x15];
+            c.extend(va(slot));
+            c.push(0xc3);
+            c
+        };
+        let f = |slot: u32, name: &str| {
+            let mut img = x86_image(&call(slot), &[0; 0x10], &[]);
+            img.iat.insert(slot, name.into());
+            features(&img, &range(0x1000, 0x1007))
+        };
+        let sleep = f(0x2000, "k.dll!Sleep");
+        assert_eq!(sleep.imports, vec!["k.dll!Sleep".to_string()]);
+        // The IAT moved: same hash.
+        assert_eq!(
+            sleep.normalized_hash,
+            f(0x2004, "k.dll!Sleep").normalized_hash
+        );
+        // Negative: the same code calling another import.
+        assert_ne!(
+            sleep.normalized_hash,
+            f(0x2000, "k.dll!Beep").normalized_hash
+        );
+    }
+
+    /// push offset 0x402010 (a string); push offset 0x403000 (a global); push offset 0x401020 (a function);
+    /// add esp, 12; ret; ... 0x1020: ret. The string is at 0x2010 + `string_shift`.
+    fn pushes_addresses(string_shift: u32) -> Image {
+        let mut code = vec![0x68];
+        code.extend(va(0x2010 + string_shift));
+        code.push(0x68);
+        code.extend(va(0x3000));
+        code.push(0x68);
+        code.extend(va(0x1020));
+        code.extend([0x83, 0xc4, 0x0c, 0xc3]);
+        code.resize(0x20, 0xcc);
+        code.push(0xc3);
+        let mut rdata = vec![0u8; 0x10 + string_shift as usize];
+        rdata.extend(b"pb-config.ini\0");
+        x86_image(&code, &rdata, &[0; 4])
+    }
+
+    #[test]
+    fn x86_pushed_addresses_are_references() {
+        let f = features(&pushes_addresses(0), &range(0x1000, 0x1013));
+        assert_eq!(f.strings, vec!["pb-config.ini".to_string()]);
+        assert_eq!(f.data_refs, vec![Rva(0x3000)]);
+        assert_eq!(f.code_refs, vec![Rva(0x1020)]);
+        assert!(f.constants.is_empty(), "addresses aren't constants");
+        // The string moved: same hash.
+        let moved = features(&pushes_addresses(0x20), &range(0x1000, 0x1013));
+        assert_eq!(f.normalized_hash, moved.normalized_hash);
+    }
+
+    #[test]
+    fn x86_unrelocated_immediates_are_not_references() {
+        // Negative: in an image with relocations, an operand no relocation names is a constant that only looks
+        // like an address. Still masked (it might be one), but no reference and no function start.
+        let mut img = pushes_addresses(0);
+        img.has_relocs = true;
+        let f = features(&img, &range(0x1000, 0x1013));
+        assert!(f.strings.is_empty() && f.data_refs.is_empty() && f.code_refs.is_empty());
+        img.has_relocs = false;
+        assert_eq!(
+            f.normalized_hash,
+            features(&img, &range(0x1000, 0x1013)).normalized_hash
+        );
+    }
+
+    #[test]
+    fn x86_callbacks_passed_by_address_are_functions() {
+        let img = pushes_addresses(0);
+        let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
+        assert!(starts.contains(&0x1020), "{starts:x?}");
+        // Negative: the same push, unrelocated in an image with relocations, finds nothing.
+        let mut img = img;
+        img.has_relocs = true;
+        let mut code = img.sections[0].data.clone();
+        code[0x1f] = 0x90; // no padding before 0x1020: only the push could make it a start
+        img.sections[0].data = code;
+        let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
+        assert_eq!(starts, vec![0x1000]);
+    }
+
+    /// 0x1000: push offset scope_table (0x402000); xor eax, eax; ret; nop to 0x1010. 0x1010: the `__except`
+    /// filter (mov eax, 1; ret); 0x1018: the handler (xor eax, eax; ret). The EH4 scope table's record has
+    /// enclosing level `level`; its pointers are the image's code pointers in data.
+    fn seh_image(level: u32) -> Image {
+        let mut code = vec![0x68];
+        code.extend(va(0x2000));
+        code.extend([0x33, 0xc0, 0xc3]);
+        code.resize(0x10, 0x90);
+        code.extend([0xb8, 1, 0, 0, 0, 0xc3, 0x90, 0x90]);
+        code.extend([0x33, 0xc0, 0xc3]);
+        let mut rdata = Vec::new();
+        for v in [0xffff_fffe_u32, 0, 0xffff_ffd8, 0, level] {
+            rdata.extend(v.to_le_bytes());
+        }
+        rdata.extend(va(0x1010));
+        rdata.extend(va(0x1018));
+        let mut img = x86_image(&code, &rdata, &[]);
+        img.code_pointer_slots = vec![(0x2014, 0x1010), (0x2018, 0x1018)];
+        img.code_pointers = vec![0x1010, 0x1018];
+        img
+    }
+
+    #[test]
+    fn x86_seh_filters_and_handlers_belong_to_their_function() {
+        let ranges = discover(&seh_image(0xffff_fffe));
+        let bounds: Vec<(u32, u32)> = ranges.iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(bounds, vec![(0x1000, 0x101b)]);
+    }
+
+    #[test]
+    fn x86_an_implausible_scope_table_names_no_blocks() {
+        // Negative: an outermost record whose enclosing level isn't -2 isn't a scope table, so the pointers stay
+        // what they look like: functions reached through data.
+        let starts: Vec<u32> = discover(&seh_image(5)).iter().map(|r| r.start).collect();
+        assert_eq!(starts, vec![0x1000, 0x1010, 0x1018]);
+    }
+
+    /// 0x1000: call 0x1010, then `tail`, then int3 padding; 0x1010: ret.
+    fn ends_after_call(tail: &[u8], x86: bool) -> Vec<(u32, u32)> {
+        let mut code = vec![0xe8, 0x0b, 0x00, 0x00, 0x00];
+        code.extend(tail);
+        code.resize(0x10, 0xcc);
+        code.push(0xc3);
+        let img = if x86 {
+            x86_image(&code, &[], &[])
+        } else {
+            let mut img = image(&code, &[]);
+            img.entry = Some(0x1000);
+            img
+        };
+        discover(&img).iter().map(|r| (r.start, r.end)).collect()
+    }
+
+    #[test]
+    fn x86_an_int3_after_a_call_that_doesnt_return_is_the_functions() {
+        assert_eq!(ends_after_call(&[0xcc], true)[0], (0x1000, 0x1006));
+        // Negative: after a `ret`, the int3s are all padding; and x64's bounds are unchanged.
+        assert_eq!(ends_after_call(&[0xc3, 0xcc], true)[0], (0x1000, 0x1006));
+        assert_eq!(ends_after_call(&[0xcc], false)[0], (0x1000, 0x1005));
+    }
+
+    #[test]
+    fn x86_code_tables_use_4_byte_slots() {
+        let ranges = [range(0x1000, 0x1001), range(0x1010, 0x1011)];
+        let mut img = x86_image(&[0xc3; 0x20], &[], &[]);
+        img.code_pointer_slots = vec![(0x2000, 0x1000), (0x2004, 0x1010)];
+        assert_eq!(code_tables(&img, &ranges).len(), 1);
+        // Negative: x64-sized spacing on x86 is two lone pointers, not a table.
+        img.code_pointer_slots = vec![(0x2000, 0x1000), (0x2008, 0x1010)];
+        assert!(code_tables(&img, &ranges).is_empty());
+    }
+
+    /// 0x1000: push offset ThrowInfo (0x402010); push eax; call [__imp__CxxThrowException] (0x402000); ret.
+    /// 0x1010: the destructor; 0x1018: the copy constructor (each `mov eax, ecx; ret`), laid out with no padding
+    /// before them. The ThrowInfo's references are written by `reference` (an address on x86).
+    fn x86_throw_image(reference: impl Fn(u32) -> u32) -> Image {
+        let mut code = vec![0x68];
+        code.extend(va(0x2010));
+        code.extend([0x50, 0xff, 0x15]);
+        code.extend(va(0x2000));
+        code.push(0xc3);
+        code.resize(0x10, 0x90);
+        code.extend([
+            0x8b, 0xc1, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x8b, 0xc1, 0xc3,
+        ]);
+        let mut rdata = vec![0u8; 0x50];
+        let mut put = |at: usize, v: u32| rdata[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(0x14, reference(0x1010)); // pmfnUnwind
+        put(0x1c, reference(0x2020)); // pCatchableTypeArray
+        put(0x20, 1);
+        put(0x24, reference(0x2030));
+        put(0x34, reference(0x3000)); // pType
+        put(0x3c, 0xffff_ffff);
+        put(0x44, 8);
+        put(0x48, reference(0x1018)); // copyFunction
+        let mut img = x86_image(&code, &rdata, &[0; 0x10]);
+        img.iat
+            .insert(0x2000, "vcruntime140.dll!_CxxThrowException".into());
+        img
+    }
+
+    #[test]
+    fn x86_a_throw_sites_destructor_and_copy_constructor_are_functions() {
+        let img = x86_throw_image(|rva| X86_BASE + rva);
+        let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
+        assert_eq!(starts, vec![0x1000, 0x1010, 0x1018]);
+        // Negative: x64's image-relative references in an x86 ThrowInfo point nowhere, so it isn't one.
+        let img = x86_throw_image(|rva| rva);
+        let starts: Vec<u32> = discover(&img).iter().map(|r| r.start).collect();
+        assert_eq!(starts, vec![0x1000]);
+    }
+
+    #[test]
+    fn x86_functions_infer_stack_arguments() {
+        // mov eax, [esp+8]; ret   (reads the second stack argument)
+        let img = x86_image(&[0x8b, 0x44, 0x24, 0x08, 0xc3], &[], &[]);
+        let f = features(&img, &range(0x1000, 0x1005));
+        assert_eq!(f.inferred_args, Some(2));
+        assert!(f.inferred_arg_classes.is_empty(), "no register arguments");
+        // mov eax, [ecx]; add eax, [esp+4]; ret 4   (__thiscall: ecx, then a stack word)
+        let img = x86_image(
+            &[0x8b, 0x01, 0x03, 0x44, 0x24, 0x04, 0xc2, 0x04, 0x00],
+            &[],
+            &[],
+        );
+        let f = features(&img, &range(0x1000, 0x1009));
+        assert_eq!(f.inferred_args, Some(2));
+        assert_eq!(f.inferred_arg_classes, vec![ArgClass::Integer]);
+        // Negative: the same bytes as x64 code read no argument register.
+        let f = features(
+            &image(&[0x8b, 0x44, 0x24, 0x08, 0xc3], &[]),
+            &range(0x1000, 0x1005),
+        );
+        assert_eq!(f.inferred_args, Some(0));
     }
 }

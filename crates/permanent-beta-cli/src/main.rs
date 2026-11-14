@@ -93,7 +93,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Analyze a PE x64 binary into the normalized AnalysisExport JSON (native analyzer).
+    /// Analyze a PE x64 or x86 binary into the normalized AnalysisExport JSON (native analyzer).
     Analyze {
         binary: PathBuf,
         /// Where to write the analysis: minified JSON, gzip-compressed if the path ends in `.gz`. Every command
@@ -675,7 +675,7 @@ fn recorded_runner(
     use permanent_beta_engine::permanent_beta_replay::{EMULATOR, Image, Recording};
     let bytes = std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
     let image = Image::parse(&bytes)
-        .map_err(|e| anyhow::anyhow!("{}: not a PE x64 image: {e}", binary.display()))?;
+        .map_err(|e| anyhow::anyhow!("{}: not a PE x64 or x86 image: {e}", binary.display()))?;
     anyhow::ensure!(
         image.build == new.build.id,
         "{} is build {}, but the new analysis is of {}",
@@ -1238,7 +1238,7 @@ fn cmd_repair(a: RepairArgs) -> Result<u8> {
     if let Some(bin) = a.new_binary {
         let bytes = std::fs::read(bin).with_context(|| format!("reading {}", bin.display()))?;
         let index = PatternIndex::new(&bytes)
-            .map_err(|e| anyhow::anyhow!("{}: not a PE x64 image: {e}", bin.display()))?;
+            .map_err(|e| anyhow::anyhow!("{}: not a PE x64 or x86 image: {e}", bin.display()))?;
         let binary_build = permanent_beta_analysis::native::build_id(&bytes);
         anyhow::ensure!(
             binary_build == new.build.id,
@@ -1609,7 +1609,7 @@ fn print_analysis_diff(d: &diff::AnalysisDiff, limit: usize) {
 fn cmd_pattern(binary: &Path, rva: Rva) -> Result<u8> {
     let bytes = std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
     let index = PatternIndex::new(&bytes)
-        .map_err(|e| anyhow::anyhow!("{}: not a PE x64 image: {e}", binary.display()))?;
+        .map_err(|e| anyhow::anyhow!("{}: not a PE x64 or x86 image: {e}", binary.display()))?;
     match index.generate(rva.0) {
         Ok(p) => {
             println!("{p}");

@@ -1473,7 +1473,9 @@ need, at the cost of deterring contributors.
 
 **Scope**
 1. Platforms: Windows PE only for v1, or ELF too? When? (Provisional: PE only.)
-2. Architectures: x64 only, or x86 too (much of legacy software is 32-bit, with no `.pdata`)? ARM64?
+2. Architectures: x64 only, or x86 too (much of legacy software is 32-bit, with no `.pdata`)? ARM64? (Decided
+   2026-11-14: x64 and x86. x86 boundaries come from discovery alone, with SEH scope-table blocks kept in their
+   function; ABI `win32` with MSVC's four conventions in the record spec, replay and the hook host. ARM64 open.)
 3. Compilers: MSVC only, or also clang-cl and MinGW?
 4. Hook libraries: Detours only, or MinHook, PolyHook 2, EasyHook, Frida, custom trampolines?
 5. How do your *existing* hooks locate targets today: RVA tables, AOB patterns, symbols? This decides the first

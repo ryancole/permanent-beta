@@ -217,6 +217,7 @@ fn image() -> Image {
 fn spec(ret: ValueType) -> HarnessSpec {
     HarnessSpec {
         build: BuildId("old".into()),
+        abi: permanent_beta_model::Abi::Win64,
         max_cases: 8,
         import_memory: true,
         pointer_depth: 0,
@@ -227,6 +228,7 @@ fn spec(ret: ValueType) -> HarnessSpec {
             prototype: "int f(...)".into(),
             ret,
             stack_args: 0,
+            convention: None,
             args: Vec::new(),
             globals: Vec::new(),
         }],

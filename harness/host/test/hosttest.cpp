@@ -4,6 +4,9 @@
 // result, so a register or stack the thunk corrupts shows up as a wrong number, not only as a strange log line.
 //
 // Built twice: `/DV2` adds a function and a call before the others, so every function moves.
+//
+// Built for x86 (test.ps1 -Arch x86), it has three more functions, one per x86 calling convention that isn't
+// __cdecl: the callee removes its stack arguments, so a thunk that gets that wrong corrupts the caller's stack.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -59,6 +62,27 @@ NOINLINE unsigned long long fib(unsigned n) {
     return n < 2 ? n : fib(n - 1) + fib(n - 2);
 }
 
+#if defined(_M_IX86)
+NOINLINE int __stdcall area(int w, int h) {
+    return w * h + 1;
+}
+
+// a and b in ecx and edx, c on the stack; weighted, so arguments in the wrong place give another result.
+NOINLINE int __fastcall fsum(int a, int b, int c) {
+    return a + 2 * b + 3 * c;
+}
+
+struct Box {
+    int v;
+    __declspec(noinline) int get(int i);
+};
+
+// __thiscall: `this` in ecx.
+__declspec(noinline) int Box::get(int i) {
+    return v * 10 + i;
+}
+#endif
+
 namespace {
 
 constexpr int kThreads = 4;
@@ -91,6 +115,12 @@ int main() {
     std::printf("store %d\n", x);
     std::printf("count_chars %zu\n", count_chars("hello", L"wörld"));
     std::printf("fib %llu\n", fib(10));
+#if defined(_M_IX86)
+    std::printf("area %d\n", area(3, 4));
+    std::printf("fsum %d\n", fsum(1, 2, 3));
+    Box box{7};
+    std::printf("box %d\n", box.get(2));
+#endif
 
     HANDLE threads[kThreads];
     for (int t = 0; t < kThreads; t++) {

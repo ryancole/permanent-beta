@@ -9,7 +9,7 @@ use permanent_beta_model::{
     PriorDecisions, ReviewItem, ReviewReason, Rva, VerificationReport,
 };
 use permanent_beta_repair::{
-    HookRepair, RepairAction, decide, from_review, layout, prototype, review_items,
+    HookRepair, RepairAction, decide_for, from_review, layout, prototype, review_items,
     rewrite_manifest, stale_locator,
 };
 use permanent_beta_verify::{BehavioralRunner, Policy, Verifier, VerifyContext};
@@ -176,7 +176,12 @@ impl Engine {
                 Some(mappings::PrototypeMisfit {
                     old: m.old,
                     new: m.new,
-                    detail: permanent_beta_repair::prototype_misfit(proto, o, n)?,
+                    detail: permanent_beta_repair::prototype_misfit(
+                        proto,
+                        permanent_beta_repair::harness::abi_of(new),
+                        o,
+                        n,
+                    )?,
                 })
             })
             .collect();
@@ -348,7 +353,8 @@ impl Engine {
             _ => Vec::new(),
         };
         alternatives.retain(|a| !rejected(a.candidate.old, a.candidate.new));
-        let mut repair = decide(hook, old_fn, report, new_fn, alternatives);
+        let abi = permanent_beta_repair::harness::abi_of(new);
+        let mut repair = decide_for(abi, hook, old_fn, report, new_fn, alternatives);
         let refused: Vec<String> = old_fn
             .map(|o| {
                 prior

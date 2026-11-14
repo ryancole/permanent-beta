@@ -98,6 +98,8 @@ pub struct Rebase<'a> {
     pub map: &'a AddressMap,
     pub old_image: &'a Range<u64>,
     pub new_base: u64,
+    /// Bytes in a pointer: 8, or 4 for an x86 image.
+    pub width: usize,
 }
 
 impl Rebase<'_> {
@@ -110,19 +112,21 @@ impl Rebase<'_> {
         Some((self.new_base + rva, kind))
     }
 
-    /// Rewrites every aligned 8-byte word of `bytes` (at `address`) that is a mapped old-image address. Returns
-    /// how many of each kind it rewrote.
+    /// Rewrites every aligned pointer-sized word of `bytes` (at `address`) that is a mapped old-image address.
+    /// Returns how many of each kind it rewrote.
     pub fn rewrite(&self, address: u64, bytes: &mut [u8]) -> Rewritten {
         let mut n = Rewritten::default();
-        let first = ((8 - (address & 7)) & 7) as usize;
+        let w = self.width as u64;
+        let first = ((w - (address & (w - 1))) & (w - 1)) as usize;
         let mut off = first;
-        while off + 8 <= bytes.len() {
-            let w = u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8 bytes"));
-            if let Some((new, kind)) = self.address(w) {
-                bytes[off..off + 8].copy_from_slice(&new.to_le_bytes());
+        while off + self.width <= bytes.len() {
+            let mut word = [0u8; 8];
+            word[..self.width].copy_from_slice(&bytes[off..off + self.width]);
+            if let Some((new, kind)) = self.address(u64::from_le_bytes(word)) {
+                bytes[off..off + self.width].copy_from_slice(&new.to_le_bytes()[..self.width]);
                 n.count(kind);
             }
-            off += 8;
+            off += self.width;
         }
         n
     }
@@ -223,6 +227,7 @@ mod tests {
         let m = AddressMap::new(&old, &new, &[]);
         let image = 0x7ff6_0000_0000..0x7ff6_0001_0000;
         let r = Rebase {
+            width: 8,
             map: &m,
             old_image: &image,
             new_base: 0x1_4000_0000,

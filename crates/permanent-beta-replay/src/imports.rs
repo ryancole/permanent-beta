@@ -28,6 +28,7 @@
 //! function itself returns and writes is still compared, and a difference there fails the case.
 
 use crate::recording::LoadedImport;
+use permanent_beta_model::Abi;
 
 /// Most bytes of a format string or a `%s` argument read. **[Guess]**
 pub const MAX_STRING: usize = 4096;
@@ -79,8 +80,13 @@ pub enum Heap {
 
 /// An import call's arguments and the memory they point to.
 pub trait CallView {
-    /// Integer argument slot `i`: 0–3 are rcx, rdx, r8, r9; 4 and up are on the stack.
+    /// Win64: integer argument slot `i`, 0–3 are rcx, rdx, r8, r9; 4 and up are on the stack. Win32: stack word
+    /// `i` above the return address ([`arg_of`] finds a parameter's words).
     fn arg(&self, i: usize) -> Option<u64>;
+    /// The ABI the call was made in.
+    fn abi(&self) -> Abi {
+        Abi::Win64
+    }
     /// `len` bytes at `address`, if all of them are readable (recorded, for a recorded call).
     fn read(&self, address: u64, len: usize) -> Option<Vec<u8>>;
 }
@@ -99,12 +105,19 @@ fn read_str(view: &dyn CallView, address: u64, max: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A recorded import call, as a [`CallView`] over its snapshots (their bytes before the call).
-pub struct Recorded<'a>(pub &'a LoadedImport);
+/// A recorded import call in an ABI, as a [`CallView`] over its snapshots (their bytes before the call).
+pub struct Recorded<'a>(pub &'a LoadedImport, pub Abi);
 
 impl CallView for Recorded<'_> {
+    fn abi(&self) -> Abi {
+        self.1
+    }
+
     fn arg(&self, i: usize) -> Option<u64> {
         let e = &self.0.call.entry;
+        if self.1 == Abi::Win32 {
+            return e.stack.get(i).map(|w| w.0 & 0xffff_ffff);
+        }
         match i {
             0..=3 => Some(e.int_reg(i as u8)),
             _ => e.stack.get(i - 4).map(|w| w.0),
@@ -241,11 +254,22 @@ fn execute_named(name: &str, now: &dyn CallView) -> Result<Effect, Refusal> {
 pub struct StandIns {
     calls: Vec<LoadedImport>,
     next: usize,
+    abi: Abi,
 }
 
 impl StandIns {
     pub fn new(calls: Vec<LoadedImport>) -> Self {
-        Self { calls, next: 0 }
+        Self {
+            calls,
+            next: 0,
+            abi: Abi::Win64,
+        }
+    }
+
+    /// The recorded calls were made in `abi` (Win32 for an x86 recording).
+    pub fn in_abi(mut self, abi: Abi) -> Self {
+        self.abi = abi;
+        self
     }
 
     /// Stands in for the candidate's call to `import` (`dll!name`), whose arguments `now` shows.
@@ -270,7 +294,7 @@ impl StandIns {
             )));
         }
         self.next += 1;
-        let r = Recorded(rec);
+        let r = Recorded(rec, self.abi);
         let rax = rec.call.observed.rax.0;
         match name {
             "__acrt_iob_func" => {
@@ -303,7 +327,7 @@ impl StandIns {
                         "the recorded {name} returned {result}: what it wrote isn't modelled"
                     ));
                 }
-                let count = now.arg(2).unwrap_or(0);
+                let count = arg_of(now, 2, name).unwrap_or(0);
                 let n = (result as u64 + 1).min(count) as usize;
                 if n == 0 {
                     return Ok(Effect {
@@ -312,7 +336,7 @@ impl StandIns {
                         heap: None,
                     });
                 }
-                let (Some(old_buf), Some(new_buf)) = (r.arg(1), now.arg(1)) else {
+                let (Ok(old_buf), Ok(new_buf)) = (arg_of(&r, 1, name), arg_of(now, 1, name)) else {
                     return Err(format!("{name}: no buffer argument"));
                 };
                 let written = rec
@@ -411,7 +435,7 @@ impl StandIns {
         self.calls
             .iter()
             .filter_map(|c| {
-                let r = Recorded(c);
+                let r = Recorded(c, self.abi);
                 let size = match base_name(&c.call.import) {
                     "malloc" => r.arg(0)?,
                     "calloc" => r.arg(0)?.checked_mul(r.arg(1)?)?,
@@ -450,9 +474,24 @@ impl StandIns {
     }
 }
 
+/// Parameter `i` of the import `name`. Win32 passes every parameter on the stack, in 4-byte words: the
+/// `__stdio_common_v*` functions' first parameter (`unsigned __int64 options`) and `_rotl64`'s and `_rotr64`'s
+/// value take two, and every other parameter of the modelled imports one.
 fn arg_of(view: &dyn CallView, i: usize, name: &str) -> Result<u64, Refusal> {
-    view.arg(i)
-        .ok_or_else(|| format!("{name}: argument {i} wasn't recorded"))
+    let missing = || format!("{name}: argument {i} wasn't recorded");
+    if view.abi() == Abi::Win64 {
+        return view.arg(i).ok_or_else(missing);
+    }
+    let wide_first = name.starts_with("__stdio_common_v") || matches!(name, "_rotl64" | "_rotr64");
+    match (wide_first, i) {
+        (true, 0) => {
+            let lo = view.arg(0).ok_or_else(missing)?;
+            let hi = view.arg(1).ok_or_else(missing)?;
+            Ok(lo | hi << 32)
+        }
+        (true, _) => view.arg(i + 1).ok_or_else(missing),
+        (false, _) => view.arg(i).ok_or_else(missing),
+    }
 }
 
 /// The low `width` bytes of argument `i` must be equal.
@@ -600,9 +639,29 @@ fn same_printf(
     }
     let slots = slots(&format_now).map_err(|what| format!("{name}: can't compare {what}"))?;
     let (list_now, list_rec) = (arg_of(now, list_arg, name)?, arg_of(rec, list_arg, name)?);
+    // Each slot's offset in the va_list: 8 bytes each on Win64; on Win32 4, or 8 for a double or a 64-bit integer.
+    let win32 = now.abi() == Abi::Win32;
+    let size = |slot: &Slot| -> u64 {
+        match slot {
+            _ if !win32 => 8,
+            Slot::Int(8) | Slot::Double => 8,
+            _ => 4,
+        }
+    };
+    let offsets: Vec<u64> = slots
+        .iter()
+        .scan(0u64, |at, s| {
+            let here = *at;
+            *at += size(s);
+            Some(here)
+        })
+        .collect();
     let word = |view: &dyn CallView, list: u64, k: usize| -> Option<u64> {
-        let b = view.read(list + 8 * k as u64, 8)?;
-        Some(u64::from_le_bytes(b.try_into().ok()?))
+        let n = size(&slots[k]) as usize;
+        let b = view.read(list + offsets[k], n)?;
+        let mut w = [0u8; 8];
+        w[..n].copy_from_slice(&b);
+        Some(u64::from_le_bytes(w))
     };
     let mut last_int = 0u64;
     for (k, slot) in slots.iter().enumerate() {

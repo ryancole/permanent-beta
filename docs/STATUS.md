@@ -4,7 +4,33 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work (2026-11-14): **M7, the IDA plugin's markup carry-forward** (design §11.4).
+Latest work (2026-11-14, later): **x86 (32-bit PE) support** (design §13 question 2, decided: x64 and x86).
+- **Analysis:** PE32 images (`machine: x86`, features version `native-4-x86`, so x86 and x64 analyses are never
+  compared; x64 output is byte-identical to before, checked on five corpus builds). No `.pdata`, so every boundary
+  comes from discovery. Absolute operands count where x64's RIP-relative ones do (`call [__imp_f]`, `push offset s`,
+  `mov eax, [g]`), and an immediate is a reference only when a `HIGHLOW` relocation names it. Throw sites read the
+  pushed ThrowInfo (addresses, not RVAs). An SEH scope table's `__except` filter and handler blocks stay in the
+  function that pushes the table (EH4 and EH3), with discovery redone once they're known. A no-return call's `int3`
+  stays in its function. Arguments: ecx/edx read first (`__thiscall`/`__fastcall`), then stack words, for the
+  matcher's argument veto, the prototype check and struct-access inference (`x86_args`). On the `basic` fixture
+  built for x86 (/O2 and /Od, by hand, not the corpus scripts): every PDB function's bounds agree exactly; matching
+  v1 → v2 got 38 and 40 PDB-named functions right, 0 wrong (x64's builds of it: 34 and 35).
+- **Model:** ABI `win32` (`Abi`, `Convention`, `ArgSlot::Reg32`/`Stack32`, `slots32`): a record spec's `abi`, each
+  hook's `convention`, stack words from `esp+4`; a recording's `rax` is edx:eax and `xmm0` st(0) as the declared type.
+- **Repair:** the record spec, prototype check (`decide_for`), struct-layout inference, host config (`abi`,
+  `convention`, `stack_bytes`) and handler stubs (`PBETA_HOOK_CC`; `__thiscall` as `__fastcall` with an unused edx)
+  follow each hook's convention (prototype keyword, else PDB signature, else `__cdecl`). Size_t-like types are 4 bytes.
+  Fixed on the way: a record spec's return type dropped `__int64` (`unsigned __int64` was read as 4 bytes).
+- **Replay:** PE32 images run on icicle's 32-bit x86 (Ghidra's `x86:LE:32`), below 4 GiB; the callee's pops are
+  checked, results read from edx:eax and st(0), and the modelled CRT imports read their stack words (`va_list` slots
+  4 or 8 bytes).
+- **Hook host:** `build.ps1 -Arch x86` (`target/host-x86`, `host_thunk32.asm`: copies 32 stack words, measures what
+  the original removed, keeps st(0) off the x87 stack while C++ runs). `test.ps1 -Arch x86` passes every check,
+  with `__stdcall`, `__fastcall` and `__thiscall` hooks added; x64 unchanged. Both run in CI.
+- **Not done:** the recorder (`corpus/hooks/hookdll`) is still x64-only, so x86 cases can't be recorded yet, and the
+  corpus has no x86 variants: no x86 scorecards were run.
+
+Before that (2026-11-14): **M7, the IDA plugin's markup carry-forward** (design §11.4).
 - `pbeta mappings --old --new [--store] [--markup] [--json]` lists a build pair's accepted function mappings: the
   engine's accepted verdicts plus reviewers' accepted mappings, minus pairs reviewers rejected and functions with
   an open review item. Every other old function is pending, with the reason. It reads only. With `--markup` (an

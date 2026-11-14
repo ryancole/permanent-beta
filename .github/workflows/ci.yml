@@ -82,6 +82,9 @@ jobs:
       - name: hook host end-to-end test
         shell: pwsh
         run: ./harness/host/test.ps1
+      - name: hook host end-to-end test, x86 (a 32-bit test app; __stdcall, __fastcall and __thiscall hooks too)
+        shell: pwsh
+        run: ./harness/host/test.ps1 -Arch x86
 
   corpus:
     if: github.event_name == 'workflow_dispatch' && inputs.corpus

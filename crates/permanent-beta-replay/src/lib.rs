@@ -246,8 +246,17 @@ pub fn replay(
     new: &NewBuild,
 ) -> CaseOutcome {
     let c = &case.case;
-    if c.abi != permanent_beta_model::ABI_WIN64 {
-        return CaseOutcome::inconclusive(format!("recorded with ABI {:?}", c.abi));
+    let abi = if image.x86 {
+        permanent_beta_model::Abi::Win32
+    } else {
+        permanent_beta_model::Abi::Win64
+    };
+    if c.abi != abi.as_str() {
+        return CaseOutcome::inconclusive(format!(
+            "recorded with ABI {:?}, but the new build's is {:?}",
+            c.abi,
+            abi.as_str()
+        ));
     }
     let Some(hook) = spec.hook(&c.hook) else {
         return CaseOutcome::inconclusive(format!("the spec has no hook {}", c.hook));
@@ -291,10 +300,16 @@ pub fn replay(
             ));
         }
     }
+    // x86: what the callee removes from the stack when it returns.
+    let pops = hook
+        .convention
+        .filter(|c| c.callee_pops())
+        .map_or(0, |_| 4 * u64::from(hook.stack_args));
     run_and_compare(
         image,
         new_rva,
         hook.ret,
+        pops,
         case,
         &prepared,
         &globals,
@@ -312,6 +327,7 @@ fn run_and_compare(
     _: &Image,
     _: Rva,
     _: ValueType,
+    _: u64,
     _: &LoadedCase,
     _: &[Prepared],
     _: &[PreparedGlobal],
@@ -329,6 +345,7 @@ fn run_and_compare(
     image: &Image,
     new_rva: Rva,
     ret: ValueType,
+    pops: u64,
     case: &LoadedCase,
     prepared: &[Prepared],
     globals: &[PreparedGlobal],
@@ -336,6 +353,11 @@ fn run_and_compare(
     changed: Option<&Changed>,
 ) -> CaseOutcome {
     let watch: Vec<u64> = changed.map_or(Vec::new(), |c| c.functions.keys().copied().collect());
+    let abi = if image.x86 {
+        permanent_beta_model::Abi::Win32
+    } else {
+        permanent_beta_model::Abi::Win64
+    };
     let placed: Vec<emulate::Placed> = prepared
         .iter()
         .map(|p| emulate::Placed {
@@ -361,9 +383,10 @@ fn run_and_compare(
         imports: case
             .case
             .imports_recorded
-            .then(|| imports::StandIns::new(case.imports.clone())),
+            .then(|| imports::StandIns::new(case.imports.clone()).in_abi(abi)),
         addresses,
         watch: &watch,
+        pops,
     }) {
         Ok(r) => r,
         Err(stop) => return attribute_stop(stop, changed),
@@ -373,6 +396,7 @@ fn run_and_compare(
         .image_size
         .map(|s| case.case.image_base.0..case.case.image_base.0.saturating_add(s.0));
     let rebase = addresses.map(|(img, map)| address::Rebase {
+        width: image.pointer_size(),
         map,
         old_image: img,
         new_base: ran.image.start,
@@ -461,16 +485,17 @@ fn first_difference(
             i += 1;
             continue;
         }
-        // The aligned 8-byte word holding byte i, if it lies inside the bytes.
-        let aligned = (base + i as u64) & !7;
+        // The aligned pointer-sized word holding byte i, if it lies inside the bytes.
+        let w = pointers.width;
+        let aligned = (base + i as u64) & !(w as u64 - 1);
         let start = aligned
             .checked_sub(base)
             .and_then(|o| usize::try_from(o).ok());
         if let Some(start) = start
-            && start + 8 <= expected.len()
-            && pointers.both_in_image(&expected[start..start + 8], &got[start..start + 8])
+            && start + w <= expected.len()
+            && pointers.both_in_image(&expected[start..start + w], &got[start..start + w])
         {
-            i = start + 8;
+            i = start + w;
             continue;
         }
         return Some(i);
@@ -487,6 +512,8 @@ fn first_difference(
 /// recordings) no word is treated this way.
 #[cfg(feature = "emulator")]
 struct ImagePointers<'a> {
+    /// Bytes in a pointer: 8, or 4 on x86.
+    width: usize,
     old: Option<Range<u64>>,
     new: Range<u64>,
     rebase: Option<address::Rebase<'a>>,
@@ -505,7 +532,11 @@ impl ImagePointers<'_> {
         let Some(old) = &self.old else {
             return false;
         };
-        let word = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
+        let word = |b: &[u8]| {
+            let mut w = [0u8; 8];
+            w[..b.len()].copy_from_slice(b);
+            u64::from_le_bytes(w)
+        };
         let (e, g) = (word(expected), word(got));
         if let Some((new, kind)) = self.rebase.and_then(|r| r.address(e)) {
             if g == new {
@@ -539,6 +570,7 @@ fn compare(
     rebase: Option<address::Rebase>,
 ) -> CaseOutcome {
     let mut pointers = ImagePointers {
+        width: ran.pointer_size,
         old: old_image,
         new: ran.image.clone(),
         rebase,
@@ -558,8 +590,10 @@ fn compare(
             compared.push(format!("return {want:#x}"));
         }
         ValueType::Pointer => {
+            let w = pointers.width;
             let (want, got) = (observed.rax.0.to_le_bytes(), ran.rax.to_le_bytes());
-            if want != got && !pointers.both_in_image(&want, &got) {
+            let (want, got) = (&want[..w], &got[..w]);
+            if want != got && !pointers.both_in_image(want, got) {
                 return CaseOutcome::Fail {
                     detail: format!("returned {:#x}, expected {:#x}", ran.rax, observed.rax.0),
                 };
@@ -568,16 +602,22 @@ fn compare(
         }
         ValueType::Float(w) => {
             let w = usize::from(w);
-            if observed.xmm0.0[..w] != ran.xmm0[..w] {
+            // x86 returns st(0); the recording holds it as the declared type, in xmm0's bytes.
+            let (got, register) = match ran.st0.map(f64::from_bits) {
+                Some(st0) if w == 4 => ((st0 as f32).to_le_bytes().to_vec(), "st(0)"),
+                Some(st0) => (st0.to_le_bytes().to_vec(), "st(0)"),
+                None => (ran.xmm0[..w].to_vec(), "xmm0"),
+            };
+            if observed.xmm0.0[..w] != got[..] {
                 return CaseOutcome::Fail {
                     detail: format!(
-                        "returned xmm0 {}, expected {}",
-                        image::hex(&ran.xmm0[..w]),
+                        "returned {register} {}, expected {}",
+                        image::hex(&got),
                         image::hex(&observed.xmm0.0[..w])
                     ),
                 };
             }
-            compared.push("return xmm0".into());
+            compared.push(format!("return {register}"));
         }
         ValueType::Void => {}
         ValueType::Unknown => return CaseOutcome::inconclusive("unknown return type"),
@@ -668,3 +708,5 @@ fn compare(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_x86;
