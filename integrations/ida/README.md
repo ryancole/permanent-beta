@@ -12,16 +12,16 @@ Needs IDA Home or Pro 9.x with IDAPython (IDA Free has no IDAPython), and a `pbe
 ## Install
 
 Copy `permanent_beta_ida.py` and the `permanent_beta` folder into IDA's plugins directory, either the install's
-`plugins` folder or `%APPDATA%\Hex-Rays\IDA Pro\plugins`, then restart IDA. The plugin adds **Edit > Permanent Beta**.
+`plugins` folder or `%APPDATA%\Hex-Rays\IDA Pro\plugins`, then restart IDA. The plugin adds **Edit > Plugins > Permanent Beta**.
 
 ## Use
 
 1. Analyze both builds with pbeta (`pbeta analyze old.exe --out old.json`, the same for the new build). If you
    review with a store, keep its path to hand.
-2. In the **old** build's database: **Edit > Permanent Beta > Export markup...** writes a `pbeta-markup` JSON
+2. In the **old** build's database: **Edit > Plugins > Permanent Beta > Export markup...** writes a `pbeta-markup` JSON
    file. It holds names you set (not IDA's `sub_` names, and not the library functions IDA recognised itself),
    prototypes you set, function comments and local types.
-3. In the **new** build's database: **Edit > Permanent Beta > Apply markup from an older build...** asks for the
+3. In the **new** build's database: **Edit > Plugins > Permanent Beta > Apply markup from an older build...** asks for the
    pbeta executable, the markup export, both analyses and, optionally, the review store. It then runs
    `pbeta mappings --markup` and asks before writing anything.
    - Each database must be its analysis's build: IDA's input file SHA-256 is the build id. A mismatch is refused.

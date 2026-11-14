@@ -1,4 +1,4 @@
-"""The IDA plugin: Edit > Permanent Beta > Export markup / Apply markup from an older build (design §11.4).
+"""The IDA plugin: Edit > Plugins > Permanent Beta > Export markup / Apply markup from an older build (design §11.4).
 
 It runs only `pbeta mappings` (a read) and writes only to the open database. It never decides a mapping or a
 review item.
@@ -18,7 +18,10 @@ import ida_nalt
 from . import core
 from .ida_db import IdaDatabase
 
-MENU = "Edit/Permanent Beta/"
+MENU_PARENT = "Edit/Plugins/"
+MENU_NAME = "permanent_beta:menu"
+MENU_LABEL = "Permanent Beta"
+MENU = MENU_PARENT + MENU_LABEL + "/"
 ACTION_EXPORT = "permanent_beta:export_markup"
 ACTION_APPLY = "permanent_beta:apply_markup"
 
@@ -207,29 +210,58 @@ class _Handler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_ALWAYS
 
 
+ACTIONS = (
+    (ACTION_EXPORT, "Export markup...", export_markup),
+    (ACTION_APPLY, "Apply markup from an older build...", apply_markup),
+)
+
+
+def attach_menu() -> bool:
+    """(Re)build Edit > Plugins > Permanent Beta. A submenu has to be created before actions can go in it."""
+    for name, _, _ in ACTIONS:
+        ida_kernwin.detach_action_from_menu(MENU, name)
+    ida_kernwin.delete_menu(MENU_NAME)
+    ok = ida_kernwin.create_menu(MENU_NAME, MENU_LABEL, MENU_PARENT)
+    for name, _, _ in ACTIONS:
+        ok = ida_kernwin.attach_action_to_menu(MENU, name, ida_kernwin.SETMENU_APP) and ok
+    return bool(ok)
+
+
+class _UiHooks(ida_kernwin.UI_Hooks):
+    """IDA fills Edit > Plugins as plugins load; attach again once the UI is ready, so the submenu survives."""
+
+    def ready_to_run(self):
+        ok = attach_menu()
+        ida_kernwin.msg(f"Permanent Beta: {'added' if ok else 'could not add'} {MENU.rstrip('/')}\n")
+
+
 class PermanentBetaPlugin(ida_idaapi.plugin_t):
-    flags = ida_idaapi.PLUGIN_KEEP
+    # Loaded with each database. PLUGIN_HIDE: no one-click Edit > Plugins entry of IDA's own; the actions have
+    # their own submenu there (MENU). PLUGIN_KEEP is init's return value, not a flag.
+    flags = ida_idaapi.PLUGIN_HIDE
     comment = "Carry markup to a new build across verified function mappings"
-    help = "Edit > Permanent Beta"
+    help = "Edit > Plugins > Permanent Beta"
     wanted_name = "Permanent Beta"
     wanted_hotkey = ""
 
     def init(self):
-        for name, label, fn in (
-            (ACTION_EXPORT, "Export markup...", export_markup),
-            (ACTION_APPLY, "Apply markup from an older build...", apply_markup),
-        ):
+        for name, label, fn in ACTIONS:
             ida_kernwin.register_action(ida_kernwin.action_desc_t(name, label, _Handler(fn)))
-            ida_kernwin.attach_action_to_menu(MENU, name, ida_kernwin.SETMENU_APP)
+        ok = attach_menu()
+        ida_kernwin.msg(f"Permanent Beta: {'added' if ok else 'will add'} {MENU.rstrip('/')}\n")
+        self.hooks = _UiHooks()
+        self.hooks.hook()
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
         apply_markup_safely()
 
     def term(self):
-        for name in (ACTION_EXPORT, ACTION_APPLY):
+        self.hooks.unhook()
+        for name, _, _ in ACTIONS:
             ida_kernwin.detach_action_from_menu(MENU, name)
             ida_kernwin.unregister_action(name)
+        ida_kernwin.delete_menu(MENU_NAME)
 
 
 def apply_markup_safely():
