@@ -41,6 +41,8 @@ stop plausible-but-wrong matching logic from merging.
 - Bump `FEATURES_VERSION` (`permanent-beta-analysis/src/native/mod.rs`) on any change to what a hash or code feature
   covers.
 - No features for unpacking, defeating integrity checks, or evading anti-cheat or anti-tamper (design §12).
+- Never add a `Signed-off-by` line yourself: the sign-off certifies the DCO (`CONTRIBUTING.md`), and only the human
+  submitting the change can make it.
 
 ## Commands
 

@@ -522,7 +522,7 @@ What's new:
    punning no local shows. Next: zstd's compression hooks (megabytes of workspace per case), globals reached only
    through pointers, and a corpus case that exercises changed-callee attribution (no zlib or zstd case does).
 5. **License: Apache-2.0, decided 2026-11-08** (design §11.5; `LICENSE`, `NOTICE`, every crate's `license`).
-   Still to choose: contributor terms (DCO or CLA).
+   Contributor terms: the DCO (2026-11-13; `CONTRIBUTING.md`, checked in CI on pull requests).
 6. **Outside the code:** try it on real targets people hook today (design §14 lists likely users).
 
 ## Known rough edges

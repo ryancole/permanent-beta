@@ -36,6 +36,29 @@ jobs:
       - name: replay tests with the emulator (icicle running Ghidra's x86-64 SLEIGH specification)
         run: cargo test -p permanent-beta-replay -p permanent-beta-cli --features permanent-beta-replay/emulator
 
+  dco:
+    # Every commit in a pull request carries a Signed-off-by line (CONTRIBUTING.md, the DCO).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: every commit is signed off
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git log -1 --format=%B "$c" | grep -qE '^Signed-off-by: .+ <[^>]+>$'; then
+              echo "::error::$(git log -1 --format='%h %s' "$c"): no Signed-off-by line (git commit -s; see CONTRIBUTING.md)"
+              missing=1
+            fi
+          done
+          exit $missing
+
   host:
     # The hook host end to end (harness/host/test.ps1, about a minute): builds Detours, the host and a test app
     # twice, locates its hooks with pbeta and runs both builds under every action, handlers and generated stubs.

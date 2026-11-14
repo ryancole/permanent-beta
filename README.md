@@ -213,6 +213,7 @@ versions) takes a long time and runs only on demand: Actions → ci → Run work
 case, and must keep wrong matches at zero.
 
 This codebase is written by AI agents and reviewed by the owner; [CLAUDE.md](CLAUDE.md) has the rules they follow.
+Contributions are welcome under the DCO: sign off each commit (`git commit -s`); see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Legal
 
