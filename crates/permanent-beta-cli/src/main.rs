@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod markup;
+
 const EXIT_OK: u8 = 0;
 const EXIT_NEEDS_REVIEW: u8 = 1;
 const EXIT_ERROR: u8 = 2;
@@ -135,6 +137,25 @@ enum Command {
         old: PathBuf,
         #[arg(long)]
         new: PathBuf,
+        /// Print the full report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a build pair's accepted function mappings: the engine's accepted matches and, with --store, the ones
+    /// reviewers accepted, minus pairs reviewers rejected and functions still in review. Every other old function
+    /// is listed as pending, with the reason. Reads only.
+    Mappings {
+        #[arg(long)]
+        old: PathBuf,
+        #[arg(long)]
+        new: PathBuf,
+        /// Review store: honor its decisions for this build pair. Without it, only the engine's matches.
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// A markup export of the old build (`pbeta-markup` JSON, the IDA plugin's): check each mapped
+        /// function's prototype against the new function's register arguments and list those that don't fit.
+        #[arg(long)]
+        markup: Option<PathBuf>,
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
@@ -461,6 +482,13 @@ fn run(cli: Cli) -> Result<u8> {
         ),
         Command::AnalysisDiff { a, b, json, limit } => cmd_analysis_diff(&a, &b, json, limit),
         Command::Match { old, new, json } => cmd_match(&old, &new, json),
+        Command::Mappings {
+            old,
+            new,
+            store,
+            markup,
+            json,
+        } => cmd_mappings(&old, &new, store.as_deref(), markup.as_deref(), json),
         Command::Repair {
             old,
             new,
@@ -920,6 +948,73 @@ fn cmd_harness_spec(
         println!("{:<18} skipped: {}", s.name, s.reason);
     }
     println!("spec written to {}", out.display());
+    Ok(EXIT_OK)
+}
+
+fn cmd_mappings(
+    old: &Path,
+    new: &Path,
+    store: Option<&Path>,
+    markup: Option<&Path>,
+    json: bool,
+) -> Result<u8> {
+    let (old, new) = (export::load(old)?, export::load(new)?);
+    let (from, to) = (&old.build.id, &new.build.id);
+    let prototypes = match markup {
+        Some(p) => markup::load_prototypes(p, from)?,
+        None => BTreeMap::new(),
+    };
+    let (prior, in_review) = match store {
+        Some(path) => {
+            let s = JsonFileStore::open(path)?;
+            let open: Vec<Rva> = s
+                .review_items()
+                .iter()
+                .filter(|i| {
+                    i.status == ReviewStatus::Open && &i.from_build == from && &i.to_build == to
+                })
+                .filter_map(|i| i.old)
+                .collect();
+            (s.prior_decisions(from, to), open)
+        }
+        None => (PriorDecisions::default(), Vec::new()),
+    };
+    let report =
+        Engine::with_defaults().accepted_mappings(&old, &new, &prior, &in_review, &prototypes)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(EXIT_OK);
+    }
+    println!("{:<10} {:<10} decided by", "old", "new");
+    for m in &report.mappings {
+        let by = match &m.decided_by {
+            permanent_beta_model::Decider::Engine => "engine".to_owned(),
+            permanent_beta_model::Decider::Human { reviewer } => format!("reviewer {reviewer}"),
+        };
+        println!("{:<10} {:<10} {by}", m.old.to_string(), m.new.to_string());
+    }
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    for p in &report.pending {
+        let r = serde_json::to_value(p.reason)?;
+        *reasons
+            .entry(r.as_str().unwrap_or("?").to_owned())
+            .or_default() += 1;
+    }
+    for m in &report.prototype_misfits {
+        println!("prototype of {} doesn't fit {}: {}", m.old, m.new, m.detail);
+    }
+    let reasons: Vec<String> = reasons.iter().map(|(r, n)| format!("{n} {r}")).collect();
+    println!(
+        "\n{} accepted mappings; {} old functions pending{}",
+        report.mappings.len(),
+        report.pending.len(),
+        if reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", reasons.join(", "))
+        }
+    );
     Ok(EXIT_OK)
 }
 

@@ -1,3 +1,4 @@
 /target
 /.pbeta
 *.pdb.cache
+__pycache__/

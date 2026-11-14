@@ -1,0 +1,58 @@
+{
+  "format": "pbeta-markup",
+  "version": 1,
+  "build": "02c38963d4cbcad84201a6f196fb77c8cec94ff26a05c29c32ee623e3300eefa",
+  "functions": [
+    {
+      "rva": "0x1010",
+      "name": "apply_discount",
+      "prototype": "int apply_discount(int cents, int percent)"
+    },
+    {
+      "rva": "0x1040",
+      "name": "checksum",
+      "prototype": "unsigned checksum(const unsigned char* data, int len)"
+    },
+    {
+      "rva": "0x1070",
+      "name": "format_receipt",
+      "prototype": "int format_receipt(char* buf, int cap, const Order* o, const char* customer)"
+    },
+    {
+      "rva": "0x10d0",
+      "name": "log_event",
+      "prototype": "void log_event(const char* msg, int code)"
+    },
+    {
+      "rva": "0x1100",
+      "name": "loyalty_bonus"
+    },
+    {
+      "rva": "0x1140",
+      "name": "main"
+    },
+    {
+      "rva": "0x1230",
+      "name": "order_add",
+      "prototype": "int order_add(Order* o, int sku, int qty)"
+    },
+    {
+      "rva": "0x12b0",
+      "name": "price_lookup",
+      "prototype": "int price_lookup(int sku)",
+      "comment": "looks up the price table; returns cents"
+    },
+    {
+      "rva": "0x1340",
+      "name": "ship_order",
+      "prototype": "unsigned ship_order(Order* o, const char* customer, int discount)"
+    },
+    {
+      "rva": "0x1490",
+      "name": "stock_level",
+      "prototype": "int stock_level(int sku)",
+      "repeatable_comment": "stock in units"
+    }
+  ],
+  "types": "struct Order { int skus[8]; int qtys[8]; int count; };"
+}

@@ -59,6 +59,19 @@ jobs:
           done
           exit $missing
 
+  ida:
+    # The IDA plugin's logic without IDA (integrations/ida/tests): export, apply rules, the pbeta client, against a
+    # recorded `pbeta mappings` reply. IDA itself can't run in CI (its licence); the GUI is checked by hand.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: plugin unit tests
+        working-directory: integrations/ida
+        run: python -m unittest discover -s tests -v
+
   host:
     # The hook host end to end (harness/host/test.ps1, about a minute): builds Detours, the host and a test app
     # twice, locates its hooks with pbeta and runs both builds under every action, handlers and generated stubs.

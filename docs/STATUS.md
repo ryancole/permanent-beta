@@ -1,10 +1,29 @@
-# Status — where we left off (2026-11-13)
+# Status — where we left off (2026-11-14)
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work (2026-11-13, later): **corpus `debug` variant and an MSVC update.** A `debug` flag set (Visual
+Latest work (2026-11-14): **M7, the IDA plugin's markup carry-forward** (design §11.4).
+- `pbeta mappings --old --new [--store] [--markup] [--json]` lists a build pair's accepted function mappings: the
+  engine's accepted verdicts plus reviewers' accepted mappings, minus pairs reviewers rejected and functions with
+  an open review item. Every other old function is pending, with the reason. It reads only. With `--markup` (an
+  IDA export of the old build) it also lists the prototypes that don't fit the new function, using repair's
+  prototype check. On the hook loop's /O2 v2 → v3: 67 mappings, all agreeing with the map files.
+- `integrations/ida`: an IDAPython plugin (IDA Home or Pro 9.x). **Export markup** in the old database; **Apply
+  markup** in the new one. It runs `pbeta mappings` and carries names, prototypes, comments and local types
+  across those mappings only. It keeps what the user set in the new database, skips misfitting prototypes and
+  taken names, and lists everything in a results window. The logic is tested without IDA: 16 tests, in CI as the
+  `ida` job.
+- **Run in IDA Home 9.5** on the hook loop's /O2 v2 → v3 (PDB declined): the names `price_lookup` and
+  `format_receipt` carried to their map-file counterparts. `checksum` (ambiguous in v3) and three CRT functions
+  pending review got nothing. That run caught two fixes: a clear error when `pbeta` isn't found, and IDA's
+  library and thunk functions are no longer exported. Not yet tried in IDA: carrying prototypes and comments.
+  Exporting all local types is noisy, and one of IDA's own declarations (an anonymous `_LARGE_INTEGER` member)
+  doesn't parse back. Exporting only the types the user's prototypes use would fix both.
+- No analysis, matching or verification logic changed, so corpus scorecards weren't run.
+
+Before that (2026-11-13, later): **corpus `debug` variant and an MSVC update.** A `debug` flag set (Visual
 Studio's Debug configuration: /ZI /Od /RTC1 /JMC, linked /INCREMENTAL, so an empty `.textbss` and every call
 through an incremental linking thunk) for the fixtures and all six projects: 0 wrong, correct counts at or above
 /Od's. Running it showed the corpus no longer met its baselines: Visual Studio updated MSVC from 14.50 to 14.52 on
@@ -480,7 +499,7 @@ What's new:
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
 | Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; review extension (M6) built and verified end to end in the GUI; external tester pending |
-| IDA plugin | Not started (designed) |
+| IDA plugin | M7 built (2026-11-14): markup carry-forward across accepted mappings (`integrations/ida`) and `pbeta mappings`; names checked in IDA Home 9.5, prototypes and comments not yet |
 | AI fallback | Built and measured (M5), in `propose` and `repair --propose`: 75 of 77 proposals correct on Lua and zstd, /O2 and /Od (remeasured 2026-11-07); `none` on 11 of 12 deleted functions; no wrong proposal passes verification (design §8) |
 | License choice | Apache-2.0 (2026-11-08); contributor terms open |
 

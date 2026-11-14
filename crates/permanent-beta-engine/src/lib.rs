@@ -16,6 +16,7 @@ use permanent_beta_verify::{BehavioralRunner, Policy, Verifier, VerifyContext};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+pub mod mappings;
 pub mod recorded;
 
 pub use permanent_beta_match;
@@ -150,6 +151,36 @@ impl Engine {
             reports,
             ambiguities: outcome.ambiguities.clone(),
         })
+    }
+
+    /// The accepted function mappings of a build pair: the engine's accepted verdicts and reviewers' accepted
+    /// mappings, by the rules repair honors (see [`mappings`]). `in_review` is the old functions with an open
+    /// review item for this pair. `prototypes` are C prototypes for old functions (from a reverser's database):
+    /// each mapped one is checked against the new function with repair's prototype check, and a misfit is
+    /// reported, never applied. Reads only.
+    pub fn accepted_mappings(
+        &self,
+        old: &AnalysisExport,
+        new: &AnalysisExport,
+        prior: &PriorDecisions,
+        in_review: &[Rva],
+        prototypes: &BTreeMap<Rva, String>,
+    ) -> Result<mappings::MappingsReport, IncomparableFeatures> {
+        let mut report = mappings::select(self.match_builds(old, new)?, prior, in_review);
+        report.prototype_misfits = report
+            .mappings
+            .iter()
+            .filter_map(|m| {
+                let proto = prototypes.get(&m.old)?;
+                let (o, n) = (old.function(m.old)?, new.function(m.new)?);
+                Some(mappings::PrototypeMisfit {
+                    old: m.old,
+                    new: m.new,
+                    detail: permanent_beta_repair::prototype_misfit(proto, o, n)?,
+                })
+            })
+            .collect();
+        Ok(report)
     }
 
     /// Verify one candidate proposed from outside the engine (an AI proposer, an MCP client) exactly like the
@@ -703,6 +734,48 @@ mod tests {
             .repair_with(&manifest(), &old, &new, &prior)
             .unwrap();
         assert!(r.needs_review());
+    }
+
+    #[test]
+    fn a_carried_prototype_that_misses_an_argument_is_reported() {
+        // 0x10 read one integer argument; its counterpart 0x110 reads two. The reverser's one-argument prototype
+        // fit the old function, not the new one.
+        let mut o = func(0x10, "k");
+        o.inferred_args = Some(1);
+        o.inferred_arg_classes = vec![permanent_beta_model::ArgClass::Integer];
+        let mut n = func(0x110, "k2");
+        n.inferred_args = Some(2);
+        n.inferred_arg_classes = vec![permanent_beta_model::ArgClass::Integer; 2];
+        let mut same = func(0x20, "s");
+        same.inferred_args = Some(1);
+        same.inferred_arg_classes = vec![permanent_beta_model::ArgClass::Integer];
+        let mut same_new = same.clone();
+        same_new.rva = Rva(0x120);
+        let (old, new) = (export("a", vec![o, same]), export("b", vec![n, same_new]));
+        let mut fits = human(0x120);
+        fits.old = Rva(0x20);
+        let prior = PriorDecisions {
+            accepted: vec![human(0x110), fits],
+            rejected: vec![],
+        };
+        let prototypes = BTreeMap::from([
+            (Rva(0x10), "int __fastcall parse(Packet *p)".to_owned()),
+            (Rva(0x20), "int __fastcall same(int a)".to_owned()),
+        ]);
+        let r = Engine::with_defaults()
+            .accepted_mappings(&old, &new, &prior, &[], &prototypes)
+            .unwrap();
+        assert_eq!(r.mappings.len(), 2, "{:?}", r.mappings);
+        // Negative: the misfit is reported; the prototype that still fits isn't.
+        assert_eq!(r.prototype_misfits.len(), 1, "{:?}", r.prototype_misfits);
+        let m = &r.prototype_misfits[0];
+        assert_eq!((m.old, m.new), (Rva(0x10), Rva(0x110)));
+        assert!(m.detail.contains("rdx"), "{}", m.detail);
+        // No prototypes given: nothing to report.
+        let none = Engine::with_defaults()
+            .accepted_mappings(&old, &new, &prior, &[], &BTreeMap::new())
+            .unwrap();
+        assert!(none.prototype_misfits.is_empty());
     }
 
     #[test]

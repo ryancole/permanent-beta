@@ -41,7 +41,8 @@ tags and optimization settings (`/O2`, `/Od`, identical-code folding, `/LTCG`, P
 | AI proposer for unmatched functions (Claude, opt-in) | Built |
 | MCP server for agents (read, explain, propose; never accept) | Built (`pbeta-mcp`) |
 | Ghidra: headless exporter and review UI | Built ([integrations/ghidra](integrations/ghidra/README.md)) |
-| IDA plugin, ELF, ARM64, x86 | Not started |
+| IDA plugin: markup carry-forward | Built; names checked in IDA ([integrations/ida](integrations/ida/README.md)) |
+| ELF, ARM64, x86 | Not started |
 
 ## Build
 
@@ -190,6 +191,7 @@ crates/
   permanent-beta-corpus/    test tooling: answer keys and scoring (`pbeta-corpus`)
 harness/host/               the hook host (C++, Detours) and its end-to-end test
 integrations/ghidra/        headless exporter and review extension
+integrations/ida/           IDA plugin: carries markup to a new build across accepted mappings
 corpus/                     ground-truth corpus: fixtures, real projects, the hook-repair loop
 examples/demo/              hand-written analyses and manifest for the walkthrough above
 docs/                       design.md (architecture), STATUS.md (where things stand)

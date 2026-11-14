@@ -130,7 +130,7 @@ flowchart LR
 | `permanent-beta-corpus` | Test tooling: linker map parser, ground-truth answer keys (`pbeta-corpus`). Nothing depends on it. | model |
 | `permanent-beta-ai` | AI proposer (§8): shortlist, prompt, strict answer parsing, model backends, recordings. Emits `Candidate`s only. | model |
 | `permanent-beta-mcp` | MCP server over the engine (`pbeta-mcp`, §11.2). Reads the store and adds review items; never decides one. | engine, store, model |
-| *(planned)* `permanent-beta-py` | PyO3 bindings for IDA / scripting. | engine, model |
+| *(unplanned)* `permanent-beta-py` | PyO3 bindings for scripting; the IDA plugin doesn't need them (§11.4). | engine, model |
 
 **Rule that matters most:** `match` and `verify` do not depend on each other. Matchers propose, verification judges,
 and the only shared language is `permanent-beta-model`. A matcher cannot mark its own output accepted, and that includes
@@ -1318,8 +1318,109 @@ stays as it is), and any tool that decides an item other than `pbeta review`.
 
 ### 11.4 IDA Pro plugin (step 5)
 
-Via PyO3 bindings (`permanent-beta-py`) from IDAPython, or the same CLI/RPC route. Start after the repair pipeline is
-validated on the corpus.
+**Scope (proposed 2026-11-14).** It's to be developed against IDA Home 9.x, which has IDAPython, IDC and the C++ SDK. IDA Free 9.5
+has no IDAPython, so it can't run the plugin (see "IDA Free" below).
+
+Why IDA: people who hook closed-source targets keep their reverse-engineering work in an IDA database (names,
+prototypes, structs, comments). When a new build ships, that work is stranded on the old database. BinDiff and Diaphora
+port it across using similarity scores alone; the plugin ports it only across mappings that passed verification or a
+reviewer (§6, §9.1), so the zero-wrong-matches gate covers the markup too. It's the job of Ghidra's deferred VT link
+(§11.3), but IDA has no Version Tracking to link to, so the plugin does it.
+
+#### Route
+
+Same as the Ghidra extension, not PyO3: an IDAPython plugin that runs `pbeta` and `pbeta-mcp` as child processes,
+Python standard library only. PyO3 would tie a build to each IDA release's Python version and ABI and add a crate;
+the subprocess route needs neither, and no dependency rule changes. `permanent-beta-py` stays unplanned until some
+other user needs bindings.
+
+- **Reads:** `pbeta-mcp --store` read tools for review items (as the Ghidra extension, its `READ_TOOLS` list,
+  refusing `propose_mapping`), and a new read-only CLI command for accepted mappings (below).
+- **Decisions:** only `pbeta review accept|reject`, its errors shown as they are. The plugin writes no mapping and
+  decides no item.
+- **Databases are tied to builds** by the input file's SHA-256, which IDA records at load
+  (`ida_nalt.retrieve_input_file_sha256`); addresses are image base + RVA (`ida_nalt.get_imagebase`). A database
+  whose hash isn't the build's is refused, not guessed, as in Ghidra.
+
+#### New in pbeta: `pbeta mappings`
+
+`pbeta mappings --old <analysis> --new <analysis> [--store <store>] --json` lists the accepted function mappings for a
+build pair: the engine's accepted verdicts (as `pbeta match` reports them), plus reviewer-accepted mappings from the
+store, minus revoked mappings and reviewer-rejected pairs, the same rules `repair --store` applies (`PriorDecisions`).
+Each entry has `old`, `new`, `decided_by` and the verdict's checks. Ambiguous, review and unmatched functions aren't
+listed; a separate `pending` list gives their old RVAs so the plugin can say what it skipped. It runs the engine (CLI
+depends on engine and store already). Tests include negatives: a revoked mapping and a rejected pair aren't listed,
+an ambiguity isn't listed.
+
+#### M7 scope: markup carry-forward (first milestone)
+
+1. Module `integrations/ida/permanent_beta/` plus a loader `permanent_beta_ida.py` for IDA's `plugins` folder.
+   Settings: paths to `pbeta`, `pbeta-mcp`, the store and the two analyses; the reviewer name.
+2. **Export** (old database): user-set markup per function, keyed by build SHA-256 and RVA, to a JSON file: names
+   IDA didn't generate (no `sub_`, `nullsub_`, `j_` names), user-set prototypes, function comments (regular and repeatable),
+   and the local types those prototypes use, as C declarations. Function markup only; data and globals later.
+3. **Apply** (new database): for each mapping `pbeta mappings` lists, apply the old function's markup at the new
+   RVA, types first. Never anything for a function that's pending. Rules:
+   - A name or prototype the user already set in the new database is kept; that function is listed as a
+     conflict, not overwritten.
+   - A prototype isn't applied when the new function reads a register argument the prototype doesn't declare, or one
+     in the other register class (the analysis's `inferred_arg_classes`, the rule of repair's prototype check, §6.1);
+     the function is listed. The name and comments still go across.
+   - A name another function in the new database already has is skipped and listed (IDA names are unique).
+   - Every applied function gets a function comment line naming the source build and how the mapping was decided
+     (engine or reviewer). A second apply is a no-op.
+4. **Report:** a window listing applied, pending, conflicting and skipped functions, with Go To. Pending items link
+   to their review items.
+5. **Tests:** the logic (export parsing, the apply rules, the `pbeta` client) sits apart from IDA calls behind a small
+   interface, tested by plain `python -m unittest` with a fake database and recorded `pbeta` and `pbeta-mcp` replies.
+   These run in CI without IDA. Negative cases: a pending function gets nothing, a user-set name isn't overwritten,
+   a prototype missing an argument the new function reads isn't applied, a database with another build's hash is
+   refused, an `sub_` name isn't exported. The IDA side is checked by hand (owner, IDA Home) on the hook loop's
+   v2 → v3 store: mark up v2, apply to v3, compare against the map files.
+6. Install and usage steps in `integrations/ida/README.md` that an external tester can follow.
+
+**Built (2026-11-14); names checked in IDA Home 9.5 on the hook loop (docs/STATUS.md).** Where it differs from
+the scope above:
+
+- **The export skips functions IDA recognised itself** (`FUNC_LIB`, `FUNC_THUNK`); the new build's database
+  recognises them too.
+
+- **The prototype check runs in pbeta, not the plugin:** `pbeta mappings --markup <export>` reads the export's
+  prototypes (refused for another build's export) and lists `prototype_misfits` using repair's
+  `prototype_misfit`, so the rule has a single implementation. The plugin skips any prototype listed there.
+- **Pending functions carry a reason:** `in_review` (an open review item for the pair), `needs_review`,
+  `verification_rejected`, `reviewer_rejected`, `candidate_claimed` (a reviewer mapped another function onto the
+  candidate), `ambiguous` or `unmatched`. The results window doesn't link to review items yet.
+- **On the hook loop's /O2 v2 → v3** (no store): 67 accepted mappings, all agreeing with the map files; 24 old
+  functions pending (10 ambiguous, 14 needing review).
+- **Tests:** 16 plugin tests (`python -m unittest`, in CI as the `ida` job) against a hand-written v2 export and
+  the real `pbeta mappings` reply, which has the evidence and check arrays removed. Rust tests cover the
+  selection rules and the misfit report, negatives included. Each IDA API the adapter calls was checked against
+  IDA Home 9.5's IDAPython modules, but not run.
+
+#### Later
+
+- **Review window:** Ghidra parity (items, candidates with evidence and checks, go to, accept and reject through
+  `pbeta review`). IDA opens one database per instance and has no two-program Function Comparison, so the compare
+  view is the old function's disassembly from its analysis next to the live new function, or a second IDA instance.
+- **Status overlay:** colour new-database functions by state (accepted, in review, unmatched).
+- **Hooks from IDA:** add a hook from a function's context menu (RVA, IDA name, IDA prototype, criticality) into a
+  manifest, bound with `pbeta bind`.
+- **IDA types as a PDB substitute** for prototype and struct proposals and replay's layouts (§7.2, §7.3). They are
+  the reverser's guesses, so they feed proposals and replay only; counting them as evidence in verification (the
+  parameter-count check) would need its own measurement first.
+
+#### IDA Free
+
+IDA Free can't run the plugin. If Free users ask, an IDC route covers carry-forward: `pbeta` reads a database
+dumped with File → Produce file → Dump database to IDC file and writes an `.idc` that applies the same markup under
+the same rules. Not checked yet: whether IDA Free 9.5 offers that dump and runs `.idc` files.
+
+#### Licensing and CI
+
+The plugin is Apache-2.0. Hex-Rays' EULA permits works built on IDAPython and the SDK. IDA Home is for
+non-commercial use, which fits developing this free tool. CI can't run IDA: the licence covers one user, and
+automated pipelines need Hex-Rays' separate IDA Pro Headless licence. That's why the tests above don't need IDA.
 
 ### 11.5 Licensing
 
