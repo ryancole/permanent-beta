@@ -14,6 +14,27 @@ import idautils
 import idc
 
 
+def _named_types(tif, out: set) -> None:
+    """Adds the names of the types `tif` refers to: itself if named, else what it points to or holds, and for a
+    function its return and parameter types. Struct members are print_decls' job (PDF_INCL_DEPS)."""
+    while True:
+        if tif.get_type_name():
+            out.add(tif.get_type_name())
+            return
+        if tif.is_ptr():
+            tif = tif.get_pointed_object()
+        elif tif.is_array():
+            tif = tif.get_array_element()
+        else:
+            break
+    if tif.is_func():
+        details = ida_typeinf.func_type_data_t()
+        if tif.get_func_details(details):
+            _named_types(details.rettype, out)
+            for arg in details:
+                _named_types(arg.type, out)
+
+
 class IdaDatabase:
     def __init__(self) -> None:
         self.base = ida_nalt.get_imagebase()
@@ -78,16 +99,19 @@ class IdaDatabase:
         f = self._func(rva)
         return bool(f and ida_funcs.set_func_cmt(f, text, repeatable))
 
-    def local_types(self) -> str:
-        limit = (
-            ida_typeinf.get_ordinal_limit()
-            if hasattr(ida_typeinf, "get_ordinal_limit")
-            else ida_typeinf.get_ordinal_qty(None) + 1
-        )
-        if limit <= 1:
+    def prototype_types(self, rva: int) -> list[str]:
+        tif = ida_typeinf.tinfo_t()
+        if not ida_nalt.get_tinfo(tif, self._ea(rva)):
+            return []
+        names: set[str] = set()
+        _named_types(tif, names)
+        return sorted(names)
+
+    def local_types(self, names: list[str]) -> str:
+        ordinals = sorted({o for o in (ida_typeinf.get_type_ordinal(None, n) for n in names) if o > 0})
+        if not ordinals:
             return ""
-        ordinals = ",".join(str(i) for i in range(1, limit))
-        return idc.print_decls(ordinals, idc.PDF_INCL_DEPS | idc.PDF_DEF_FWD) or ""
+        return idc.print_decls(",".join(map(str, ordinals)), idc.PDF_INCL_DEPS | idc.PDF_DEF_FWD) or ""
 
     def import_types(self, text: str) -> int:
         errors = idc.parse_decls(text, idc.PT_SILENT)

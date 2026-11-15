@@ -25,7 +25,9 @@ and installing it with `hcli plugin install` hasn't been tried.
    review with a store, keep its path to hand.
 2. In the **old** build's database: **Edit > Plugins > Permanent Beta > Export markup...** writes a `pbeta-markup` JSON
    file. It holds names you set (not IDA's `sub_` names, and not the library functions IDA recognised itself),
-   prototypes you set, function comments and local types.
+   prototypes you set, function comments, and the local types those prototypes use (with the types they depend
+   on). Other local types aren't exported: most are IDA's own (PE, SEH and CRT structures), and the new database
+   has its own copies.
 3. In the **new** build's database: **Edit > Plugins > Permanent Beta > Apply markup from an older build...** asks for the
    pbeta executable, the markup export, both analyses and, optionally, the review store. It then runs
    `pbeta mappings --markup` and asks before writing anything.

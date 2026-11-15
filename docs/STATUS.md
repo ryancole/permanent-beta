@@ -1,5 +1,23 @@
 # Status — where we left off (2026-11-15)
 
+**Latest (2026-11-15): the IDA plugin's types and a prototype and comment check** (design §11.4).
+- Export now writes only the local types the exported prototypes use, with their dependencies, as design §11.4
+  says. Before, it wrote every local type, mostly IDA's own PE, SEH and CRT structures. IDA's declarations of
+  anonymous struct and union members (`_LARGE_INTEGER::$8374...`) are dropped: the type that holds one declares
+  it inline, and IDA's parser refused the name, which failed `_LARGE_INTEGER`'s import. Unit tests with negatives
+  (an unused local type isn't exported; nothing without a prototype; nothing else is dropped). 20 tests now.
+- **Checked end to end with idalib** (IDA Home 9.5, headless, PDB loading off), not in the GUI. Fresh
+  databases of the hook loop's /O2 v2 and v3 builds. In v2: four names, `Order` and `AuditRecord { LARGE_INTEGER
+  when; Order *order; }`, prototypes using them on `order_add`, `format_receipt` and `stock_level`, a comment and
+  a repeatable comment on `order_add`, and an unused struct. Export: only `Order`, `AuditRecord` and their
+  dependencies. Apply to v3 (`pbeta mappings`, 67 mappings): names, all three prototypes and both comments land
+  on the map files' counterparts. The types import with 0 errors, the unused struct doesn't arrive, the three
+  pending functions get nothing, and a second apply changes nothing.
+- Found on the way: a database made before its build was rebuilt has the old SHA-256, and `pbeta mappings`
+  refuses its markup. That's correct, but the message doesn't say the database is stale.
+- Not checked: a misfitting prototype in real IDA (no hooked function's arguments change v2 → v3; unit-tested).
+  IDA 9.5 marks `ida_funcs.get_func` and `set_func_cmt` deprecated; they still work.
+
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
 (repair loop) is done**, recording harness included. 0 wrong matches on every x64 corpus variant, 0 wrong relocations in
 the hook loop (x64 and x86). **0 wrong matches on every x86 corpus variant too, all 68 gated** (below; merged in
@@ -173,8 +191,9 @@ Before that (2026-11-14): **M7, the IDA plugin's markup carry-forward** (design 
 - **Run in IDA Home 9.5** on the hook loop's /O2 v2 → v3 (PDB declined): the names `price_lookup` and
   `format_receipt` carried to their map-file counterparts. `checksum` (ambiguous in v3) and three CRT functions
   pending review got nothing. That run caught two fixes: a clear error when `pbeta` isn't found, and IDA's
-  library and thunk functions are no longer exported. Not yet tried in IDA: carrying prototypes and comments.
-  Exporting all local types is noisy, and one of IDA's own declarations (an anonymous `_LARGE_INTEGER` member)
+  library and thunk functions are no longer exported. Not yet tried in IDA (since done, above): carrying
+  prototypes and comments. Exporting all local types is noisy, and one of IDA's own declarations (an anonymous
+  `_LARGE_INTEGER` member)
   doesn't parse back. Exporting only the types the user's prototypes use would fix both.
 - No analysis, matching or verification logic changed, so corpus scorecards weren't run.
 
@@ -654,7 +673,7 @@ What's new:
 | 5. Review queue | Listable with candidates; accept / reject / pick a candidate, honored by `repair --store` |
 | MCP server | Done (M5): read tools, explanations, proposals into review |
 | Ghidra | Headless exporter done (M1): boundaries cross-checked, pseudocode stored; review extension (M6) built and verified end to end in the GUI; external tester pending |
-| IDA plugin | M7 built (2026-11-14): markup carry-forward across accepted mappings (`integrations/ida`) and `pbeta mappings`; names checked in IDA Home 9.5, prototypes and comments not yet |
+| IDA plugin | M7 built (2026-11-14): markup carry-forward across accepted mappings (`integrations/ida`) and `pbeta mappings`; names checked in the IDA Home 9.5 GUI, prototypes, comments and types with idalib (2026-11-15) |
 | AI fallback | Built and measured (M5), in `propose` and `repair --propose`: 75 of 77 proposals correct on Lua and zstd, /O2 and /Od (remeasured 2026-11-07); `none` on 11 of 12 deleted functions; no wrong proposal passes verification (design §8) |
 | License choice | Apache-2.0 (2026-11-08); contributor terms open |
 

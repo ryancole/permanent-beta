@@ -32,7 +32,9 @@ class FakeDatabase:
         self.names = dict(names or {})
         self.prototypes = dict(prototypes or {})
         self.comments = dict(comments or {})  # (rva, repeatable) -> text
-        self.types = ""
+        self.types = ""  # what import_types received
+        self.local = {}  # local type name -> (declaration, names it depends on)
+        self.uses = {}  # rva -> named types its prototype refers to
         self.writes = 0
         self.library = set()
 
@@ -75,8 +77,17 @@ class FakeDatabase:
         self.comments[(rva, repeatable)] = text
         return True
 
-    def local_types(self):
-        return self.types
+    def prototype_types(self, rva):
+        return self.uses.get(rva, [])
+
+    def local_types(self, names):
+        out, todo = [], list(names)
+        while todo:
+            n = todo.pop(0)
+            if n in self.local and self.local[n][0] not in out:
+                out.append(self.local[n][0])
+                todo += self.local[n][1]
+        return "\n".join(out)
 
     def import_types(self, text):
         self.types += text
@@ -101,7 +112,12 @@ class ExportTest(unittest.TestCase):
             prototypes={0x10: "int __fastcall parse(Packet *p)"},
             comments={(0x30, False): "pbeta: carried from build x 0x1, mapped by engine\nreal note"},
         )
-        db.types = "struct Packet { int len; };"
+        db.local = {
+            "Packet": ("struct Packet { Header h; int len; };", ["Header"]),
+            "Header": ("struct Header { int kind; };", []),
+            "Unused": ("struct Unused { int x; };", []),
+        }
+        db.uses = {0x10: ["Packet"], 0x50: ["Unused"]}
         db.functions.add(0x50)
         db.names[0x50] = "memcpy"
         db.prototypes[0x50] = "void *__cdecl memcpy(void *, const void *Src, size_t Size)"
@@ -118,7 +134,32 @@ class ExportTest(unittest.TestCase):
         self.assertNotIn(0x50, by)
         # Negative: a carried provenance line isn't exported again.
         self.assertEqual(by[0x30].comment, "real note")
-        self.assertIn("Packet", m.types)
+        # Types: what the exported prototypes use, with their dependencies.
+        self.assertIn("struct Packet", m.types)
+        self.assertIn("struct Header", m.types)
+        # Negative: a local type no exported prototype uses (here only a library function's) isn't exported.
+        self.assertNotIn("Unused", m.types)
+
+    def test_no_types_without_prototypes(self):
+        db = FakeDatabase("ab", [0x10], names={0x10: "parse"})
+        db.local = {"Packet": ("struct Packet { int len; };", [])}
+        db.uses = {0x10: ["Packet"]}  # IDA's own guess, not a prototype the user set
+        self.assertEqual(core.export_markup(db).types, "")
+
+    def test_anonymous_member_declarations_are_dropped(self):
+        # IDA 9.5's print_decls of _LARGE_INTEGER (from the hook loop's v2 database); the `::$` declaration
+        # alone made IDA's parser fail the whole import.
+        printed = data("large-integer.decls.h")
+        kept = core.drop_anonymous_members(printed)
+        self.assertNotIn("::$", kept)
+        self.assertIn("union _LARGE_INTEGER\n{", kept)
+        self.assertIn("} u;", kept, "the inline member stays")
+        # Negative: nothing else is dropped.
+        for decl in ("typedef unsigned int DWORD;", "typedef int LONG;", "typedef __int64 LONGLONG;",
+                     "typedef union _LARGE_INTEGER LARGE_INTEGER;", "struct __crt_locale_pointers;"):
+            self.assertIn(decl, kept)
+        self.assertEqual(core.drop_anonymous_members(kept), kept)
+        self.assertEqual(core.drop_anonymous_members(""), "")
 
     def test_a_database_without_a_hash_is_refused(self):
         with self.assertRaises(PbetaError):

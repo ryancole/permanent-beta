@@ -8,6 +8,7 @@ the tests), so these rules are tested without IDA. Nothing here decides a mappin
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
@@ -130,8 +131,12 @@ class Database(Protocol):
 
     def set_comment(self, rva: int, text: str, repeatable: bool) -> bool: ...
 
-    def local_types(self) -> str:
-        """The database's local types as C declarations."""
+    def prototype_types(self, rva: int) -> list[str]:
+        """The named types the function's prototype refers to (behind pointers and arrays too)."""
+
+    def local_types(self, names: list[str]) -> str:
+        """C declarations of these local types and of the types they depend on. Names that aren't local types
+        (built-in, or only in a type library) are left out."""
 
     def import_types(self, text: str) -> int:
         """Parse C declarations into the local types; returns the number of errors."""
@@ -143,7 +148,10 @@ class Database(Protocol):
 def export_markup(db: Database) -> MarkupExport:
     """The user's markup per function: names the user set, prototypes the user set, function comments. Library and
     thunk functions IDA recognised itself are left out (the new build's database recognises them too), and so are
-    carried provenance lines, so markup carried twice doesn't stack them."""
+    carried provenance lines, so markup carried twice doesn't stack them.
+
+    Types: only the local types the exported prototypes use, with what they depend on. The rest of the local types
+    are mostly IDA's own (PE and SEH structures, CRT types) and the new database has its own copies."""
     build = db.sha256()
     if not build:
         raise PbetaError("this database has no input file SHA-256, so it can't be tied to a build")
@@ -161,7 +169,31 @@ def export_markup(db: Database) -> MarkupExport:
         )
         if f.name or f.prototype or f.comment or f.repeatable_comment:
             functions.append(f)
-    return MarkupExport(build=build.lower(), functions=functions, types=db.local_types())
+    used = sorted({t for f in functions if f.prototype for t in db.prototype_types(f.rva)})
+    types = drop_anonymous_members(db.local_types(used)) if used else ""
+    return MarkupExport(build=build.lower(), functions=functions, types=types)
+
+
+_DECL_HEADER = re.compile(r"^/\* \d+ \*/$")
+
+
+def drop_anonymous_members(decls: str) -> str:
+    """Drops the declarations IDA prints for anonymous struct and union members (`_LARGE_INTEGER::$8374...`).
+    The type that holds one declares it inline already, and IDA's parser doesn't accept the name, so one of them
+    would fail the whole import. `decls` is `print_decls` output: forward declarations, then one `/* N */` block
+    per type."""
+    blocks: list[list[str]] = [[]]
+    for line in decls.splitlines():
+        if _DECL_HEADER.match(line.strip()):
+            blocks.append([])
+        blocks[-1].append(line)
+    preamble = [line for line in blocks[0] if "::$" not in line]
+    kept = [preamble] if any(line.strip() for line in preamble) else []
+    for block in blocks[1:]:
+        declares = next((line for line in block[1:] if line.strip() and not line.startswith("#")), "")
+        if "::$" not in declares:
+            kept.append(block)
+    return "\n".join(line for block in kept for line in block).strip() + ("\n" if kept else "")
 
 
 def strip_provenance(comment: str) -> str:
