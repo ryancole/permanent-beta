@@ -1,4 +1,5 @@
-# Publishes site/ to GitHub Pages: index.html, the README banner, and style.css built from site/tailwind.css.
+# Publishes site/ to GitHub Pages as is. site/banner.svg is a copy of docs/banner.svg (which the README and the
+# wiki use); update both together.
 # One-time setup: Settings → Pages → Source: "GitHub Actions".
 name: pages
 
@@ -7,7 +8,6 @@ on:
     branches: [master]
     paths:
       - "site/**"
-      - "docs/banner.svg"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -28,24 +28,9 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: site/package-lock.json
-      - name: Build stylesheet
-        working-directory: site
-        run: |
-          npm ci --no-audit --no-fund
-          npm run build
-      - name: Assemble site
-        run: |
-          mkdir -p _site
-          cp site/index.html site/dist/style.css _site/
-          cp docs/banner.svg _site/banner.svg
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: site
       - id: deployment
         uses: actions/deploy-pages@v4
