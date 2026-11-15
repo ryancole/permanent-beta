@@ -30,7 +30,9 @@ Latest work (2026-11-14, latest): **the recorder on x86** (design §7.3), so x86
   matches still passes, as before (vectorized over-reads). Tests: the slack ranges (with a negative: a region
   filling whole blocks has none), and an x86 byte-at-a-time strlen past a 2-byte capture → inconclusive, with
   negatives: the whole string captured and a wrong recorded length still fails. The repro is now inconclusive,
-  the hand-run negatives still fail. **Scorecards and the hook loop weren't run** for this replay change.
+  the hand-run negatives still fail. Fixture scorecards unchanged (0 wrong, every flag set at its `min_correct`;
+  they don't run replay). x64 hook loop with `-Replay` (also the rebuilt recorder): passed, unchanged (22 of 24
+  resolved hooks replay, all matching; the negative controls fail replay; redaction holds).
 
 Before that (2026-11-14, later): **x86 (32-bit PE) support** (design §13 question 2, decided: x64 and x86).
 - **Analysis:** PE32 images (`machine: x86`, features version `native-4-x86`, so x86 and x64 analyses are never
