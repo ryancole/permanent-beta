@@ -13,3 +13,6 @@ Made from the hook loop's /O2 builds (`target/hooks/o2`, `corpus/build-hooks.ps1
   mappings agree with the v2 and v3 map files. `checksum` (0x1040) is pending as ambiguous, and `ship_order`
   (0x1340) needs review with candidate 0x1380. No prototype misfits: no hooked function's arguments changed
   between v2 and v3.
+- `large-integer.decls.h`: IDA 9.5's `print_decls` of local types 7 and 13 (`_locale_t`, `LARGE_INTEGER`) with
+  their dependencies, from a database of v2 (2026-11-15). It holds the anonymous member declaration
+  (`_LARGE_INTEGER::$8374...`) that IDA's parser refuses.
