@@ -314,10 +314,21 @@ fn discover_except(
     // the table, not functions, though the table's relocated pointers to them make them look like starts.
     starts.retain(|s| !seh_blocks.contains(s));
     let mut seh_found: BTreeSet<u32> = BTreeSet::new();
+    // x86 has no unwind data to say which blocks are one function. Blocks a function reaches only by a
+    // conditional jump out of its range (PGO moves cold blocks far from the hot ones) are boundaries here and
+    // are given to their function at the end (`cold_block_owners`).
+    let mut cold: BTreeSet<u32> = BTreeSet::new();
 
     loop {
         let mut found = Vec::new();
-        let ranges = ranges(image, &starts, data);
+        let mut found_cold = Vec::new();
+        let pieces: BTreeSet<u32> = starts.union(&cold).copied().collect();
+        let ranges = ranges(image, &pieces, data, &BTreeMap::new());
+        let fallen_into = if image.x86 {
+            fallen_into(image, &ranges)
+        } else {
+            BTreeSet::new()
+        };
         // Fragments whose chain couldn't be followed to a known start are still code worth scanning.
         let owned: BTreeSet<(u32, u32)> = ranges.iter().flat_map(|r| r.fragments.clone()).collect();
         let orphans = pdata
@@ -381,8 +392,8 @@ fn discover_except(
                     }
                     throw_info.clear();
                 }
-                let (t, is_call) = if (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)))
-                {
+                let is_branch = (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)));
+                let (t, is_call) = if is_branch {
                     (
                         ins.near_branch_target(),
                         ins.flow_control() == FlowControl::Call,
@@ -405,23 +416,150 @@ fn discover_except(
                     && !starts.contains(&t)
                     && !inside_pdata(t)
                 {
-                    found.push(t);
+                    if !image.x86 || is_call || !is_branch {
+                        found.push(t);
+                    } else if cold.contains(&t) || fallen_into.contains(&t) {
+                        // A jump into the middle of straight-line code (a cold block returning to its
+                        // function's hot code) enters a function, it doesn't start one.
+                    } else if ins.flow_control() == FlowControl::ConditionalBranch {
+                        // MSVC doesn't tail-call conditionally: a block of the jumping function.
+                        found_cold.push(t);
+                    } else {
+                        found.push(t);
+                    }
                 }
             }
         }
-        found.retain(|f| !seh_blocks.contains(f));
-        // The descriptor's own address, taken by its function (`mov edx, offset desc`), isn't code.
-        found.retain(|&f| !data.iter().any(|&(s, e)| s <= f && f < e));
-        if found.is_empty() {
+        let is_code = |f: &u32| {
+            !seh_blocks.contains(f)
+                // The descriptor's own address, taken by its function (`mov edx, offset desc`), isn't code.
+                && !data.iter().any(|&(s, e)| s <= *f && *f < e)
+        };
+        found.retain(is_code);
+        found_cold.retain(is_code);
+        if found.is_empty() && found_cold.is_empty() {
             // Nothing reaches the rest: look for code that starts after padding (dead code, design §4.4).
-            found = padding_starts(image, &ranges, &starts, data);
+            found = padding_starts(image, &ranges, &pieces, data);
             found.retain(|f| !seh_blocks.contains(f));
             if found.is_empty() {
-                return (ranges, seh_found);
+                if cold.is_empty() {
+                    return (ranges, seh_found);
+                }
+                let owners = cold_block_owners(image, &ranges, &starts);
+                starts.extend(cold.iter().filter(|c| !owners.contains_key(c)));
+                return (self::ranges(image, &starts, data, &owners), seh_found);
             }
         }
         starts.extend(found);
+        cold.extend(found_cold);
+        // A call wins: a block something calls is a function.
+        cold.retain(|c| !starts.contains(c));
     }
+}
+
+/// x86: the addresses the instruction before them runs into. `ranges` are the pieces known so far, each decoded
+/// from its start; an instruction after a return, a jump or `int3` isn't run into.
+fn fallen_into(image: &Image, ranges: &[FunctionRange]) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    for r in ranges.iter().filter(|r| !r.from_pdata) {
+        let mut runs_on = false;
+        for ins in decode(image, r.start, r.end) {
+            if runs_on {
+                out.insert((ins.ip() - image.base) as u32);
+            }
+            runs_on = ins.mnemonic() != Mnemonic::Int3
+                && !matches!(
+                    ins.flow_control(),
+                    FlowControl::Return
+                        | FlowControl::UnconditionalBranch
+                        | FlowControl::IndirectBranch
+                        | FlowControl::Interrupt
+                        | FlowControl::Exception
+                );
+        }
+    }
+    out
+}
+
+/// x86: which function each cold block belongs to, from the direct jumps into it. `pieces` are the ranges of
+/// functions (`starts`) and cold blocks alike. A block belongs to the one function whose code (its own range or
+/// blocks already given to it) jumps there; a block two functions jump to, or none, gets no owner and is left a
+/// function, as before.
+fn cold_block_owners(
+    image: &Image,
+    pieces: &[FunctionRange],
+    starts: &BTreeSet<u32>,
+) -> BTreeMap<u32, u32> {
+    let piece_starts: BTreeSet<u32> = pieces.iter().map(|r| r.start).collect();
+    let piece_of = |t: u32| piece_starts.contains(&t).then_some(t);
+    // Cold block -> the pieces that jump to it.
+    let mut referrers: BTreeMap<u32, BTreeSet<u32>> = pieces
+        .iter()
+        .filter(|r| !starts.contains(&r.start))
+        .map(|r| (r.start, BTreeSet::new()))
+        .collect();
+    for r in pieces {
+        for ins in decode(image, r.start, r.end) {
+            let jumps = matches!(
+                ins.flow_control(),
+                FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+            ) && (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)));
+            if !jumps {
+                continue;
+            }
+            let Some(t) = image.va_to_rva(ins.near_branch_target()).and_then(piece_of) else {
+                continue;
+            };
+            if t != r.start {
+                if let Some(from) = referrers.get_mut(&t) {
+                    from.insert(r.start);
+                }
+            }
+        }
+    }
+    // Resolve through blocks that are reached from other cold blocks. `None`: no single owner.
+    let mut owner: BTreeMap<u32, Option<u32>> = BTreeMap::new();
+    loop {
+        let mut changed = false;
+        for (&block, from) in &referrers {
+            if owner.contains_key(&block) {
+                continue;
+            }
+            let mut roots = BTreeSet::new();
+            let mut pending = false;
+            for p in from {
+                if starts.contains(p) {
+                    roots.insert(Some(*p));
+                } else {
+                    match owner.get(p) {
+                        Some(o) => {
+                            roots.insert(*o);
+                        }
+                        None => pending = true,
+                    }
+                }
+            }
+            let decided = if roots.len() > 1 || roots.contains(&None) {
+                Some(None)
+            } else if pending {
+                None
+            } else {
+                Some(roots.into_iter().next().flatten())
+            };
+            if let Some(d) = decided {
+                owner.insert(block, d);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Blocks that only reach each other (pending forever) have no owner.
+    owner
+        .into_iter()
+        .filter_map(|(block, o)| Some((block, o?)))
+        .collect()
 }
 
 /// Farthest an SEH block is taken to be from the start of its function. **[Guess]**
@@ -677,16 +815,62 @@ fn gap_start(image: &Image, from: u32, to: u32) -> Option<u32> {
 
 /// Boundaries for each start: exact from `.pdata`, otherwise up to the next start (or any `.pdata` begin,
 /// including chained fragments), within the section, minus trailing `int3` padding.
-fn ranges(image: &Image, starts: &BTreeSet<u32>, data: &[(u32, u32)]) -> Vec<FunctionRange> {
+fn ranges(
+    image: &Image,
+    starts: &BTreeSet<u32>,
+    data: &[(u32, u32)],
+    blocks: &BTreeMap<u32, u32>,
+) -> Vec<FunctionRange> {
     let mut boundaries: BTreeSet<u32> = starts.clone();
     boundaries.extend(image.pdata.iter().map(|r| r.begin));
+    boundaries.extend(blocks.keys());
+    // Where the code starting at `start` ends, for code without `.pdata`.
+    let end_of = |start: u32| -> Option<u32> {
+        let section_end = image.section_end(start)?;
+        let next = boundaries
+            .range(start + 1..)
+            .next()
+            .copied()
+            .unwrap_or(section_end);
+        let mut end = next.min(section_end);
+        // Data after the function's code (an RTC frame descriptor, a jump table) ends it.
+        if let Some(&(d, _)) = data.iter().find(|&&(d, _)| start < d && d < end) {
+            end = d;
+        }
+        while end > start + 1 && image.bytes(end - 1, 1) == Some(&[0xcc]) {
+            end -= 1;
+        }
+        // MSVC follows a call that doesn't return with an `int3` of the function's own; on x86, where every
+        // function ends this way, keep it. (On x64 a function that calls has `.pdata`, so exact bounds.)
+        if image.x86
+            && end < next.min(section_end)
+            && decode(image, start, end).last().is_some_and(|i| {
+                i.next_ip() == image.base + u64::from(end)
+                    && matches!(
+                        i.flow_control(),
+                        FlowControl::Call | FlowControl::IndirectCall
+                    )
+            })
+        {
+            end += 1;
+        }
+        Some(end)
+    };
     let fragments_of = |start: u32| -> Vec<(u32, u32)> {
-        image
+        let mut f: Vec<(u32, u32)> = image
             .pdata
             .iter()
             .filter(|r| r.chained && r.parent == Some(start) && image.is_executable(r.begin))
             .map(|r| (r.begin, r.end))
-            .collect()
+            .collect();
+        f.extend(
+            blocks
+                .iter()
+                .filter(|&(_, &owner)| owner == start)
+                .filter_map(|(&b, _)| Some((b, end_of(b)?))),
+        );
+        f.sort_unstable();
+        f
     };
 
     starts
@@ -700,37 +884,9 @@ fn ranges(image: &Image, starts: &BTreeSet<u32>, data: &[(u32, u32)]) -> Vec<Fun
                     fragments: fragments_of(start),
                 });
             }
-            let section_end = image.section_end(start)?;
-            let next = boundaries
-                .range(start + 1..)
-                .next()
-                .copied()
-                .unwrap_or(section_end);
-            let mut end = next.min(section_end);
-            // Data after the function's code (an RTC frame descriptor, a jump table) ends it.
-            if let Some(&(d, _)) = data.iter().find(|&&(d, _)| start < d && d < end) {
-                end = d;
-            }
-            while end > start + 1 && image.bytes(end - 1, 1) == Some(&[0xcc]) {
-                end -= 1;
-            }
-            // MSVC follows a call that doesn't return with an `int3` of the function's own; on x86, where every
-            // function ends this way, keep it. (On x64 a function that calls has `.pdata`, so exact bounds.)
-            if image.x86
-                && end < next.min(section_end)
-                && decode(image, start, end).last().is_some_and(|i| {
-                    i.next_ip() == image.base + u64::from(end)
-                        && matches!(
-                            i.flow_control(),
-                            FlowControl::Call | FlowControl::IndirectCall
-                        )
-                })
-            {
-                end += 1;
-            }
             Some(FunctionRange {
                 start,
-                end,
+                end: end_of(start)?,
                 from_pdata: false,
                 fragments: fragments_of(start),
             })
@@ -2196,6 +2352,89 @@ mod tests {
         // Negative: after a `ret`, the int3s are all padding; and x64's bounds are unchanged.
         assert_eq!(ends_after_call(&[0xc3, 0xcc], true)[0], (0x1000, 0x1006));
         assert_eq!(ends_after_call(&[0xcc], false)[0], (0x1000, 0x1005));
+    }
+
+    /// Code laid out at the given RVAs (from 0x1000), `int3` between, as an x86 or x64 image without `.pdata`;
+    /// 0x1000 is the entry and `exported` are exports.
+    fn laid_out(blocks: &[(u32, &[u8])], exported: &[u32], x86: bool) -> Vec<FunctionRange> {
+        let mut code = Vec::new();
+        for &(rva, bytes) in blocks {
+            code.resize((rva - 0x1000) as usize, 0xcc);
+            code.extend(bytes);
+        }
+        let mut img = if x86 {
+            x86_image(&code, &[], &[])
+        } else {
+            image(&code, &[])
+        };
+        img.entry = Some(0x1000);
+        img.exports = exported.iter().map(|&e| (e, "e".into())).collect();
+        discover(&img)
+    }
+
+    const XOR_EAX_RET: &[u8] = &[0x33, 0xc0, 0xc3];
+
+    #[test]
+    fn x86_a_cold_block_is_a_fragment_of_the_function_that_jumps_to_it() {
+        // PGO layout. f: `test ecx, ecx; je cold; xor eax, eax; inc eax; ret`. cold (0x1040): `xor eax, eax;
+        // jmp` back to f's `inc eax` (0x100a). g (0x1020) lies between.
+        let f: &[u8] = &[
+            0x85, 0xc9, 0x0f, 0x84, 0x38, 0, 0, 0, 0x33, 0xc0, 0x40, 0xc3,
+        ];
+        let cold: &[u8] = &[0x33, 0xc0, 0xe9, 0xc3, 0xff, 0xff, 0xff];
+        let blocks = [(0x1000, f), (0x1020, XOR_EAX_RET), (0x1040, cold)];
+        assert_eq!(
+            laid_out(&blocks, &[0x1020], true),
+            vec![
+                FunctionRange {
+                    fragments: vec![(0x1040, 0x1047)],
+                    ..range(0x1000, 0x100c)
+                },
+                range(0x1020, 0x1023)
+            ]
+        );
+        // x64 is unchanged: without `.pdata` every jump out of a range starts a function.
+        let x64: Vec<u32> = laid_out(&blocks, &[0x1020], false)
+            .iter()
+            .map(|r| r.start)
+            .collect();
+        assert_eq!(x64, vec![0x1000, 0x100a, 0x1020, 0x1040]);
+    }
+
+    #[test]
+    fn x86_a_block_is_still_a_function_when_it_could_be_one() {
+        let starts = |blocks: &[(u32, &[u8])], exported: &[u32]| -> Vec<u32> {
+            let found = laid_out(blocks, exported, true);
+            assert!(found.iter().all(|r| r.fragments.is_empty()), "{found:x?}");
+            found.iter().map(|r| r.start).collect()
+        };
+        // Two functions jump conditionally to 0x1040: it belongs to neither.
+        let f: &[u8] = &[0x85, 0xc9, 0x0f, 0x84, 0x38, 0, 0, 0, 0xc3];
+        let g: &[u8] = &[0x85, 0xc9, 0x0f, 0x84, 0x18, 0, 0, 0, 0xc3];
+        assert_eq!(
+            starts(
+                &[(0x1000, f), (0x1020, g), (0x1040, XOR_EAX_RET)],
+                &[0x1020]
+            ),
+            vec![0x1000, 0x1020, 0x1040]
+        );
+        // An unconditional jump out of the function to code nothing runs into: a tail call.
+        let tail: &[u8] = &[0xe9, 0x3b, 0, 0, 0];
+        assert_eq!(
+            starts(
+                &[(0x1000, tail), (0x1020, XOR_EAX_RET), (0x1040, XOR_EAX_RET)],
+                &[0x1020]
+            ),
+            vec![0x1000, 0x1020, 0x1040]
+        );
+        // A conditional jump to a block that is also called: a function.
+        let calls: &[u8] = &[
+            0x85, 0xc9, 0x0f, 0x84, 0x38, 0, 0, 0, 0xe8, 0x33, 0, 0, 0, 0xc3,
+        ];
+        assert_eq!(
+            starts(&[(0x1000, calls), (0x1040, XOR_EAX_RET)], &[]),
+            vec![0x1000, 0x1040]
+        );
     }
 
     #[test]

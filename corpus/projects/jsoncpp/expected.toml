@@ -18,7 +18,7 @@
 "o2__1.9.7__1.9.8" = 276
 "o2-icf__1.9.6__1.9.7" = 267
 "o2-icf__1.9.7__1.9.8" = 266
-"od__1.9.6__1.9.7" = 1592
+"od__1.9.6__1.9.7" = 1590
 "od__1.9.7__1.9.8" = 1626
 "o2-ltcg__1.9.6__1.9.7" = 221
 "o2-ltcg__1.9.7__1.9.8" = 221
@@ -29,3 +29,19 @@
 # instantiations (declared in recipe.psd1).
 "debug__1.9.6__1.9.7" = 1603
 "debug__1.9.7__1.9.8" = 1638
+# x86 (2026-11-15, build-projects.ps1 -Arch x86; features native-4-x86.4): first baselines, 0 wrong.
+"x86-debug__1.9.6__1.9.7" = 1594
+"x86-debug__1.9.7__1.9.8" = 1634
+"x86-o2-icf__1.9.6__1.9.7" = 296
+"x86-o2-icf__1.9.7__1.9.8" = 296
+"x86-o2-ltcg__1.9.6__1.9.7" = 280
+"x86-o2-ltcg__1.9.7__1.9.8" = 282
+"x86-o2-pgo__1.9.6__1.9.7" = 342
+"x86-o2-pgo__1.9.7__1.9.8" = 347
+"x86-o2__1.9.6__1.9.7" = 301
+"x86-o2__1.9.7__1.9.8" = 301
+"x86-od__1.9.6__1.9.7" = 1580
+"x86-od__1.9.7__1.9.8" = 1618
+# 2026-11-15, unique code vetoed when its callers' likely counterparts don't call it; x86 similarity counts a stack
+# argument change and is rescored against the final matches. 0 wrong on every variant: od__1.9.6__1.9.7 1592 ->
+# 1590, x86-o2-pgo__1.9.7__1.9.8 346 -> 347.

@@ -37,3 +37,18 @@
 "o2-pgo__v1.3__v1.3.1" = 74
 "debug__v1.2.13__v1.3" = 161
 "debug__v1.3__v1.3.1" = 160
+# x86 (2026-11-15, build-projects.ps1 -Arch x86; features native-4-x86.4): first baselines, 0 wrong.
+"x86-debug__v1.2.13__v1.3" = 162
+"x86-debug__v1.3__v1.3.1" = 161
+"x86-o2-icf__v1.2.13__v1.3" = 68
+"x86-o2-icf__v1.3__v1.3.1" = 68
+"x86-o2-ltcg__v1.2.13__v1.3" = 58
+"x86-o2-ltcg__v1.3__v1.3.1" = 58
+"x86-o2-pgo__v1.2.13__v1.3" = 77
+"x86-o2-pgo__v1.3__v1.3.1" = 78
+"x86-o2__v1.2.13__v1.3" = 68
+"x86-o2__v1.3__v1.3.1" = 68
+"x86-od__v1.2.13__v1.3" = 159
+"x86-od__v1.3__v1.3.1" = 158
+# 2026-11-15, unique code vetoed when its callers' likely counterparts don't call it; x86 similarity counts a stack
+# argument change and is rescored against the final matches. 0 wrong on every variant.

@@ -36,5 +36,24 @@
 "o2-ltcg__yaml-cpp-0.7.0__0.8.0" = 235
 "o2-pgo__0.8.0__yaml-cpp-0.9.0" = 312
 "o2-pgo__yaml-cpp-0.7.0__0.8.0" = 321
-"debug__0.8.0__yaml-cpp-0.9.0" = 2957
-"debug__yaml-cpp-0.7.0__0.8.0" = 2993
+"debug__0.8.0__yaml-cpp-0.9.0" = 2965
+"debug__yaml-cpp-0.7.0__0.8.0" = 3000
+# 2026-11-15, similarity ignores boilerplate callees and constants (SIM_UBIQUITOUS_SHARE), 0 wrong:
+# debug__0.8.0__yaml-cpp-0.9.0 2957 -> 2965, debug__yaml-cpp-0.7.0__0.8.0 2993 -> 3000.
+# x86 (2026-11-15, build-projects.ps1 -Arch x86; features native-4-x86.4): first baselines, 0 wrong.
+"x86-debug__0.8.0__yaml-cpp-0.9.0" = 2950
+"x86-debug__yaml-cpp-0.7.0__0.8.0" = 2982
+"x86-o2-icf__0.8.0__yaml-cpp-0.9.0" = 249
+"x86-o2-icf__yaml-cpp-0.7.0__0.8.0" = 259
+"x86-o2-ltcg__0.8.0__yaml-cpp-0.9.0" = 253
+"x86-o2-ltcg__yaml-cpp-0.7.0__0.8.0" = 267
+"x86-o2-pgo__0.8.0__yaml-cpp-0.9.0" = 323
+"x86-o2-pgo__yaml-cpp-0.7.0__0.8.0" = 337
+"x86-o2__0.8.0__yaml-cpp-0.9.0" = 264
+"x86-o2__yaml-cpp-0.7.0__0.8.0" = 278
+"x86-od__0.8.0__yaml-cpp-0.9.0" = 2889
+"x86-od__yaml-cpp-0.7.0__0.8.0" = 2929
+# 2026-11-15, unique code vetoed when its callers' likely counterparts don't call it; x86 similarity counts a stack
+# argument change and is rescored against the final matches. 0 wrong on every variant:
+# x86-debug__0.8.0__yaml-cpp-0.9.0 2955 -> 2950, x86-o2-pgo__yaml-cpp-0.7.0__0.8.0 335 -> 337,
+# x86-od__0.8.0__yaml-cpp-0.9.0 2892 -> 2889.

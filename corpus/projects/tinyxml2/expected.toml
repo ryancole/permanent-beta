@@ -41,3 +41,19 @@
 "o2-pgo__9.0.0__10.0.0" = 316
 "debug__10.0.0__10.1.0" = 427
 "debug__9.0.0__10.0.0" = 442
+# x86 (2026-11-15, build-projects.ps1 -Arch x86; features native-4-x86.4): first baselines, 0 wrong.
+"x86-debug__10.0.0__10.1.0" = 460
+"x86-debug__9.0.0__10.0.0" = 438
+"x86-o2-icf__10.0.0__10.1.0" = 216
+"x86-o2-icf__9.0.0__10.0.0" = 216
+"x86-o2-ltcg__10.0.0__10.1.0" = 282
+"x86-o2-ltcg__9.0.0__10.0.0" = 284
+"x86-o2-pgo__10.0.0__10.1.0" = 331
+"x86-o2-pgo__9.0.0__10.0.0" = 325
+"x86-o2__10.0.0__10.1.0" = 256
+"x86-o2__9.0.0__10.0.0" = 256
+"x86-od__10.0.0__10.1.0" = 458
+"x86-od__9.0.0__10.0.0" = 440
+# 2026-11-15, unique code vetoed when its callers' likely counterparts don't call it; x86 similarity counts a stack
+# argument change and is rescored against the final matches. 0 wrong on every variant: x86-debug__9.0.0__10.0.0 436
+# -> 438.
