@@ -409,8 +409,15 @@ pub fn is_lambda_named(name: &str) -> bool {
 }
 
 /// An exception-handling funclet: `f$dtor$3`, `f$catch$0` (C names) or `?dtor$0@?0??f@…`, `?catch$1@…`
-/// (C++ names); also `fin` and `filt`.
+/// (C++ names); also `fin` and `filt`. On x86, `__unwindfunclet$f$3`, `__catch$f$0` and the per-function
+/// `__ehhandler$f` stub (one underscore fewer once the map's C decoration is removed): named after the parent, whose
+/// name can hold a per-build hash (an anonymous namespace's `?A0x…`), and numbered like the x64 ones.
 pub fn is_funclet(name: &str) -> bool {
+    const X86_KINDS: [&str; 3] = ["unwindfunclet$", "ehhandler$", "catch$"];
+    let undecorated = name.trim_start_matches('_');
+    if name.starts_with('_') && X86_KINDS.iter().any(|k| undecorated.starts_with(k)) {
+        return true;
+    }
     const KINDS: [&str; 4] = ["dtor$", "catch$", "fin$", "filt$"];
     let numbered = |rest: &str| rest.starts_with(|c: char| c.is_ascii_digit());
     KINDS.iter().any(|kind| {
@@ -850,6 +857,10 @@ mod tests {
             "f$fin$1",
             "?dtor$0@?0??TestParseError@TestUtil@?MM@??main@@YAHHPEAPEBD@Z@QEAAXPEBD1W4XMLError@tinyxml2@@H@Z@4HA",
             "?catch$1@?0??f@@YAXXZ@4HA",
+            // x86, as the map reader undecorates them.
+            "_unwindfunclet$?printValueTree@@YAXPAU_iobuf@@AAVValue@Json@@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z$57",
+            "_ehhandler$?valueToString@?A0x86a7b5ed@Json@@YA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@N_NIW4PrecisionType@2@@Z",
+            "_catch$?f@@YAXXZ$0",
         ] {
             assert!(is_funclet(name), "{name}");
         }
@@ -859,6 +870,9 @@ mod tests {
             "?finish@@YAXXZ",
             "$dtor$1",
             "deflate",
+            // Negative: an ordinary name that only starts like one.
+            "ehhandler_init",
+            "_unwindfunclet",
         ] {
             assert!(!is_funclet(name), "{name}");
         }

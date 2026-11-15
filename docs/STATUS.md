@@ -1,10 +1,39 @@
 # Status — where we left off (2026-11-15)
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
-(repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
-the hook loop (x64 and x86).
+(repair loop) is done**, recording harness included. 0 wrong matches on every x64 corpus variant, 0 wrong relocations in
+the hook loop (x64 and x86). **x86 corpus: in progress, 9 wrong matches left** (below).
 
-Latest work (2026-11-15): **the hook loop on x86** (`corpus/build-hooks.ps1 -Arch x86 -Run -Replay`), run for the
+**In progress (2026-11-15, branch `x86-corpus`, not merged): the x86 corpus.** Resume here.
+- Done: `-Arch x86` for `corpus/build-fixtures.ps1` and `corpus/build-projects.ps1` (variants `x86-<flags>` and
+  `x86-<flags>__<old>__<new>` beside the x64 ones, scored with them, own gates); `corpus/verify.ps1` builds and runs
+  the x86 hook loop and fixtures too.
+- `basic` fixture, x86: 0 wrong, same correct counts as x64; gates `x86-*` in its expected.toml. Passes.
+- Fixed on the way (x86 only, features `native-4-x86.3`): the answer key takes x86 EH funclets (`__unwindfunclet$`,
+  `__ehhandler$`, `__catch$`) as funclets (out of scope; their names carry the parent's per-build anonymous
+  namespace hash); discovery no longer decodes data after a function as code: `/RTCs` frame descriptors
+  (`_RTC_framedesc`, Debug builds) and switch jump tables (3+ consecutive relocated code pointers in code) end the
+  function and start none. Before, their garbage branches split the next function (e.g. jsoncpp debug: 29 bogus
+  starts). Tests with negatives.
+- **Projects, x86 (all six, all flag sets; the logs were in the session scratchpad, rerun to see them):** wrong
+  matches went from ~40 to 9; jsoncpp, tinyxml2, zlib 0; lua 0 but o2-pgo; correct counts high. Left, all looking
+  like matching choosing a plausible wrong function where code was refactored, inlined or shifted (x64 has 0 on the
+  same projects):
+  - zstd o2 and o2-icf v1.5.5→v1.5.6: `ZSTDMT_freeBufferPool` → `freeCCtxPool`, `freeCCtxPool` → `freeJobsTable`
+    (a shift by one); `ZSTD_decodingBufferSize_min` → the new `ZSTD_decodingBufferSize_internal` (truth: none).
+  - zstd debug v1.5.5→v1.5.6: `snprintf` (header inline) → the new `LOREM_genBuffer`.
+  - lua o2-pgo: v5.4.6→v5.4.7 `getobjname` → the new `basicgetobjname`; `luaK_patchtohere` → a PGO cold block
+    inside `test_then_block` (x86 has no `.pdata`, so cold blocks are functions); v5.4.7→v5.4.8
+    `luaS_createlngstrobj` → `createstrobj`.
+  - yaml-cpp debug 0.8.0→0.9.0: one `std::_Get_unwrapped` instantiation onto another.
+- Next: find which pass makes each wrong match (`pbeta-corpus score --misses`, the scorer's per-pass lines), fix
+  with negative tests, then add the x86 project gates (`x86-…` keys in each project's expected.toml) once wrong is
+  0, and rerun the x64 scorecards to confirm unchanged (the changes are x86-guarded).
+- Rerun: `pwsh corpus/build-projects.ps1 -Arch x86 -Project <p> -Score` per project (one failing score stops
+  the script, so run them one by one; ~25 min for all six). Fixtures: `pwsh corpus/build-fixtures.ps1 -Arch x86
+  -Score`.
+
+Before that (2026-11-15): **the hook loop on x86** (`corpus/build-hooks.ps1 -Arch x86 -Run -Replay`), run for the
 first time; it found five problems, all fixed.
 - **Linker maps** (`pbeta-corpus`, answer key only): x86 maps have 8-digit addresses (none were read) and decorated
   C names (`_f`, `_f@8`, `@f@12`), now undecorated to the PDB's names. Tests, with a negative: x64 names are never

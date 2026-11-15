@@ -152,9 +152,12 @@ fn is_near_branch(kind: OpKind) -> bool {
 /// for a function start has already made its own jumps into starts, so they're found again without it. The set
 /// only grows, so this ends.
 pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
+    let mut data = rtc_frame_descriptors(image);
+    data.extend(jump_tables_in_code(image));
+    data.sort_unstable();
     let mut seh_blocks = BTreeSet::new();
     loop {
-        let (ranges, found) = discover_except(image, &seh_blocks);
+        let (ranges, found) = discover_except(image, &seh_blocks, &data);
         if found.is_subset(&seh_blocks) {
             return ranges;
         }
@@ -162,11 +165,117 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
     }
 }
 
-/// Discovery that never takes the addresses in `seh_blocks` for function starts. Also returns every SEH block
-/// found on the way.
+/// Most variables an `_RTC_framedesc` is taken to describe. **[Guess]**
+const MAX_RTC_VARS: u32 = 256;
+/// Farthest past its variable records a descriptor's names are taken to be, and longest name. **[Guess]**
+const MAX_RTC_NAMES: u32 = 0x1000;
+const MAX_RTC_NAME: usize = 256;
+
+/// x86 `/RTCs` (part of `/RTC1`, the Debug default) frame descriptors in code, `[start, end)`, sorted. MSVC puts
+/// a function's `_RTC_framedesc` (for `_RTC_CheckStackVars`) in `.text` right after the function's code: a count
+/// `n`, a pointer to the `n` variable records that follow it (`{ int offset; int size; char* name; }`), then the
+/// names. Decoded as code it's garbage, and a garbage branch out of the function makes a bogus start in the next
+/// one. Found from the relocated pointers in code (the function's `mov edx, offset desc`) and taken only in that
+/// exact shape: the records pointer is the descriptor's own address + 8, each size is positive, and each name a
+/// short printable string just past the records.
+fn rtc_frame_descriptors(image: &Image) -> Vec<(u32, u32)> {
+    if !image.x86 {
+        return Vec::new();
+    }
+    let u32_at = |rva: u32| {
+        image
+            .bytes(rva, 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let descriptor = |t: u32| -> Option<(u32, u32)> {
+        let n = u32_at(t)?;
+        if n == 0 || n > MAX_RTC_VARS || u64::from(u32_at(t + 4)?) != image.base + u64::from(t + 8)
+        {
+            return None;
+        }
+        let names = t + 8 + 12 * n;
+        let mut end = names;
+        for i in 0..n {
+            let record = t + 8 + 12 * i;
+            let size = u32_at(record + 4)? as i32;
+            let name = image.va_to_rva(u64::from(u32_at(record + 8)?))?;
+            if size <= 0 || !(names..names + MAX_RTC_NAMES).contains(&name) {
+                return None;
+            }
+            let bytes = image.bytes_from(name)?;
+            let len = bytes.iter().take(MAX_RTC_NAME).position(|&b| b == 0)?;
+            if len == 0 || !bytes[..len].iter().all(|b| b.is_ascii_graphic()) {
+                return None;
+            }
+            end = end.max(name + len as u32 + 1);
+        }
+        Some((t, end))
+    };
+    let mut found: Vec<(u32, u32)> = image
+        .code_relocs
+        .iter()
+        .filter_map(|&slot| image.va_to_rva(u64::from(u32_at(slot)?)))
+        .filter(|&t| image.is_executable(t))
+        .collect::<BTreeSet<u32>>()
+        .into_iter()
+        .filter_map(descriptor)
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// Fewest consecutive relocated code pointers in code taken for a jump table. **[Guess]**: MSVC builds a table
+/// for a switch of four cases or more; no instruction has two address operands 4 bytes apart that both point into
+/// code.
+const MIN_JUMP_TABLE_SLOTS: usize = 3;
+
+/// x86 switch jump tables in code, `[start, end)`, sorted: MSVC puts a function's tables (`jmp [eax*4 + table]`)
+/// in `.text` after its code, so without `.pdata` they'd be decoded as its code, and a garbage branch out of the
+/// function makes a bogus start in the next one. A table is a run of at least [`MIN_JUMP_TABLE_SLOTS`] consecutive
+/// relocated 4-byte slots in code, each pointing into code. A sparse switch's byte index table follows it; the
+/// function ending at the table (`ranges`) keeps that out too.
+fn jump_tables_in_code(image: &Image) -> Vec<(u32, u32)> {
+    if !image.x86 {
+        return Vec::new();
+    }
+    let points_into_code = |slot: u32| {
+        image
+            .bytes(slot, 4)
+            .map(|b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .and_then(|va| image.va_to_rva(va))
+            .is_some_and(|t| image.is_executable(t))
+    };
+    let mut tables = Vec::new();
+    let mut run: Vec<u32> = Vec::new();
+    for &slot in &image.code_relocs {
+        let continues = run.last().is_some_and(|&last| slot == last + 4);
+        if !continues {
+            if run.len() >= MIN_JUMP_TABLE_SLOTS {
+                tables.push((run[0], run[run.len() - 1] + 4));
+            }
+            run.clear();
+        }
+        if points_into_code(slot) {
+            run.push(slot);
+        } else {
+            if run.len() >= MIN_JUMP_TABLE_SLOTS {
+                tables.push((run[0], run[run.len() - 1] + 4));
+            }
+            run.clear();
+        }
+    }
+    if run.len() >= MIN_JUMP_TABLE_SLOTS {
+        tables.push((run[0], run[run.len() - 1] + 4));
+    }
+    tables
+}
+
+/// Discovery that never takes the addresses in `seh_blocks` for function starts, with `data` (RTC frame
+/// descriptors, jump tables) never decoded as code. Also returns every SEH block found on the way.
 fn discover_except(
     image: &Image,
     seh_blocks: &BTreeSet<u32>,
+    data: &[(u32, u32)],
 ) -> (Vec<FunctionRange>, BTreeSet<u32>) {
     let pdata: Vec<_> = image
         .pdata
@@ -208,7 +317,7 @@ fn discover_except(
 
     loop {
         let mut found = Vec::new();
-        let ranges = ranges(image, &starts);
+        let ranges = ranges(image, &starts, data);
         // Fragments whose chain couldn't be followed to a known start are still code worth scanning.
         let owned: BTreeSet<(u32, u32)> = ranges.iter().flat_map(|r| r.fragments.clone()).collect();
         let orphans = pdata
@@ -301,9 +410,11 @@ fn discover_except(
             }
         }
         found.retain(|f| !seh_blocks.contains(f));
+        // The descriptor's own address, taken by its function (`mov edx, offset desc`), isn't code.
+        found.retain(|&f| !data.iter().any(|&(s, e)| s <= f && f < e));
         if found.is_empty() {
             // Nothing reaches the rest: look for code that starts after padding (dead code, design §4.4).
-            found = padding_starts(image, &ranges, &starts);
+            found = padding_starts(image, &ranges, &starts, data);
             found.retain(|f| !seh_blocks.contains(f));
             if found.is_empty() {
                 return (ranges, seh_found);
@@ -474,9 +585,16 @@ const FUNCTION_ALIGN: u32 = 16;
 /// Inside a function, code after `int3` can be its own block (after a call that doesn't return), which is why
 /// the padding, the alignment and the absence of an internal branch to it are all required. Functions with
 /// `.pdata` are never split: their bounds are exact.
-fn padding_starts(image: &Image, ranges: &[FunctionRange], starts: &BTreeSet<u32>) -> Vec<u32> {
+fn padding_starts(
+    image: &Image,
+    ranges: &[FunctionRange],
+    starts: &BTreeSet<u32>,
+    data: &[(u32, u32)],
+) -> Vec<u32> {
     let mut covered: Vec<(u32, u32)> = ranges.iter().flat_map(|r| r.segments()).collect();
     covered.extend(image.pdata.iter().map(|r| (r.begin, r.end)));
+    // Data in code (RTC frame descriptors) isn't a gap: the padding after it is.
+    covered.extend(data.iter().copied());
     covered.sort_unstable();
 
     let mut found = Vec::new();
@@ -559,7 +677,7 @@ fn gap_start(image: &Image, from: u32, to: u32) -> Option<u32> {
 
 /// Boundaries for each start: exact from `.pdata`, otherwise up to the next start (or any `.pdata` begin,
 /// including chained fragments), within the section, minus trailing `int3` padding.
-fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
+fn ranges(image: &Image, starts: &BTreeSet<u32>, data: &[(u32, u32)]) -> Vec<FunctionRange> {
     let mut boundaries: BTreeSet<u32> = starts.clone();
     boundaries.extend(image.pdata.iter().map(|r| r.begin));
     let fragments_of = |start: u32| -> Vec<(u32, u32)> {
@@ -589,6 +707,10 @@ fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
                 .copied()
                 .unwrap_or(section_end);
             let mut end = next.min(section_end);
+            // Data after the function's code (an RTC frame descriptor, a jump table) ends it.
+            if let Some(&(d, _)) = data.iter().find(|&&(d, _)| start < d && d < end) {
+                end = d;
+            }
             while end > start + 1 && image.bytes(end - 1, 1) == Some(&[0xcc]) {
                 end -= 1;
             }
@@ -1840,6 +1962,92 @@ mod tests {
             entry: Some(0x1000),
             ..Default::default()
         }
+    }
+
+    /// x86: a function at 0x1000 that passes an RTC frame descriptor (at 0x1008) in edx, `records` as the
+    /// descriptor's records pointer, then `int3` padding and a function at 0x1030.
+    fn rtc_image(records: u32) -> Image {
+        let mut code = vec![0xba];
+        code.extend(va(0x1008)); // mov edx, offset desc
+        code.extend([0xc3, 0x66, 0x90]); // ret; nop
+        code.extend(1u32.to_le_bytes()); // desc: one variable
+        code.extend(va(records));
+        code.extend((-8i32).to_le_bytes()); // [ebp-8]
+        code.extend(4u32.to_le_bytes()); // 4 bytes
+        code.extend(va(0x101c)); // named
+        code.extend(b"buf\0");
+        code.resize(0x30, 0xcc);
+        code.push(0xc3); // the next function: ret
+        code.resize(0x1000, 0xcc); // the section's file data, padded
+        let mut img = x86_image(&code, &[], &[]);
+        img.has_relocs = true;
+        img.code_relocs = [0x1001, 0x100c, 0x1018].into_iter().collect();
+        img
+    }
+
+    #[test]
+    fn an_rtc_frame_descriptor_after_x86_code_is_data() {
+        let img = rtc_image(0x1010);
+        assert_eq!(rtc_frame_descriptors(&img), vec![(0x1008, 0x1020)]);
+        let ranges = discover(&img);
+        let f = ranges
+            .iter()
+            .find(|r| r.start == 0x1000)
+            .expect("the function");
+        assert_eq!(f.end, 0x1008, "the descriptor isn't the function's code");
+        assert!(ranges.iter().any(|r| r.start == 0x1030), "{ranges:x?}");
+        assert_eq!(ranges.len(), 2, "{ranges:x?}");
+        assert!(!ranges.iter().any(|r| (0x1008..0x1020).contains(&r.start)));
+        // Negative: a records pointer that isn't the descriptor's own address + 8 isn't a descriptor, and the
+        // bytes stay the function's.
+        let img = rtc_image(0x1014);
+        assert!(rtc_frame_descriptors(&img).is_empty());
+        let ranges = discover(&img);
+        assert!(
+            ranges
+                .iter()
+                .find(|r| r.start == 0x1000)
+                .expect("the function")
+                .end
+                > 0x1008
+        );
+    }
+
+    #[test]
+    fn an_x86_jump_table_after_the_code_is_data() {
+        // 0x1000: cmp eax, 2; ja +7; jmp [eax*4 + 0x1018]; ret; (pad) 0x1018: table of 3 code pointers whose bytes
+        // decode as a branch out of the function (0x1018 + .. ); 0x1030: the next function: ret.
+        let mut code = vec![0x83, 0xf8, 0x02, 0x77, 0x07, 0xff, 0x24, 0x85];
+        code.extend(va(0x1018));
+        code.push(0xc3);
+        code.resize(0x18, 0x90);
+        for t in [0x100d, 0x100d, 0x1035] {
+            code.extend(va(t));
+        }
+        code.resize(0x30, 0xcc);
+        code.push(0xc3);
+        code.resize(0x1000, 0xcc);
+        let image = |code: &[u8], relocs: &[u32]| {
+            let mut img = x86_image(code, &[], &[]);
+            img.has_relocs = true;
+            img.code_relocs = relocs.iter().copied().collect();
+            img
+        };
+        let img = image(&code, &[0x1008, 0x1018, 0x101c, 0x1020]);
+        assert_eq!(jump_tables_in_code(&img), vec![(0x1018, 0x1024)]);
+        let ranges = discover(&img);
+        assert_eq!(
+            ranges.iter().find(|r| r.start == 0x1000).map(|r| r.end),
+            Some(0x1018)
+        );
+        assert!(ranges.iter().any(|r| r.start == 0x1030), "{ranges:x?}");
+        // Negative: two relocated slots aren't a table (an instruction can have two address operands).
+        let img = image(&code, &[0x1008, 0x1018, 0x101c]);
+        assert!(jump_tables_in_code(&img).is_empty());
+        // Negative: nor are slots whose values don't all point into code.
+        code[0x1c..0x20].copy_from_slice(&va(0x3000));
+        let img = image(&code, &[0x1008, 0x1018, 0x101c, 0x1020]);
+        assert!(jump_tables_in_code(&img).is_empty());
     }
 
     #[test]
