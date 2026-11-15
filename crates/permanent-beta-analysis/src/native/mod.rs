@@ -40,7 +40,13 @@ pub const FEATURES_VERSION: &str = "native-4";
 ///
 /// 2: inferred arguments: a prologue `push ecx` (room for a local) isn't a `this`, and stack arguments read after
 /// a call count (through `ebp`, or `esp` after a `__cdecl` call's cleanup).
-pub const X86_FEATURES_REVISION: u32 = 2;
+///
+/// 3: data after a function's code, an `/RTCs` frame descriptor or a switch's jump table, ends the function and
+/// starts none.
+///
+/// 4: function bounds. A block reached only by a conditional jump from one function (a PGO cold block) is a
+/// fragment of that function, and a jump target the code before it runs into starts no function.
+pub const X86_FEATURES_REVISION: u32 = 4;
 
 /// The features version an image's analysis records: [`FEATURES_VERSION`] for x64; for x86 with `-x86` and
 /// [`X86_FEATURES_REVISION`] appended. x86 code is normalized differently (absolute operands, stack arguments), so

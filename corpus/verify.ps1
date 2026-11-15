@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
   Runs every corpus measurement at once: replay on zlib and zstd (corpus/replay-measure.ps1), the M4 hook loop with
-  replay (corpus/build-hooks.ps1 -Run -Replay) and the fixture scorecards (corpus/build-fixtures.ps1 -Score).
+  replay (corpus/build-hooks.ps1 -Run -Replay), x64 and x86, and the fixture scorecards (corpus/build-fixtures.ps1
+  -Score, the x64 and x86 variants).
 
 .DESCRIPTION
   Builds once, sequentially (pbeta and pbeta-corpus with the emulator, the hook DLL, launcher and sample apps, the
@@ -35,6 +36,7 @@ $jobs = @(
     @{ Name = 'zstd-o2'; File = $measure; Args = @('-Project', 'zstd') + $extra; Replay = $true },
     @{ Name = 'zstd-od'; File = $measure; Args = @('-Project', 'zstd', '-Flags', 'od', '-Old', 'v1.5.5', '-New', 'v1.5.6') + $extra; Replay = $true },
     @{ Name = 'hook-loop'; File = (Join-Path $PSScriptRoot 'build-hooks.ps1'); Args = @('-Run', '-Replay', '-NoBuild'); Replay = $false },
+    @{ Name = 'hook-loop-x86'; File = (Join-Path $PSScriptRoot 'build-hooks.ps1'); Args = @('-Arch', 'x86', '-Run', '-Replay', '-NoBuild'); Replay = $false },
     @{ Name = 'fixtures'; File = (Join-Path $PSScriptRoot 'build-fixtures.ps1'); Args = @('-Score', '-NoBuild'); Replay = $false }
 )
 $Only = @($Only | ForEach-Object { $_ -split ',' } | Where-Object { $_ })  # `pwsh -File` passes a,b as one string
@@ -47,7 +49,9 @@ cargo build -q --manifest-path "$repo\Cargo.toml" -p permanent-beta-cli -p perma
 if ($LASTEXITCODE) { throw 'cargo build failed' }
 foreach ($b in @(
         @{ File = 'build-hooks.ps1'; Args = @(); Log = 'build-hooks' },
-        @{ File = 'build-fixtures.ps1'; Args = @('-NoBuild'); Log = 'build-fixtures' })) {
+        @{ File = 'build-hooks.ps1'; Args = @('-Arch', 'x86'); Log = 'build-hooks-x86' },
+        @{ File = 'build-fixtures.ps1'; Args = @('-NoBuild'); Log = 'build-fixtures' },
+        @{ File = 'build-fixtures.ps1'; Args = @('-Arch', 'x86', '-NoBuild'); Log = 'build-fixtures-x86' })) {
     pwsh -NoProfile -File (Join-Path $PSScriptRoot $b.File) @($b.Args) *> (Join-Path $logs "$($b.Log).log")
     if ($LASTEXITCODE) { throw "$($b.File) failed: see target\verify\$($b.Log).log" }
 }

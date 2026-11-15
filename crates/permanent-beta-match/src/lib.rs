@@ -6,8 +6,8 @@
 //!   It yields an [`Ambiguity`] instead, so review can show the competing functions.
 
 use permanent_beta_model::{
-    Ambiguity, AnalysisExport, Candidate, CandidateSource, Evidence, FunctionFeatures, Rva,
-    evidence_kind,
+    Ambiguity, AnalysisExport, Candidate, CandidateSource, Evidence, FunctionFeatures, Machine,
+    Rva, evidence_kind,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
@@ -20,6 +20,10 @@ pub struct MatchContext<'a> {
     pub matched_new: &'a HashSet<Rva>,
     /// Candidates accepted by earlier passes, in order.
     pub pairs: &'a [Candidate],
+    /// Only while rechecking the final matches ([`Matcher::contradiction`]): each unmatched old function's likely
+    /// counterpart, a clear mutual best by similarity below the candidate threshold ([`likely_partners`]).
+    /// Empty while passes propose.
+    pub likely: &'a HashMap<Rva, Rva>,
 }
 
 /// What one pass produced: unique candidates, plus key groups it refused to resolve.
@@ -128,13 +132,17 @@ fn run_passes_on(
     let mut banned: BTreeMap<(Rva, Rva), Ambiguity> = BTreeMap::new();
     loop {
         let round = run_round(old, new, matchers, &banned);
-        let ctx = MatchContext {
+        let no_likely = HashMap::new();
+        let mut ctx = MatchContext {
             old,
             new,
             matched_old: &round.matched_old,
             matched_new: &round.matched_new,
             pairs: &round.candidates,
+            likely: &no_likely,
         };
+        let likely = likely_partners(&ctx, &banned);
+        ctx.likely = &likely;
         let vetoed: Vec<Ambiguity> = round
             .candidates
             .iter()
@@ -211,12 +219,14 @@ impl Round {
         new: &AnalysisExport,
         banned: &BTreeMap<(Rva, Rva), Ambiguity>,
     ) -> bool {
+        let no_likely = HashMap::new();
         let ctx = MatchContext {
             old,
             new,
             matched_old: &self.matched_old,
             matched_new: &self.matched_new,
             pairs: &self.candidates,
+            likely: &no_likely,
         };
         let proposals = matcher.propose(&ctx);
         let before = self.candidates.len();
@@ -488,7 +498,9 @@ impl Matcher for NormalizedHashMatcher {
     }
 
     fn contradiction(&self, ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
-        callers_disagree(ctx, c).map(|r| format!("same code, but {r}"))
+        callers_disagree(ctx, c)
+            .or_else(|| likely_callers_disagree(ctx, c))
+            .map(|r| format!("same code, but {r}"))
     }
 }
 
@@ -570,6 +582,40 @@ fn callers_disagree(ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
         format!(
             "none of the {} matched caller(s) calls the new function",
             mapped.len()
+        )
+    })
+}
+
+/// None of the old function's callers is matched, but some have a likely counterpart ([`MatchContext::likely`]),
+/// and none of those calls the new function. Byte-identical code isn't identity: yaml-cpp 0.9.0 replaced the
+/// `std::string` iterator helpers `GetNextCodePointAndAdvance` used with `std::array<char, 20>` ones whose Debug
+/// code is the same, each unique in its build. Their only caller is unmatched when its signature change keeps it
+/// under the similarity threshold; its likely counterpart doesn't call the array helpers.
+fn likely_callers_disagree(ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
+    let callers: Vec<Rva> = ctx
+        .old
+        .functions
+        .iter()
+        .filter(|f| f.rva != c.old && f.callees.contains(&c.old))
+        .map(|f| f.rva)
+        .collect();
+    let matched = ctx.pairs.iter().any(|p| callers.contains(&p.old));
+    if matched {
+        return None;
+    }
+    let likely: Vec<Rva> = callers
+        .iter()
+        .filter_map(|o| ctx.likely.get(o).copied())
+        .collect();
+    let agrees = likely.iter().any(|&nc| {
+        ctx.new
+            .function(nc)
+            .is_some_and(|f| f.callees.contains(&c.new))
+    });
+    (!likely.is_empty() && !agrees).then(|| {
+        format!(
+            "no caller is matched, and none of the {} caller(s)' likely counterparts calls the new function",
+            likely.len()
         )
     })
 }
@@ -1305,6 +1351,35 @@ pub const WRAPPER_MIN_DIRECT_CALLERS: usize = 2;
 /// it. [Guess]: any score at all cost up to 31 correct per zstd variant; TinyXML-2's case is 0.07 behind.
 pub const INLINED_CALLER_MARGIN: f32 = 0.1;
 
+/// A callee or constant found in more than this share of a build's functions (and in more than
+/// [`SIM_MAX_BUCKET`] of them) is boilerplate and isn't scored: a Debug build's run-time check helpers
+/// (`_RTC_CheckEsp`, the JMC probe) and its 0xCCCCCCCC stack fill are in most functions, and two unrelated small
+/// functions agreed on all of them (zstd x86 Debug: `snprintf` against the new `LOREM_genBuffer`). [Guess]
+pub const SIM_UBIQUITOUS_SHARE: f32 = 0.25;
+
+/// The keys found in enough of a build's functions to be boilerplate ([`SIM_UBIQUITOUS_SHARE`]).
+fn ubiquitous<K: Hash + Eq + Copy>(
+    e: &AnalysisExport,
+    keys: impl Fn(&FunctionFeatures) -> Vec<K>,
+) -> HashSet<K> {
+    let mut count: HashMap<K, usize> = HashMap::new();
+    for f in &e.functions {
+        for k in keys(f).into_iter().collect::<HashSet<K>>() {
+            *count.entry(k).or_default() += 1;
+        }
+    }
+    let floor = (e.functions.len() as f32 * SIM_UBIQUITOUS_SHARE) as usize;
+    let floor = floor.max(SIM_MAX_BUCKET);
+    count
+        .into_iter()
+        .filter(|&(_, n)| n > floor)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Weight of the x86 argument-count component, present only when the counts differ (it then scores 0). [Guess]
+const SIM_ARGS_WEIGHT: f32 = 1.0;
+
 /// Component weights. [Guess]
 const SIM_WEIGHTS: [(&str, f32); 8] = [
     ("code", 3.0),
@@ -1353,12 +1428,120 @@ struct Side<'a> {
     f: &'a FunctionFeatures,
     callees: BTreeSet<Rva>,
     callers: BTreeSet<Rva>,
+    /// The function's constants without the build's boilerplate ones.
+    constants: BTreeSet<u64>,
 }
 
-fn similarity(o: &Side<'_>, n: &Side<'_>) -> Option<Similarity> {
+/// Both builds are 32-bit x86.
+fn is_x86(ctx: &MatchContext<'_>) -> bool {
+    ctx.old.build.machine == Machine::X86 && ctx.new.build.machine == Machine::X86
+}
+
+/// What scoring needs to know about both builds given the matches so far.
+struct Neighbours<'a> {
+    ctx: &'a MatchContext<'a>,
+    map: HashMap<Rva, Rva>,
+    old_callers: HashMap<Rva, Vec<Rva>>,
+    new_callers: HashMap<Rva, Vec<Rva>>,
+    /// Boilerplate callees of either build, in new-build addresses.
+    common_callees: HashSet<Rva>,
+    common_constants: HashSet<u64>,
+}
+
+impl<'a> Neighbours<'a> {
+    fn new(ctx: &'a MatchContext<'a>) -> Self {
+        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|c| (c.old, c.new)).collect();
+        let callers_of = |e: &AnalysisExport| {
+            let mut out: HashMap<Rva, Vec<Rva>> = HashMap::new();
+            for f in &e.functions {
+                for &c in &f.callees {
+                    if c != f.rva {
+                        out.entry(c).or_default().push(f.rva);
+                    }
+                }
+            }
+            out
+        };
+        let callees_of = |f: &FunctionFeatures| f.callees.clone();
+        let mut common_callees = ubiquitous(ctx.new, callees_of);
+        common_callees.extend(
+            ubiquitous(ctx.old, callees_of)
+                .iter()
+                .filter_map(|c| map.get(c).copied()),
+        );
+        let constants_of = |f: &FunctionFeatures| f.constants.clone();
+        let mut common_constants = ubiquitous(ctx.new, constants_of);
+        common_constants.extend(ubiquitous(ctx.old, constants_of));
+        Self {
+            ctx,
+            old_callers: callers_of(ctx.old),
+            new_callers: callers_of(ctx.new),
+            map,
+            common_callees,
+            common_constants,
+        }
+    }
+
+    fn constants(&self, f: &FunctionFeatures) -> BTreeSet<u64> {
+        f.constants
+            .iter()
+            .copied()
+            .filter(|c| !self.common_constants.contains(c))
+            .collect()
+    }
+
+    /// An old function, its matched neighbours in new-build addresses.
+    fn old_side<'f>(&self, f: &'f FunctionFeatures) -> Side<'f> {
+        let callees = f
+            .callees
+            .iter()
+            .filter_map(|c| self.map.get(c).copied())
+            .filter(|c| !self.common_callees.contains(c))
+            .collect();
+        let callers = self
+            .old_callers
+            .get(&f.rva)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| self.map.get(c).copied())
+            .collect();
+        Side {
+            f,
+            callees,
+            callers,
+            constants: self.constants(f),
+        }
+    }
+
+    /// A new function and its matched neighbours.
+    fn new_side<'f>(&self, f: &'f FunctionFeatures) -> Side<'f> {
+        let matched = |c: &Rva| self.ctx.matched_new.contains(c);
+        let callees = f
+            .callees
+            .iter()
+            .copied()
+            .filter(|c| matched(c) && !self.common_callees.contains(c))
+            .collect();
+        let callers = self
+            .new_callers
+            .get(&f.rva)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(matched)
+            .collect();
+        Side {
+            f,
+            callees,
+            callers,
+            constants: self.constants(f),
+        }
+    }
+}
+
+fn similarity(o: &Side<'_>, n: &Side<'_>, x86: bool) -> Option<Similarity> {
     let code = weighted_jaccard(&o.f.mnemonic_counts, &n.f.mnemonic_counts)?;
     let set = |v: &[String]| v.iter().cloned().collect::<BTreeSet<String>>();
-    let consts = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
     let shape = match (o.f.basic_blocks, n.f.basic_blocks, o.f.edges, n.f.edges) {
         (Some(a), Some(b), Some(c), Some(d)) => Some((ratio(a, b) + ratio(c, d)) / 2.0),
         (Some(a), Some(b), _, _) => Some(ratio(a, b)),
@@ -1371,25 +1554,137 @@ fn similarity(o: &Side<'_>, n: &Side<'_>) -> Option<Similarity> {
         jaccard(&o.callees, &n.callees),
         jaccard(&o.callers, &n.callers),
         jaccard(&set(&o.f.strings), &set(&n.f.strings)),
-        jaccard(&consts(&o.f.constants), &consts(&n.f.constants)),
+        jaccard(&o.constants, &n.constants),
         jaccard(&set(&o.f.imports), &set(&n.f.imports)),
     ];
-    let parts: Vec<(&'static str, f32)> = SIM_WEIGHTS
+    let mut parts: Vec<(&'static str, f32)> = SIM_WEIGHTS
         .iter()
         .zip(values)
         .filter_map(|(&(name, _), v)| Some((name, v?)))
         .collect();
+    // x86 only: a different count of stack argument slots read counts against the pair, as one more component
+    // scoring 0. On the x86 corpus it separates plausible wrong partners (zstd's ZSTDMT_freeCCtxPool against the
+    // new freeJobsTable, 1 -> 4; Lua's luaS_createlngstrobj against createstrobj, 2 -> 4). The x64 register count
+    // was measured, as a veto, and rejected (STATUS.md).
+    if x86 && matches!((o.f.inferred_args, n.f.inferred_args), (Some(a), Some(b)) if a != b) {
+        parts.push(("args", 0.0));
+    }
     let (sum, weight) = parts.iter().fold((0.0, 0.0), |(s, w), &(name, v)| {
         let wt = SIM_WEIGHTS
             .iter()
             .find(|x| x.0 == name)
-            .map_or(0.0, |x| x.1);
+            .map_or(SIM_ARGS_WEIGHT, |x| x.1);
         (s + wt * v, w + wt)
     });
     Some(Similarity {
         score: sum / weight,
         parts,
     })
+}
+
+/// Similarity scores of the anchored pairs among unmatched functions of at least `min_size` bytes.
+fn score_unmatched(ctx: &MatchContext<'_>, min_size: u32) -> Vec<(Rva, Rva, Similarity)> {
+    let eligible = |f: &FunctionFeatures| f.size >= min_size && !f.mnemonic_counts.is_empty();
+    let olds: Vec<&FunctionFeatures> = ctx
+        .old
+        .functions
+        .iter()
+        .filter(|f| !ctx.matched_old.contains(&f.rva) && eligible(f))
+        .collect();
+    let news: Vec<&FunctionFeatures> = ctx
+        .new
+        .functions
+        .iter()
+        .filter(|f| !ctx.matched_new.contains(&f.rva) && eligible(f))
+        .collect();
+    if olds.is_empty() || news.is_empty() {
+        return Vec::new();
+    }
+    let hood = Neighbours::new(ctx);
+    let x86 = is_x86(ctx);
+    let new_sides: HashMap<Rva, Side<'_>> =
+        news.iter().map(|&f| (f.rva, hood.new_side(f))).collect();
+
+    // Anchor buckets over the unmatched new functions.
+    let mut by_anchor: HashMap<String, Vec<Rva>> = HashMap::new();
+    for (rva, s) in &new_sides {
+        let mut anchors: BTreeSet<String> = BTreeSet::new();
+        anchors.extend(s.callees.iter().map(|c| format!("callee:{c}")));
+        anchors.extend(s.callers.iter().map(|c| format!("caller:{c}")));
+        anchors.extend(s.f.strings.iter().map(|x| format!("string:{x}")));
+        anchors.extend(s.constants.iter().map(|x| format!("constant:{x}")));
+        anchors.extend(s.f.imports.iter().map(|x| format!("import:{x}")));
+        for a in anchors {
+            by_anchor.entry(a).or_default().push(*rva);
+        }
+    }
+
+    // Score every anchored pair.
+    let mut scored: Vec<(Rva, Rva, Similarity)> = Vec::new();
+    for &f in &olds {
+        let o = hood.old_side(f);
+        let mut anchors: BTreeSet<String> = BTreeSet::new();
+        anchors.extend(o.callees.iter().map(|c| format!("callee:{c}")));
+        anchors.extend(o.callers.iter().map(|c| format!("caller:{c}")));
+        anchors.extend(f.strings.iter().map(|x| format!("string:{x}")));
+        anchors.extend(o.constants.iter().map(|x| format!("constant:{x}")));
+        anchors.extend(f.imports.iter().map(|x| format!("import:{x}")));
+        let candidates: BTreeSet<Rva> = anchors
+            .iter()
+            .filter_map(|a| by_anchor.get(a))
+            .filter(|b| b.len() <= SIM_MAX_BUCKET)
+            .flatten()
+            .copied()
+            .collect();
+        for n in candidates {
+            if let Some(s) = similarity(&o, &new_sides[&n], x86) {
+                scored.push((f.rva, n, s));
+            }
+        }
+    }
+    scored
+}
+
+/// Minimum similarity for a likely counterpart ([`MatchContext::likely`]). [Guess]
+pub const LIKELY_MIN_SCORE: f32 = 0.6;
+
+/// Each unmatched old function's likely counterpart: mutual best by similarity, at least [`LIKELY_MIN_SCORE`],
+/// [`SIM_MIN_MARGIN`] ahead of the runner-up on both sides, and not a banned pair. Evidence against a candidate
+/// only, never for one.
+fn likely_partners(
+    ctx: &MatchContext<'_>,
+    banned: &BTreeMap<(Rva, Rva), Ambiguity>,
+) -> HashMap<Rva, Rva> {
+    let scored: Vec<(Rva, Rva, f32)> = score_unmatched(ctx, SIM_MIN_SIZE)
+        .into_iter()
+        .filter(|t| !banned.contains_key(&(t.0, t.1)))
+        .map(|(o, n, s)| (o, n, s.score))
+        .collect();
+    let mut by_old: HashMap<Rva, Vec<(f32, Rva)>> = HashMap::new();
+    let mut by_new: HashMap<Rva, Vec<(f32, Rva)>> = HashMap::new();
+    for &(o, n, s) in &scored {
+        by_old.entry(o).or_default().push((s, n));
+        by_new.entry(n).or_default().push((s, o));
+    }
+    let best = |v: &mut Vec<(f32, Rva)>| {
+        v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let lead = v[0].0 - v.get(1).map_or(0.0, |x| x.0);
+        (v[0], lead)
+    };
+    let new_best: HashMap<Rva, ((f32, Rva), f32)> =
+        by_new.iter_mut().map(|(&n, v)| (n, best(v))).collect();
+    by_old
+        .iter_mut()
+        .filter_map(|(&o, v)| {
+            let ((score, n), lead) = best(v);
+            let ((_, back), new_lead) = new_best[&n];
+            (score >= LIKELY_MIN_SCORE
+                && back == o
+                && lead >= SIM_MIN_MARGIN
+                && new_lead >= SIM_MIN_MARGIN)
+                .then_some((o, n))
+        })
+        .collect()
 }
 
 impl Matcher for SimilarityMatcher {
@@ -1402,128 +1697,33 @@ impl Matcher for SimilarityMatcher {
     }
 
     fn contradiction(&self, ctx: &MatchContext<'_>, c: &Candidate) -> Option<String> {
+        // x86 only: rescored against the final matches, the pair must still reach the threshold. Neighbours matched
+        // after it can count against it: zstd 1.5.6's ZSTDMT_freeBufferPool (no calls) scored best against the
+        // new ZSTDMT_freeCCtxPool before ZSTD_freeCCtx, which the latter calls, was matched. On x64, with no
+        // wrong match to fix, it cost 18 correct over the corpus.
+        if is_x86(ctx) {
+            let hood = Neighbours::new(ctx);
+            if let (Some(o), Some(n)) = (ctx.old.function(c.old), ctx.new.function(c.new)) {
+                if let Some(s) = similarity(&hood.old_side(o), &hood.new_side(n), true) {
+                    if s.score < self.params.min_score {
+                        return Some(format!(
+                            "similar code, but only {:.2} against the final matches",
+                            s.score
+                        ));
+                    }
+                }
+            }
+        }
         callers_disagree(ctx, c).map(|r| format!("similar code, but {r}"))
     }
 
     fn propose(&self, ctx: &MatchContext<'_>) -> Proposals {
-        let map: HashMap<Rva, Rva> = ctx.pairs.iter().map(|c| (c.old, c.new)).collect();
-        let eligible =
-            |f: &FunctionFeatures| f.size >= self.params.min_size && !f.mnemonic_counts.is_empty();
-        let olds: Vec<&FunctionFeatures> = ctx
-            .old
-            .functions
-            .iter()
-            .filter(|f| !ctx.matched_old.contains(&f.rva) && eligible(f))
-            .collect();
-        let news: Vec<&FunctionFeatures> = ctx
-            .new
-            .functions
-            .iter()
-            .filter(|f| !ctx.matched_new.contains(&f.rva) && eligible(f))
-            .collect();
-        if olds.is_empty() || news.is_empty() {
+        let scored = score_unmatched(ctx, self.params.min_size);
+        if scored.is_empty() {
             return Proposals::default();
         }
-        let callers_of = |e: &AnalysisExport| {
-            let mut out: HashMap<Rva, Vec<Rva>> = HashMap::new();
-            for f in &e.functions {
-                for &c in &f.callees {
-                    if c != f.rva {
-                        out.entry(c).or_default().push(f.rva);
-                    }
-                }
-            }
-            out
-        };
-        let (old_callers, new_callers) = (callers_of(ctx.old), callers_of(ctx.new));
-        // Neighbours in new-build addresses: (callees, callers).
-        let old_neighbours = |f: &FunctionFeatures| -> (BTreeSet<Rva>, BTreeSet<Rva>) {
-            let callees = f
-                .callees
-                .iter()
-                .filter_map(|c| map.get(c).copied())
-                .collect();
-            let callers = old_callers
-                .get(&f.rva)
-                .into_iter()
-                .flatten()
-                .filter_map(|c| map.get(c).copied())
-                .collect();
-            (callees, callers)
-        };
-        let new_neighbours = |f: &FunctionFeatures| -> (BTreeSet<Rva>, BTreeSet<Rva>) {
-            let callees = f
-                .callees
-                .iter()
-                .copied()
-                .filter(|c| ctx.matched_new.contains(c))
-                .collect();
-            let callers = new_callers
-                .get(&f.rva)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|c| ctx.matched_new.contains(c))
-                .collect();
-            (callees, callers)
-        };
-        let new_sides: HashMap<Rva, Side<'_>> = news
-            .iter()
-            .map(|&f| {
-                let (callees, callers) = new_neighbours(f);
-                (
-                    f.rva,
-                    Side {
-                        f,
-                        callees,
-                        callers,
-                    },
-                )
-            })
-            .collect();
-
-        // Anchor buckets over the unmatched new functions.
-        let mut by_anchor: HashMap<String, Vec<Rva>> = HashMap::new();
-        for (rva, s) in &new_sides {
-            let mut anchors: BTreeSet<String> = BTreeSet::new();
-            anchors.extend(s.callees.iter().map(|c| format!("callee:{c}")));
-            anchors.extend(s.callers.iter().map(|c| format!("caller:{c}")));
-            anchors.extend(s.f.strings.iter().map(|x| format!("string:{x}")));
-            anchors.extend(s.f.constants.iter().map(|x| format!("constant:{x}")));
-            anchors.extend(s.f.imports.iter().map(|x| format!("import:{x}")));
-            for a in anchors {
-                by_anchor.entry(a).or_default().push(*rva);
-            }
-        }
-
-        // Score every anchored pair.
-        let mut scored: Vec<(Rva, Rva, Similarity)> = Vec::new();
-        for &f in &olds {
-            let (callees, callers) = old_neighbours(f);
-            let o = Side {
-                f,
-                callees,
-                callers,
-            };
-            let mut anchors: BTreeSet<String> = BTreeSet::new();
-            anchors.extend(o.callees.iter().map(|c| format!("callee:{c}")));
-            anchors.extend(o.callers.iter().map(|c| format!("caller:{c}")));
-            anchors.extend(f.strings.iter().map(|x| format!("string:{x}")));
-            anchors.extend(f.constants.iter().map(|x| format!("constant:{x}")));
-            anchors.extend(f.imports.iter().map(|x| format!("import:{x}")));
-            let candidates: BTreeSet<Rva> = anchors
-                .iter()
-                .filter_map(|a| by_anchor.get(a))
-                .filter(|b| b.len() <= SIM_MAX_BUCKET)
-                .flatten()
-                .copied()
-                .collect();
-            for n in candidates {
-                if let Some(s) = similarity(&o, &new_sides[&n]) {
-                    scored.push((f.rva, n, s));
-                }
-            }
-        }
+        let hood = Neighbours::new(ctx);
+        let (old_callers, new_callers) = (&hood.old_callers, &hood.new_callers);
 
         // Best and runner-up per function on each side (ties broken by address, so they stay ties in margin).
         let rank = |key: &dyn Fn(&(Rva, Rva, Similarity)) -> Rva| {
@@ -1582,7 +1782,7 @@ impl Matcher for SimilarityMatcher {
                     .get(&o)
                     .into_iter()
                     .flatten()
-                    .filter_map(|c| map.get(c))
+                    .filter_map(|c| hood.map.get(c))
                     .filter(|nc| {
                         ctx.new
                             .function(**nc)
@@ -2078,6 +2278,181 @@ mod tests {
         let (old, new) = edited(&[0x110], vec![body(0x110, "h2", 6, &[0x150], 66)]);
         assert!(pairs(&old, &new).contains(&(0x10, 0x110)));
         assert_eq!(matcher_of(&old, &new, 0x10).as_deref(), Some("similarity"));
+    }
+
+    /// A build whose `fillers` named functions all call one helper and hold one constant, as the edited
+    /// function `h` (old 0x10, new 0x110, code half changed) does, and nothing else ties the two `h` together.
+    fn sharing_a_helper(fillers: u64) -> (AnalysisExport, AnalysisExport) {
+        let build = |id: &str, helper: u64, h: FunctionFeatures| {
+            let mut fns = vec![named_calling(helper, "chk", &[])];
+            for i in 0..fillers {
+                let mut f = named_calling(0x1000 + i * 0x10, &format!("f{i}"), &[helper]);
+                f.constants = vec![0xcccc_cccc];
+                fns.push(f);
+            }
+            fns.push(h);
+            export(id, fns)
+        };
+        let mut old_h = body(0x10, "h1", 4, &[0x900], 64);
+        let mut new_h = body(0x110, "h2", 16, &[0x910], 64);
+        old_h.constants = vec![0xcccc_cccc];
+        new_h.constants = vec![0xcccc_cccc];
+        (build("a", 0x900, old_h), build("b", 0x910, new_h))
+    }
+
+    #[test]
+    fn boilerplate_callees_and_constants_are_not_similarity_evidence() {
+        // A helper five functions call still counts: the pair is matched on it.
+        let (old, new) = sharing_a_helper(5);
+        assert_eq!(matcher_of(&old, &new, 0x10).as_deref(), Some("similarity"));
+
+        // Called by most of the build (a Debug build's run-time checks), it says nothing: no candidate.
+        let (old, new) = sharing_a_helper(40);
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x10)),
+            "{:?}",
+            got.candidates
+        );
+    }
+
+    #[test]
+    fn ubiquitous_needs_a_share_of_the_build_and_a_minimum_count() {
+        let build = |callers: u64, others: u64| {
+            let mut fns = vec![named_calling(0x900, "chk", &[])];
+            fns.extend((0..callers).map(|i| named_calling(0x1000 + i, "c", &[0x900])));
+            fns.extend((0..others).map(|i| named_calling(0x9000 + i, "o", &[])));
+            export("a", fns)
+        };
+        let callees = |f: &FunctionFeatures| f.callees.clone();
+        // 40 of 41: most of the build.
+        assert!(ubiquitous(&build(40, 0), callees).contains(&Rva(0x900)));
+        // 40 of 401: many callers, but a tenth of the build.
+        assert!(ubiquitous(&build(40, 360), callees).is_empty());
+        // 10 of 11: most of a build too small to tell.
+        assert!(ubiquitous(&build(10, 0), callees).is_empty());
+    }
+
+    fn x86(mut e: AnalysisExport) -> AnalysisExport {
+        e.build.machine = Machine::X86;
+        e
+    }
+
+    #[test]
+    fn an_x86_stack_argument_count_change_counts_against_similarity() {
+        // An edit just over the threshold (about 0.79).
+        let (mut old, mut new) = edited(&[0x110], vec![body(0x110, "h2", 30, &[0x150], 66)]);
+        old.functions[2].inferred_args = Some(1);
+        new.functions[2].inferred_args = Some(4);
+        // x64: the register count isn't scored.
+        assert_eq!(matcher_of(&old, &new, 0x10).as_deref(), Some("similarity"));
+        // x86, same count: still matched.
+        let (mut same_old, mut same_new) = (x86(old.clone()), x86(new.clone()));
+        same_old.functions[2].inferred_args = Some(4);
+        same_new.functions[2].inferred_args = Some(4);
+        assert_eq!(
+            matcher_of(&same_old, &same_new, 0x10).as_deref(),
+            Some("similarity")
+        );
+        // x86, 1 -> 4 stack arguments: below the threshold, no candidate.
+        let (old, new) = (x86(old), x86(new));
+        assert_eq!(matcher_of(&old, &new, 0x10), None);
+    }
+
+    /// old: 0x10 (constant k) calls 0x20, also k. new: 0x110 (k) calls 0x120 (k, edited). The two pairs are
+    /// found by similarity together, before either is matched.
+    fn matched_in_one_wave(new_adds: u32) -> (AnalysisExport, AnalysisExport) {
+        let with_k = |mut f: FunctionFeatures| {
+            f.constants = vec![0x1234_5678];
+            f
+        };
+        let old = export(
+            "a",
+            vec![
+                with_k(body(0x10, "o1", 5, &[], 64)),
+                with_k(body(0x20, "x1", 30, &[], 64)),
+            ],
+        );
+        let new = export(
+            "b",
+            vec![
+                with_k(body(0x110, "o2", new_adds, &[0x120], 64)),
+                with_k(body(0x120, "x2", 31, &[], 64)),
+            ],
+        );
+        (old, new)
+    }
+
+    #[test]
+    fn an_x86_similarity_pair_is_rescored_against_the_final_matches() {
+        // 0x110 calls the new 0x120; 0x10 calls nothing. Scored before 0x120 is matched, the call doesn't count.
+        let (old, new) = matched_in_one_wave(6);
+        assert!(pairs(&old, &new).contains(&(0x10, 0x110)));
+        // x86: rescored once 0x120 is matched, the call it doesn't share takes it under the threshold.
+        let (old, new) = (x86(old), x86(new));
+        let got = pairs(&old, &new);
+        assert!(!got.contains(&(0x10, 0x110)), "{got:x?}");
+        // Negative: identical code keeps the pair even with the call counted.
+        let (old, new) = matched_in_one_wave(5);
+        assert!(pairs(&x86(old), &x86(new)).contains(&(0x10, 0x110)));
+    }
+
+    /// old: p (0x10, constant k) calls helper h (0x40). new: p' (0x110, k) and h' (0x140), the only copy of h's
+    /// code. p' calls h' or an unrelated 0x150. p and p' are too different to match, but each is the other's
+    /// clear best.
+    fn helper_of_an_unmatched_caller(
+        new_adds: u32,
+        new_size: u32,
+        calls_helper: bool,
+    ) -> (AnalysisExport, AnalysisExport) {
+        let with_k = |mut f: FunctionFeatures| {
+            f.constants = vec![0x1234_5678];
+            f
+        };
+        let old = export(
+            "a",
+            vec![
+                with_k(body(0x10, "p1", 1, &[0x40], 64)),
+                func(0x40, None, Some("helper")),
+            ],
+        );
+        let callee = if calls_helper { 0x140 } else { 0x150 };
+        let new = export(
+            "b",
+            vec![
+                with_k(body(0x110, "p2", new_adds, &[callee], new_size)),
+                func(0x140, None, Some("helper")),
+                func(0x150, None, Some("other")),
+            ],
+        );
+        (old, new)
+    }
+
+    #[test]
+    fn unique_code_is_vetoed_when_its_callers_likely_counterpart_doesnt_call_it() {
+        // p' (similarity about 0.68 to p, under the threshold) doesn't call h': h' may be other code that
+        // happens to be identical (yaml-cpp 0.9.0's std::array iterator helpers).
+        let (old, new) = helper_of_an_unmatched_caller(4, 64, false);
+        let got = run_passes(&old, &new, &default_matchers());
+        assert!(
+            !got.candidates.iter().any(|c| c.old == Rva(0x40)),
+            "{:?}",
+            got.candidates
+        );
+        assert!(
+            got.ambiguities
+                .iter()
+                .any(|a| a.matcher == "normalized-hash"
+                    && a.old == vec![Rva(0x40)]
+                    && a.detail.contains("likely counterparts"))
+        );
+
+        // The likely counterpart calls h': kept.
+        let (old, new) = helper_of_an_unmatched_caller(40, 128, true);
+        assert!(pairs(&old, &new).contains(&(0x40, 0x140)));
+        // Not a likely counterpart (too different), so no evidence either way: kept, as before.
+        let (old, new) = helper_of_an_unmatched_caller(40, 128, false);
+        assert!(pairs(&old, &new).contains(&(0x40, 0x140)));
     }
 
     #[test]
@@ -2806,7 +3181,9 @@ mod tests {
         let recheck = |pairs: &[Candidate]| {
             let matched_old: HashSet<Rva> = pairs.iter().map(|c| c.old).collect();
             let matched_new: HashSet<Rva> = pairs.iter().map(|c| c.new).collect();
+            let no_likely = HashMap::new();
             let ctx = MatchContext {
+                likely: &no_likely,
                 old: &old,
                 new: &new,
                 matched_old: &matched_old,

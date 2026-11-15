@@ -11,17 +11,22 @@
        copies and truth.json (functions from the project's own object files, joined by name).
   With -Score, runs `pbeta-corpus score` against the project's expected.toml.
 
+  -Arch x86 builds 32-bit (vcvars32): builds/x86-<flags>/ and variants x86-<flags>__<old>__<new>, scored with the
+  x64 ones, with their own gates in expected.toml.
+
   Needs git and network access the first time (to clone), Visual Studio with the x64 C++ toolset, and cargo.
 
 .EXAMPLE
   pwsh corpus/build-projects.ps1
   pwsh corpus/build-projects.ps1 -Project zlib -Flags o2 -Score
+  pwsh corpus/build-projects.ps1 -Arch x86 -Score
 #>
 [CmdletBinding()]
 param(
     [string[]] $Project,
     [string[]] $Flags,
-    [switch] $Score
+    [switch] $Score,
+    [ValidateSet('x64', 'x86')] [string] $Arch = 'x64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +35,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 $projectsDir = Join-Path $PSScriptRoot 'projects'
 $srcRoot = Join-Path $repo 'target/corpus-src'
 $outRoot = Join-Path $repo 'target/corpus'
+$variantPrefix = if ($Arch -eq 'x86') { 'x86-' } else { '' }
 
 function Get-Sources($recipe) {
     $base = Join-Path $srcRoot $recipe.Name
@@ -49,9 +55,9 @@ function Get-Sources($recipe) {
 function Build-Version($recipe, [string] $tag, [string] $flagName) {
     $set = Get-MsvcFlagSet $flagName
     $src = Join-Path $srcRoot "$($recipe.Name)/$tag"
-    $out = Join-Path $outRoot "$($recipe.Name)/builds/$flagName/$tag"
+    $out = Join-Path $outRoot "$($recipe.Name)/builds/$variantPrefix$flagName/$tag"
     New-Item -ItemType Directory -Force $out | Out-Null
-    Write-Host "building $($recipe.Name) $tag [$flagName]"
+    Write-Host "building $($recipe.Name) $tag [$variantPrefix$flagName]"
 
     $defines = @($recipe.Defines | ForEach-Object { "/D$_" })
     $includes = @("/I$src") + @($recipe.Include | Where-Object { $_ } | ForEach-Object { "/I$(Join-Path $src $_)" })
@@ -135,7 +141,7 @@ function Invoke-Training($recipe, [string] $src, [string] $out) {
     }
 }
 
-Import-VsDevEnvironment
+Import-VsDevEnvironment -Arch $Arch
 
 $projectNames = if ($Project) { $Project } else { Get-ChildItem $projectsDir -Directory | ForEach-Object Name }
 $flagNames = if ($Flags) { $Flags } else { $MsvcFlagSets.Keys }
@@ -155,11 +161,11 @@ foreach ($name in $projectNames) {
 
         for ($i = 0; $i -lt $recipe.Versions.Count - 1; $i++) {
             $old, $new = $recipe.Versions[$i], $recipe.Versions[$i + 1]
-            $variant = Join-Path $outRoot "$name/$flagName`__$old`__$new"
+            $variant = Join-Path $outRoot "$name/$variantPrefix$flagName`__$old`__$new"
             foreach ($pair in @(@('v1', $old), @('v2', $new))) {
                 $dest = Join-Path $variant $pair[0]
                 New-Item -ItemType Directory -Force $dest | Out-Null
-                $from = Join-Path $outRoot "$name/builds/$flagName/$($pair[1])"
+                $from = Join-Path $outRoot "$name/builds/$variantPrefix$flagName/$($pair[1])"
                 Copy-Item "$from\$exe.exe", "$from\$exe.map" $dest -Force
             }
             # Renames declared for the newer tag (checked by hand against the sources).

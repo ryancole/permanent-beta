@@ -46,7 +46,26 @@
 "od__v5.4.7__v5.4.8" = 1091
 "o2-ltcg__v5.4.6__v5.4.7" = 521
 "o2-ltcg__v5.4.7__v5.4.8" = 517
-"o2-pgo__v5.4.6__v5.4.7" = 837
+"o2-pgo__v5.4.6__v5.4.7" = 836
 "o2-pgo__v5.4.7__v5.4.8" = 837
-"debug__v5.4.6__v5.4.7" = 1089
+"debug__v5.4.6__v5.4.7" = 1088
 "debug__v5.4.7__v5.4.8" = 1092
+# 2026-11-15, similarity ignores boilerplate callees and constants (SIM_UBIQUITOUS_SHARE), 0 wrong:
+# debug__v5.4.6__v5.4.7 1089 -> 1088.
+# x86 (2026-11-15, build-projects.ps1 -Arch x86; features native-4-x86.4): first baselines, 0 wrong.
+"x86-debug__v5.4.6__v5.4.7" = 1088
+"x86-debug__v5.4.7__v5.4.8" = 1091
+"x86-o2-icf__v5.4.6__v5.4.7" = 754
+"x86-o2-icf__v5.4.7__v5.4.8" = 761
+"x86-o2-ltcg__v5.4.6__v5.4.7" = 615
+"x86-o2-ltcg__v5.4.7__v5.4.8" = 616
+"x86-o2-pgo__v5.4.6__v5.4.7" = 888
+"x86-o2__v5.4.6__v5.4.7" = 754
+"x86-o2__v5.4.7__v5.4.8" = 761
+"x86-od__v5.4.6__v5.4.7" = 1085
+"x86-od__v5.4.7__v5.4.8" = 1089
+# 2026-11-15, unique code vetoed when its callers' likely counterparts don't call it; x86 similarity counts a stack
+# argument change and is rescored against the final matches. 0 wrong on every variant: o2-pgo__v5.4.6__v5.4.7 837 ->
+# 836, x86-o2-ltcg__v5.4.7__v5.4.8 617 -> 616, x86-o2-pgo__v5.4.6__v5.4.7 889 -> 888. Newly gated:
+# x86-o2-pgo__v5.4.7__v5.4.8.
+"x86-o2-pgo__v5.4.7__v5.4.8" = 880

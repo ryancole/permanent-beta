@@ -152,9 +152,12 @@ fn is_near_branch(kind: OpKind) -> bool {
 /// for a function start has already made its own jumps into starts, so they're found again without it. The set
 /// only grows, so this ends.
 pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
+    let mut data = rtc_frame_descriptors(image);
+    data.extend(jump_tables_in_code(image));
+    data.sort_unstable();
     let mut seh_blocks = BTreeSet::new();
     loop {
-        let (ranges, found) = discover_except(image, &seh_blocks);
+        let (ranges, found) = discover_except(image, &seh_blocks, &data);
         if found.is_subset(&seh_blocks) {
             return ranges;
         }
@@ -162,11 +165,117 @@ pub(crate) fn discover(image: &Image) -> Vec<FunctionRange> {
     }
 }
 
-/// Discovery that never takes the addresses in `seh_blocks` for function starts. Also returns every SEH block
-/// found on the way.
+/// Most variables an `_RTC_framedesc` is taken to describe. **[Guess]**
+const MAX_RTC_VARS: u32 = 256;
+/// Farthest past its variable records a descriptor's names are taken to be, and longest name. **[Guess]**
+const MAX_RTC_NAMES: u32 = 0x1000;
+const MAX_RTC_NAME: usize = 256;
+
+/// x86 `/RTCs` (part of `/RTC1`, the Debug default) frame descriptors in code, `[start, end)`, sorted. MSVC puts
+/// a function's `_RTC_framedesc` (for `_RTC_CheckStackVars`) in `.text` right after the function's code: a count
+/// `n`, a pointer to the `n` variable records that follow it (`{ int offset; int size; char* name; }`), then the
+/// names. Decoded as code it's garbage, and a garbage branch out of the function makes a bogus start in the next
+/// one. Found from the relocated pointers in code (the function's `mov edx, offset desc`) and taken only in that
+/// exact shape: the records pointer is the descriptor's own address + 8, each size is positive, and each name a
+/// short printable string just past the records.
+fn rtc_frame_descriptors(image: &Image) -> Vec<(u32, u32)> {
+    if !image.x86 {
+        return Vec::new();
+    }
+    let u32_at = |rva: u32| {
+        image
+            .bytes(rva, 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let descriptor = |t: u32| -> Option<(u32, u32)> {
+        let n = u32_at(t)?;
+        if n == 0 || n > MAX_RTC_VARS || u64::from(u32_at(t + 4)?) != image.base + u64::from(t + 8)
+        {
+            return None;
+        }
+        let names = t + 8 + 12 * n;
+        let mut end = names;
+        for i in 0..n {
+            let record = t + 8 + 12 * i;
+            let size = u32_at(record + 4)? as i32;
+            let name = image.va_to_rva(u64::from(u32_at(record + 8)?))?;
+            if size <= 0 || !(names..names + MAX_RTC_NAMES).contains(&name) {
+                return None;
+            }
+            let bytes = image.bytes_from(name)?;
+            let len = bytes.iter().take(MAX_RTC_NAME).position(|&b| b == 0)?;
+            if len == 0 || !bytes[..len].iter().all(|b| b.is_ascii_graphic()) {
+                return None;
+            }
+            end = end.max(name + len as u32 + 1);
+        }
+        Some((t, end))
+    };
+    let mut found: Vec<(u32, u32)> = image
+        .code_relocs
+        .iter()
+        .filter_map(|&slot| image.va_to_rva(u64::from(u32_at(slot)?)))
+        .filter(|&t| image.is_executable(t))
+        .collect::<BTreeSet<u32>>()
+        .into_iter()
+        .filter_map(descriptor)
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// Fewest consecutive relocated code pointers in code taken for a jump table. **[Guess]**: MSVC builds a table
+/// for a switch of four cases or more; no instruction has two address operands 4 bytes apart that both point into
+/// code.
+const MIN_JUMP_TABLE_SLOTS: usize = 3;
+
+/// x86 switch jump tables in code, `[start, end)`, sorted: MSVC puts a function's tables (`jmp [eax*4 + table]`)
+/// in `.text` after its code, so without `.pdata` they'd be decoded as its code, and a garbage branch out of the
+/// function makes a bogus start in the next one. A table is a run of at least [`MIN_JUMP_TABLE_SLOTS`] consecutive
+/// relocated 4-byte slots in code, each pointing into code. A sparse switch's byte index table follows it; the
+/// function ending at the table (`ranges`) keeps that out too.
+fn jump_tables_in_code(image: &Image) -> Vec<(u32, u32)> {
+    if !image.x86 {
+        return Vec::new();
+    }
+    let points_into_code = |slot: u32| {
+        image
+            .bytes(slot, 4)
+            .map(|b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .and_then(|va| image.va_to_rva(va))
+            .is_some_and(|t| image.is_executable(t))
+    };
+    let mut tables = Vec::new();
+    let mut run: Vec<u32> = Vec::new();
+    for &slot in &image.code_relocs {
+        let continues = run.last().is_some_and(|&last| slot == last + 4);
+        if !continues {
+            if run.len() >= MIN_JUMP_TABLE_SLOTS {
+                tables.push((run[0], run[run.len() - 1] + 4));
+            }
+            run.clear();
+        }
+        if points_into_code(slot) {
+            run.push(slot);
+        } else {
+            if run.len() >= MIN_JUMP_TABLE_SLOTS {
+                tables.push((run[0], run[run.len() - 1] + 4));
+            }
+            run.clear();
+        }
+    }
+    if run.len() >= MIN_JUMP_TABLE_SLOTS {
+        tables.push((run[0], run[run.len() - 1] + 4));
+    }
+    tables
+}
+
+/// Discovery that never takes the addresses in `seh_blocks` for function starts, with `data` (RTC frame
+/// descriptors, jump tables) never decoded as code. Also returns every SEH block found on the way.
 fn discover_except(
     image: &Image,
     seh_blocks: &BTreeSet<u32>,
+    data: &[(u32, u32)],
 ) -> (Vec<FunctionRange>, BTreeSet<u32>) {
     let pdata: Vec<_> = image
         .pdata
@@ -205,10 +314,21 @@ fn discover_except(
     // the table, not functions, though the table's relocated pointers to them make them look like starts.
     starts.retain(|s| !seh_blocks.contains(s));
     let mut seh_found: BTreeSet<u32> = BTreeSet::new();
+    // x86 has no unwind data to say which blocks are one function. Blocks a function reaches only by a
+    // conditional jump out of its range (PGO moves cold blocks far from the hot ones) are boundaries here and
+    // are given to their function at the end (`cold_block_owners`).
+    let mut cold: BTreeSet<u32> = BTreeSet::new();
 
     loop {
         let mut found = Vec::new();
-        let ranges = ranges(image, &starts);
+        let mut found_cold = Vec::new();
+        let pieces: BTreeSet<u32> = starts.union(&cold).copied().collect();
+        let ranges = ranges(image, &pieces, data, &BTreeMap::new());
+        let fallen_into = if image.x86 {
+            fallen_into(image, &ranges)
+        } else {
+            BTreeSet::new()
+        };
         // Fragments whose chain couldn't be followed to a known start are still code worth scanning.
         let owned: BTreeSet<(u32, u32)> = ranges.iter().flat_map(|r| r.fragments.clone()).collect();
         let orphans = pdata
@@ -272,8 +392,8 @@ fn discover_except(
                     }
                     throw_info.clear();
                 }
-                let (t, is_call) = if (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)))
-                {
+                let is_branch = (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)));
+                let (t, is_call) = if is_branch {
                     (
                         ins.near_branch_target(),
                         ins.flow_control() == FlowControl::Call,
@@ -296,21 +416,150 @@ fn discover_except(
                     && !starts.contains(&t)
                     && !inside_pdata(t)
                 {
-                    found.push(t);
+                    if !image.x86 || is_call || !is_branch {
+                        found.push(t);
+                    } else if cold.contains(&t) || fallen_into.contains(&t) {
+                        // A jump into the middle of straight-line code (a cold block returning to its
+                        // function's hot code) enters a function, it doesn't start one.
+                    } else if ins.flow_control() == FlowControl::ConditionalBranch {
+                        // MSVC doesn't tail-call conditionally: a block of the jumping function.
+                        found_cold.push(t);
+                    } else {
+                        found.push(t);
+                    }
                 }
             }
         }
-        found.retain(|f| !seh_blocks.contains(f));
-        if found.is_empty() {
+        let is_code = |f: &u32| {
+            !seh_blocks.contains(f)
+                // The descriptor's own address, taken by its function (`mov edx, offset desc`), isn't code.
+                && !data.iter().any(|&(s, e)| s <= *f && *f < e)
+        };
+        found.retain(is_code);
+        found_cold.retain(is_code);
+        if found.is_empty() && found_cold.is_empty() {
             // Nothing reaches the rest: look for code that starts after padding (dead code, design §4.4).
-            found = padding_starts(image, &ranges, &starts);
+            found = padding_starts(image, &ranges, &pieces, data);
             found.retain(|f| !seh_blocks.contains(f));
             if found.is_empty() {
-                return (ranges, seh_found);
+                if cold.is_empty() {
+                    return (ranges, seh_found);
+                }
+                let owners = cold_block_owners(image, &ranges, &starts);
+                starts.extend(cold.iter().filter(|c| !owners.contains_key(c)));
+                return (self::ranges(image, &starts, data, &owners), seh_found);
             }
         }
         starts.extend(found);
+        cold.extend(found_cold);
+        // A call wins: a block something calls is a function.
+        cold.retain(|c| !starts.contains(c));
     }
+}
+
+/// x86: the addresses the instruction before them runs into. `ranges` are the pieces known so far, each decoded
+/// from its start; an instruction after a return, a jump or `int3` isn't run into.
+fn fallen_into(image: &Image, ranges: &[FunctionRange]) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    for r in ranges.iter().filter(|r| !r.from_pdata) {
+        let mut runs_on = false;
+        for ins in decode(image, r.start, r.end) {
+            if runs_on {
+                out.insert((ins.ip() - image.base) as u32);
+            }
+            runs_on = ins.mnemonic() != Mnemonic::Int3
+                && !matches!(
+                    ins.flow_control(),
+                    FlowControl::Return
+                        | FlowControl::UnconditionalBranch
+                        | FlowControl::IndirectBranch
+                        | FlowControl::Interrupt
+                        | FlowControl::Exception
+                );
+        }
+    }
+    out
+}
+
+/// x86: which function each cold block belongs to, from the direct jumps into it. `pieces` are the ranges of
+/// functions (`starts`) and cold blocks alike. A block belongs to the one function whose code (its own range or
+/// blocks already given to it) jumps there; a block two functions jump to, or none, gets no owner and is left a
+/// function, as before.
+fn cold_block_owners(
+    image: &Image,
+    pieces: &[FunctionRange],
+    starts: &BTreeSet<u32>,
+) -> BTreeMap<u32, u32> {
+    let piece_starts: BTreeSet<u32> = pieces.iter().map(|r| r.start).collect();
+    let piece_of = |t: u32| piece_starts.contains(&t).then_some(t);
+    // Cold block -> the pieces that jump to it.
+    let mut referrers: BTreeMap<u32, BTreeSet<u32>> = pieces
+        .iter()
+        .filter(|r| !starts.contains(&r.start))
+        .map(|r| (r.start, BTreeSet::new()))
+        .collect();
+    for r in pieces {
+        for ins in decode(image, r.start, r.end) {
+            let jumps = matches!(
+                ins.flow_control(),
+                FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+            ) && (0..ins.op_count()).any(|op| is_near_branch(ins.op_kind(op)));
+            if !jumps {
+                continue;
+            }
+            let Some(t) = image.va_to_rva(ins.near_branch_target()).and_then(piece_of) else {
+                continue;
+            };
+            if t != r.start {
+                if let Some(from) = referrers.get_mut(&t) {
+                    from.insert(r.start);
+                }
+            }
+        }
+    }
+    // Resolve through blocks that are reached from other cold blocks. `None`: no single owner.
+    let mut owner: BTreeMap<u32, Option<u32>> = BTreeMap::new();
+    loop {
+        let mut changed = false;
+        for (&block, from) in &referrers {
+            if owner.contains_key(&block) {
+                continue;
+            }
+            let mut roots = BTreeSet::new();
+            let mut pending = false;
+            for p in from {
+                if starts.contains(p) {
+                    roots.insert(Some(*p));
+                } else {
+                    match owner.get(p) {
+                        Some(o) => {
+                            roots.insert(*o);
+                        }
+                        None => pending = true,
+                    }
+                }
+            }
+            let decided = if roots.len() > 1 || roots.contains(&None) {
+                Some(None)
+            } else if pending {
+                None
+            } else {
+                Some(roots.into_iter().next().flatten())
+            };
+            if let Some(d) = decided {
+                owner.insert(block, d);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Blocks that only reach each other (pending forever) have no owner.
+    owner
+        .into_iter()
+        .filter_map(|(block, o)| Some((block, o?)))
+        .collect()
 }
 
 /// Farthest an SEH block is taken to be from the start of its function. **[Guess]**
@@ -474,9 +723,16 @@ const FUNCTION_ALIGN: u32 = 16;
 /// Inside a function, code after `int3` can be its own block (after a call that doesn't return), which is why
 /// the padding, the alignment and the absence of an internal branch to it are all required. Functions with
 /// `.pdata` are never split: their bounds are exact.
-fn padding_starts(image: &Image, ranges: &[FunctionRange], starts: &BTreeSet<u32>) -> Vec<u32> {
+fn padding_starts(
+    image: &Image,
+    ranges: &[FunctionRange],
+    starts: &BTreeSet<u32>,
+    data: &[(u32, u32)],
+) -> Vec<u32> {
     let mut covered: Vec<(u32, u32)> = ranges.iter().flat_map(|r| r.segments()).collect();
     covered.extend(image.pdata.iter().map(|r| (r.begin, r.end)));
+    // Data in code (RTC frame descriptors) isn't a gap: the padding after it is.
+    covered.extend(data.iter().copied());
     covered.sort_unstable();
 
     let mut found = Vec::new();
@@ -559,16 +815,62 @@ fn gap_start(image: &Image, from: u32, to: u32) -> Option<u32> {
 
 /// Boundaries for each start: exact from `.pdata`, otherwise up to the next start (or any `.pdata` begin,
 /// including chained fragments), within the section, minus trailing `int3` padding.
-fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
+fn ranges(
+    image: &Image,
+    starts: &BTreeSet<u32>,
+    data: &[(u32, u32)],
+    blocks: &BTreeMap<u32, u32>,
+) -> Vec<FunctionRange> {
     let mut boundaries: BTreeSet<u32> = starts.clone();
     boundaries.extend(image.pdata.iter().map(|r| r.begin));
+    boundaries.extend(blocks.keys());
+    // Where the code starting at `start` ends, for code without `.pdata`.
+    let end_of = |start: u32| -> Option<u32> {
+        let section_end = image.section_end(start)?;
+        let next = boundaries
+            .range(start + 1..)
+            .next()
+            .copied()
+            .unwrap_or(section_end);
+        let mut end = next.min(section_end);
+        // Data after the function's code (an RTC frame descriptor, a jump table) ends it.
+        if let Some(&(d, _)) = data.iter().find(|&&(d, _)| start < d && d < end) {
+            end = d;
+        }
+        while end > start + 1 && image.bytes(end - 1, 1) == Some(&[0xcc]) {
+            end -= 1;
+        }
+        // MSVC follows a call that doesn't return with an `int3` of the function's own; on x86, where every
+        // function ends this way, keep it. (On x64 a function that calls has `.pdata`, so exact bounds.)
+        if image.x86
+            && end < next.min(section_end)
+            && decode(image, start, end).last().is_some_and(|i| {
+                i.next_ip() == image.base + u64::from(end)
+                    && matches!(
+                        i.flow_control(),
+                        FlowControl::Call | FlowControl::IndirectCall
+                    )
+            })
+        {
+            end += 1;
+        }
+        Some(end)
+    };
     let fragments_of = |start: u32| -> Vec<(u32, u32)> {
-        image
+        let mut f: Vec<(u32, u32)> = image
             .pdata
             .iter()
             .filter(|r| r.chained && r.parent == Some(start) && image.is_executable(r.begin))
             .map(|r| (r.begin, r.end))
-            .collect()
+            .collect();
+        f.extend(
+            blocks
+                .iter()
+                .filter(|&(_, &owner)| owner == start)
+                .filter_map(|(&b, _)| Some((b, end_of(b)?))),
+        );
+        f.sort_unstable();
+        f
     };
 
     starts
@@ -582,33 +884,9 @@ fn ranges(image: &Image, starts: &BTreeSet<u32>) -> Vec<FunctionRange> {
                     fragments: fragments_of(start),
                 });
             }
-            let section_end = image.section_end(start)?;
-            let next = boundaries
-                .range(start + 1..)
-                .next()
-                .copied()
-                .unwrap_or(section_end);
-            let mut end = next.min(section_end);
-            while end > start + 1 && image.bytes(end - 1, 1) == Some(&[0xcc]) {
-                end -= 1;
-            }
-            // MSVC follows a call that doesn't return with an `int3` of the function's own; on x86, where every
-            // function ends this way, keep it. (On x64 a function that calls has `.pdata`, so exact bounds.)
-            if image.x86
-                && end < next.min(section_end)
-                && decode(image, start, end).last().is_some_and(|i| {
-                    i.next_ip() == image.base + u64::from(end)
-                        && matches!(
-                            i.flow_control(),
-                            FlowControl::Call | FlowControl::IndirectCall
-                        )
-                })
-            {
-                end += 1;
-            }
             Some(FunctionRange {
                 start,
-                end,
+                end: end_of(start)?,
                 from_pdata: false,
                 fragments: fragments_of(start),
             })
@@ -1842,6 +2120,92 @@ mod tests {
         }
     }
 
+    /// x86: a function at 0x1000 that passes an RTC frame descriptor (at 0x1008) in edx, `records` as the
+    /// descriptor's records pointer, then `int3` padding and a function at 0x1030.
+    fn rtc_image(records: u32) -> Image {
+        let mut code = vec![0xba];
+        code.extend(va(0x1008)); // mov edx, offset desc
+        code.extend([0xc3, 0x66, 0x90]); // ret; nop
+        code.extend(1u32.to_le_bytes()); // desc: one variable
+        code.extend(va(records));
+        code.extend((-8i32).to_le_bytes()); // [ebp-8]
+        code.extend(4u32.to_le_bytes()); // 4 bytes
+        code.extend(va(0x101c)); // named
+        code.extend(b"buf\0");
+        code.resize(0x30, 0xcc);
+        code.push(0xc3); // the next function: ret
+        code.resize(0x1000, 0xcc); // the section's file data, padded
+        let mut img = x86_image(&code, &[], &[]);
+        img.has_relocs = true;
+        img.code_relocs = [0x1001, 0x100c, 0x1018].into_iter().collect();
+        img
+    }
+
+    #[test]
+    fn an_rtc_frame_descriptor_after_x86_code_is_data() {
+        let img = rtc_image(0x1010);
+        assert_eq!(rtc_frame_descriptors(&img), vec![(0x1008, 0x1020)]);
+        let ranges = discover(&img);
+        let f = ranges
+            .iter()
+            .find(|r| r.start == 0x1000)
+            .expect("the function");
+        assert_eq!(f.end, 0x1008, "the descriptor isn't the function's code");
+        assert!(ranges.iter().any(|r| r.start == 0x1030), "{ranges:x?}");
+        assert_eq!(ranges.len(), 2, "{ranges:x?}");
+        assert!(!ranges.iter().any(|r| (0x1008..0x1020).contains(&r.start)));
+        // Negative: a records pointer that isn't the descriptor's own address + 8 isn't a descriptor, and the
+        // bytes stay the function's.
+        let img = rtc_image(0x1014);
+        assert!(rtc_frame_descriptors(&img).is_empty());
+        let ranges = discover(&img);
+        assert!(
+            ranges
+                .iter()
+                .find(|r| r.start == 0x1000)
+                .expect("the function")
+                .end
+                > 0x1008
+        );
+    }
+
+    #[test]
+    fn an_x86_jump_table_after_the_code_is_data() {
+        // 0x1000: cmp eax, 2; ja +7; jmp [eax*4 + 0x1018]; ret; (pad) 0x1018: table of 3 code pointers whose bytes
+        // decode as a branch out of the function (0x1018 + .. ); 0x1030: the next function: ret.
+        let mut code = vec![0x83, 0xf8, 0x02, 0x77, 0x07, 0xff, 0x24, 0x85];
+        code.extend(va(0x1018));
+        code.push(0xc3);
+        code.resize(0x18, 0x90);
+        for t in [0x100d, 0x100d, 0x1035] {
+            code.extend(va(t));
+        }
+        code.resize(0x30, 0xcc);
+        code.push(0xc3);
+        code.resize(0x1000, 0xcc);
+        let image = |code: &[u8], relocs: &[u32]| {
+            let mut img = x86_image(code, &[], &[]);
+            img.has_relocs = true;
+            img.code_relocs = relocs.iter().copied().collect();
+            img
+        };
+        let img = image(&code, &[0x1008, 0x1018, 0x101c, 0x1020]);
+        assert_eq!(jump_tables_in_code(&img), vec![(0x1018, 0x1024)]);
+        let ranges = discover(&img);
+        assert_eq!(
+            ranges.iter().find(|r| r.start == 0x1000).map(|r| r.end),
+            Some(0x1018)
+        );
+        assert!(ranges.iter().any(|r| r.start == 0x1030), "{ranges:x?}");
+        // Negative: two relocated slots aren't a table (an instruction can have two address operands).
+        let img = image(&code, &[0x1008, 0x1018, 0x101c]);
+        assert!(jump_tables_in_code(&img).is_empty());
+        // Negative: nor are slots whose values don't all point into code.
+        code[0x1c..0x20].copy_from_slice(&va(0x3000));
+        let img = image(&code, &[0x1008, 0x1018, 0x101c, 0x1020]);
+        assert!(jump_tables_in_code(&img).is_empty());
+    }
+
     #[test]
     fn x86_import_calls_hash_by_imported_name() {
         // call dword ptr [slot]; ret
@@ -1988,6 +2352,89 @@ mod tests {
         // Negative: after a `ret`, the int3s are all padding; and x64's bounds are unchanged.
         assert_eq!(ends_after_call(&[0xc3, 0xcc], true)[0], (0x1000, 0x1006));
         assert_eq!(ends_after_call(&[0xcc], false)[0], (0x1000, 0x1005));
+    }
+
+    /// Code laid out at the given RVAs (from 0x1000), `int3` between, as an x86 or x64 image without `.pdata`;
+    /// 0x1000 is the entry and `exported` are exports.
+    fn laid_out(blocks: &[(u32, &[u8])], exported: &[u32], x86: bool) -> Vec<FunctionRange> {
+        let mut code = Vec::new();
+        for &(rva, bytes) in blocks {
+            code.resize((rva - 0x1000) as usize, 0xcc);
+            code.extend(bytes);
+        }
+        let mut img = if x86 {
+            x86_image(&code, &[], &[])
+        } else {
+            image(&code, &[])
+        };
+        img.entry = Some(0x1000);
+        img.exports = exported.iter().map(|&e| (e, "e".into())).collect();
+        discover(&img)
+    }
+
+    const XOR_EAX_RET: &[u8] = &[0x33, 0xc0, 0xc3];
+
+    #[test]
+    fn x86_a_cold_block_is_a_fragment_of_the_function_that_jumps_to_it() {
+        // PGO layout. f: `test ecx, ecx; je cold; xor eax, eax; inc eax; ret`. cold (0x1040): `xor eax, eax;
+        // jmp` back to f's `inc eax` (0x100a). g (0x1020) lies between.
+        let f: &[u8] = &[
+            0x85, 0xc9, 0x0f, 0x84, 0x38, 0, 0, 0, 0x33, 0xc0, 0x40, 0xc3,
+        ];
+        let cold: &[u8] = &[0x33, 0xc0, 0xe9, 0xc3, 0xff, 0xff, 0xff];
+        let blocks = [(0x1000, f), (0x1020, XOR_EAX_RET), (0x1040, cold)];
+        assert_eq!(
+            laid_out(&blocks, &[0x1020], true),
+            vec![
+                FunctionRange {
+                    fragments: vec![(0x1040, 0x1047)],
+                    ..range(0x1000, 0x100c)
+                },
+                range(0x1020, 0x1023)
+            ]
+        );
+        // x64 is unchanged: without `.pdata` every jump out of a range starts a function.
+        let x64: Vec<u32> = laid_out(&blocks, &[0x1020], false)
+            .iter()
+            .map(|r| r.start)
+            .collect();
+        assert_eq!(x64, vec![0x1000, 0x100a, 0x1020, 0x1040]);
+    }
+
+    #[test]
+    fn x86_a_block_is_still_a_function_when_it_could_be_one() {
+        let starts = |blocks: &[(u32, &[u8])], exported: &[u32]| -> Vec<u32> {
+            let found = laid_out(blocks, exported, true);
+            assert!(found.iter().all(|r| r.fragments.is_empty()), "{found:x?}");
+            found.iter().map(|r| r.start).collect()
+        };
+        // Two functions jump conditionally to 0x1040: it belongs to neither.
+        let f: &[u8] = &[0x85, 0xc9, 0x0f, 0x84, 0x38, 0, 0, 0, 0xc3];
+        let g: &[u8] = &[0x85, 0xc9, 0x0f, 0x84, 0x18, 0, 0, 0, 0xc3];
+        assert_eq!(
+            starts(
+                &[(0x1000, f), (0x1020, g), (0x1040, XOR_EAX_RET)],
+                &[0x1020]
+            ),
+            vec![0x1000, 0x1020, 0x1040]
+        );
+        // An unconditional jump out of the function to code nothing runs into: a tail call.
+        let tail: &[u8] = &[0xe9, 0x3b, 0, 0, 0];
+        assert_eq!(
+            starts(
+                &[(0x1000, tail), (0x1020, XOR_EAX_RET), (0x1040, XOR_EAX_RET)],
+                &[0x1020]
+            ),
+            vec![0x1000, 0x1020, 0x1040]
+        );
+        // A conditional jump to a block that is also called: a function.
+        let calls: &[u8] = &[
+            0x85, 0xc9, 0x0f, 0x84, 0x38, 0, 0, 0, 0xe8, 0x33, 0, 0, 0, 0xc3,
+        ];
+        assert_eq!(
+            starts(&[(0x1000, calls), (0x1040, XOR_EAX_RET)], &[]),
+            vec![0x1000, 0x1040]
+        );
     }
 
     #[test]

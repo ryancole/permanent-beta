@@ -1,10 +1,81 @@
 # Status — where we left off (2026-11-15)
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
-(repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
-the hook loop (x64 and x86).
+(repair loop) is done**, recording harness included. 0 wrong matches on every x64 corpus variant, 0 wrong relocations in
+the hook loop (x64 and x86). **0 wrong matches on every x86 corpus variant too, all 68 gated** (below; branch
+`x86-corpus`, not merged).
 
-Latest work (2026-11-15): **the hook loop on x86** (`corpus/build-hooks.ps1 -Arch x86 -Run -Replay`), run for the
+**Done, not merged (2026-11-15, branch `x86-corpus`): the x86 corpus.** The x86 hook loop
+(`corpus/build-hooks.ps1 -Arch x86 -Run -Replay`) passes after every change below: 0 wrong relocations, every trace
+identical, the negative control caught by the answer key and replay, 20 of 22 resolved hooks replayed (unchanged).
+The x64 hook loop passes too (0 wrong relocations, negative control caught, 22 of 24 resolved hooks replayed, unchanged).
+- Done: `-Arch x86` for `corpus/build-fixtures.ps1` and `corpus/build-projects.ps1` (variants `x86-<flags>` and
+  `x86-<flags>__<old>__<new>` beside the x64 ones, scored with them, own gates); `corpus/verify.ps1` builds and runs
+  the x86 hook loop and fixtures too.
+- `basic` fixture, x86: 0 wrong, same correct counts as x64; gates `x86-*` in its expected.toml. Passes.
+- Fixed on the way (x86 only, features `native-4-x86.3`): the answer key takes x86 EH funclets (`__unwindfunclet$`,
+  `__ehhandler$`, `__catch$`) as funclets (out of scope; their names carry the parent's per-build anonymous
+  namespace hash); discovery no longer decodes data after a function as code: `/RTCs` frame descriptors
+  (`_RTC_framedesc`, Debug builds) and switch jump tables (3+ consecutive relocated code pointers in code) end the
+  function and start none. Before, their garbage branches split the next function (e.g. jsoncpp debug: 29 bogus
+  starts). Tests with negatives.
+- **Projects, x86 (all six, all flag sets; the logs were in the session scratchpad, rerun to see them):** wrong
+  matches went from ~40 to 10 (6 variants); jsoncpp, tinyxml2, zlib 0; lua 0 but o2-pgo; correct counts high.
+  **Every one of the 10 is a `similarity` review candidate** (verdict needs_review, none accepted; the gate counts
+  them anyway). Left, all matching choosing a plausible wrong function where code was refactored, inlined or shifted
+  (x64 has 0 on the same projects):
+  - zstd o2 and o2-icf v1.5.5→v1.5.6: `ZSTDMT_freeBufferPool` → `freeCCtxPool`, `freeCCtxPool` → `freeJobsTable`
+    (a shift by one); `ZSTD_decodingBufferSize_min` → the new `ZSTD_decodingBufferSize_internal` (truth: none).
+  - zstd debug v1.5.5→v1.5.6: `snprintf` (header inline) → the new `LOREM_genBuffer`.
+  - lua o2-pgo: v5.4.6→v5.4.7 `getobjname` → the new `basicgetobjname`; `luaK_patchtohere` → a PGO cold block
+    inside `test_then_block` (x86 has no `.pdata`, so cold blocks are functions); v5.4.7→v5.4.8
+    `luaS_createlngstrobj` → `createstrobj`.
+  - yaml-cpp debug 0.8.0→0.9.0: one `std::_Get_unwrapped` instantiation onto another.
+- **Fixed 2026-11-15 (second session), 10 → 6 wrong, no new wrong match anywhere:**
+  - *Matching, both architectures:* similarity no longer scores (or anchors on) boilerplate, a callee or constant
+    in more than a quarter of a build's functions and more than 32 (`SIM_UBIQUITOUS_SHARE`, [Guess]). In Debug
+    builds `_RTC_CheckEsp`, the JMC probe and the 0xCCCCCCCC fill are in ~60% of functions, and gave unrelated
+    one-block functions "callees 1.00, constants 1.00". Fixes zstd debug `snprintf` and yaml-cpp debug
+    `_Get_unwrapped`. Only Debug variants move: x64 47147 → 47160 correct, x86 48200 → 48199. Five baselines
+    went down (zstd `debug__v1.5.6__v1.5.7` 1775 → 1773, lua `debug__v5.4.6__v5.4.7` 1089 → 1088, and x86
+    jsoncpp/zstd/lua debug by 1–5), lowered in expected.toml (owner accepted, 2026-11-15).
+  - *x86 discovery (features `native-4-x86.4`):* cold blocks are fragments (design §4). A block reached from
+    outside only by conditional jumps from one function belongs to it; a jump target the code before it runs
+    into starts no function. Lua's x86 PGO build was 3021 "functions" (1615 under 32 bytes): every cold block
+    was one, and each jump back split the hot function (`getobjname` was 16 bytes). Now 1136. Fixes lua o2-pgo
+    v5.4.6→v5.4.7 (`getobjname`, `luaK_patchtohere`). x86 correct 48199 → 48205, accepted 41844 → 41795 (PGO
+    functions now hash their whole body, so fewer are byte-identical across versions); x64 untouched.
+- **Fixed 2026-11-15 (third session), 6 → 0 wrong, no new wrong match anywhere** (`permanent-beta-match`):
+  - *Hash pass, both architectures:* unique code is vetoed when none of the old function's callers is matched but
+    some have a **likely counterpart** (an unmatched function that is its clear mutual best by similarity, ≥ 0.6
+    `LIKELY_MIN_SCORE` [Guess], margin as the similarity pass, never a banned pair) and none of those calls the new
+    function. Closes the yaml-cpp hole: 0.9.0 replaced the `std::string` iterator helpers with `std::array<char,20>`
+    ones, byte-identical in Debug, each unique in its build. Requiring outside evidence for every isolated hash pair
+    was measured too and would cost 100+ correct per Debug variant; the likely-counterpart check alone costs x64 −3,
+    x86 +1.
+  - *Similarity, x86 only:* a different inferred stack-argument count is one more score component at 0 (weight 1,
+    [Guess]); and each similarity pair is rescored against the final matches and vetoed if it falls under 0.75. Fixes
+    `freeCCtxPool`, `decodingBufferSize_min`, `luaS_createlngstrobj` (the penalty) and `freeBufferPool` (the
+    rescore: `ZSTD_freeCCtx`, which only its rival calls, is matched after it). Applied to x64 the rescore cost 18
+    correct with no wrong match to fix, so it's x86's.
+  - Totals over the six projects: x64 47160 → 47157 correct, x86 48205 → 48188, wrong 0 on all 136 variants.
+    Baselines moved by 1–5 in 13 variants, mostly down; raised where they went up.
+- **x86 project gates: all 68 variants** (`x86-…` keys in each project's expected.toml). `basic` fixture passes
+  for both architectures.
+- **Measured 2026-11-15, not adopted:**
+  - The argument count as a *veto* in similarity: wrong 10 → 5, correct −94, two new wrong matches in yaml-cpp.
+  - Callees-first waves in similarity (a pair waits while a callee of either side is being paired): costs correct
+    on Lua PGO and zstd x64.
+  - Callee-edge vetoes (offline on 6 variants' match reports): −47 correct for 3, −15 for 2.
+  - Raising the similarity threshold: the wrong ones scored 0.76–0.86, where 10–25 correct per variant sit.
+- Scoring is quick with a release build: `cargo build --release -p permanent-beta-corpus`, then
+  `target/release/pbeta-corpus score --built target/corpus/<p> --expected corpus/projects/<p>/expected.toml`
+  for all six takes under a minute (the 25 minutes below is the builds plus a debug-profile scorer).
+- Rerun: `pwsh corpus/build-projects.ps1 -Arch x86 -Project <p> -Score` per project (one failing score stops
+  the script, so run them one by one; ~25 min for all six). Fixtures: `pwsh corpus/build-fixtures.ps1 -Arch x86
+  -Score`.
+
+Before that (2026-11-15): **the hook loop on x86** (`corpus/build-hooks.ps1 -Arch x86 -Run -Replay`), run for the
 first time; it found five problems, all fixed.
 - **Linker maps** (`pbeta-corpus`, answer key only): x86 maps have 8-digit addresses (none were read) and decorated
   C names (`_f`, `_f@8`, `@f@12`), now undecorated to the PDB's names. Tests, with a negative: x64 names are never

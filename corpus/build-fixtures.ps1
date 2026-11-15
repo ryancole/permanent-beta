@@ -7,12 +7,16 @@
   both versions to target/fixtures/<name>/<flags>/v{1,2}/ with an .exe, .pdb and linker .map file, then writes
   truth.json (the true old -> new function mapping, joined by symbol name from the map files).
 
-  Requires Visual Studio (or Build Tools) with the C++ x64 toolset, and cargo on PATH.
+  -Arch x86 builds 32-bit (vcvars32) into target/fixtures/<name>/x86-<flags>/: a variant beside the x64 ones,
+  scored with them, with its own gate (`x86-<flags>` in expected.toml).
+
+  Requires Visual Studio (or Build Tools) with the C++ x64 toolset (for -Arch x86, the x86 one), and cargo on PATH.
 
 .EXAMPLE
   pwsh corpus/build-fixtures.ps1
   pwsh corpus/build-fixtures.ps1 -Fixture basic -Flags o2-icf
   pwsh corpus/build-fixtures.ps1 -Score
+  pwsh corpus/build-fixtures.ps1 -Arch x86 -Score
 #>
 [CmdletBinding()]
 param(
@@ -22,7 +26,8 @@ param(
     [switch] $Score,
     # Use the already built target/debug/pbeta-corpus.exe instead of `cargo run` (corpus/verify.ps1 builds it once,
     # so parallel jobs never relink a binary another one is running).
-    [switch] $NoBuild
+    [switch] $NoBuild,
+    [ValidateSet('x64', 'x86')] [string] $Arch = 'x64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,8 +36,9 @@ $repo = Split-Path -Parent $PSScriptRoot
 $fixturesDir = Join-Path $PSScriptRoot 'fixtures'
 $outRoot = Join-Path $repo 'target/fixtures'
 $fixtureCl = @('/EHsc', '/permissive-', '/W4')
+$variantPrefix = if ($Arch -eq 'x86') { 'x86-' } else { '' }
 
-Import-VsDevEnvironment
+Import-VsDevEnvironment -Arch $Arch
 
 function Invoke-Corpus([string[]] $arguments) {
     if ($NoBuild) {
@@ -49,7 +55,7 @@ $flagNames = if ($Flags) { $Flags } else { Get-PlainMsvcFlagSetNames }
 foreach ($name in $fixtureNames) {
     foreach ($flagName in $flagNames) {
         $set = Get-MsvcFlagSet $flagName
-        $variantDir = Join-Path $outRoot "$name/$flagName"
+        $variantDir = Join-Path $outRoot "$name/$variantPrefix$flagName"
 
         foreach ($version in 'v1', 'v2') {
             $src = Join-Path $fixturesDir "$name/$version/fixture.cpp"

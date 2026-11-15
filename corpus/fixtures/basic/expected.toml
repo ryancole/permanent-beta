@@ -23,6 +23,13 @@ o2-ltcg = 6
 # debug (2026-11-13): Visual Studio's Debug configuration (/ZI /Od /RTC1 /JMC, incremental linking: 190
 # incremental linking thunks in v1). 9 of 13, 0 wrong.
 debug = 9
+# x86 (2026-11-15, build-fixtures.ps1 -Arch x86; features native-4-x86.2): the same counts as x64, 0 wrong.
+# pb_deleted (S7) is ambiguous rather than unmatched at /Od and /O2 /OPT:ICF: no match either way.
+x86-o2 = 6
+x86-o2-icf = 7
+x86-od = 9
+x86-o2-ltcg = 6
+x86-debug = 9
 
 [[scenario]]
 id = "main"
@@ -60,7 +67,7 @@ target = "review"
 id = "S6"
 function = "pb_dup_a"
 target = "ambiguous"
-overrides = { "o2-icf" = "accepted" }
+overrides = { "o2-icf" = "accepted", "x86-o2-icf" = "accepted" }
 
 [[scenario]]
 id = "S7"
