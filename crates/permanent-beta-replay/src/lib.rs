@@ -410,6 +410,15 @@ fn run_and_compare(
         old_image,
         rebase,
     ) {
+        // It read a zero replay keeps around the recorded memory for vectorized over-reads, where the recorded
+        // process may have had other bytes (a string longer than was captured): the difference may be replay's.
+        CaseOutcome::Fail { detail } if ran.slack_read.is_some() => {
+            CaseOutcome::inconclusive(format!(
+                "{detail}; but it read {:#x}, past the recorded memory (a zero replay put there for over-reads, not \
+                 what the recorded process had), which may be what differs",
+                ran.slack_read.unwrap_or_default()
+            ))
+        }
         // A function pointer mapped through another function's match: if that match is wrong, the difference is
         // its doing, so a correct candidate mustn't fail on it.
         CaseOutcome::Fail { detail } if ran.rewritten.functions > 0 => {

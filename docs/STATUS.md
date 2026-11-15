@@ -21,12 +21,16 @@ Latest work (2026-11-14, latest): **the recorder on x86** (design §7.3), so x86
   (stdcall), `fsum` (fastcall) replay identically (inconclusive: constant results); `Box_get` (thiscall) and /Od
   `count_chars` (unmodelled `wcslen`) inconclusive. Negatives: `mix` on `scalef` and `sum12` on `add3` fail,
   `add3` on `fsum` inconclusive (unbalanced stack). x64 DLL builds and behaves as before on the same check.
-- **Found, not fixed (replay):** x86 /O2 `count_chars` **fails** replay on its own function. `wcslen` is inlined, its
-  argument points to a string literal in the old image, captured as `array` (2 bytes, not a heap block), and the
-  scalar loop reads on into the 32-byte zeroed slack replay maps around regions for vectorized over-reads: 1
-  character instead of 5. A false failure; x64 doesn't hit it only because `wcslen` stays an import there. Needs a
-  replay fix (slack reads that change the result → inconclusive, or an old-image pointer with no mapping →
-  inconclusive) with negative tests and the scorecards.
+- **Found and fixed (replay), a false failure:** x86 /O2 `count_chars` failed replay on its own function. `wcslen`
+  is inlined, its argument points to a string literal in the old image, captured as `array` (2 bytes, not a heap
+  block), and the scalar loop read on into the 32-byte zeroed slack replay maps around regions for vectorized
+  over-reads: 1 character instead of 5 (x64 doesn't hit it only because `wcslen` stays an import there). Replay now
+  hooks reads of the pages holding slack and notes the first slack byte the function reads (`Ran::slack_read`);
+  a case that then differs from the recording is inconclusive, naming the address. A run that reads slack and
+  matches still passes, as before (vectorized over-reads). Tests: the slack ranges (with a negative: a region
+  filling whole blocks has none), and an x86 byte-at-a-time strlen past a 2-byte capture → inconclusive, with
+  negatives: the whole string captured and a wrong recorded length still fails. The repro is now inconclusive,
+  the hand-run negatives still fail. **Scorecards and the hook loop weren't run** for this replay change.
 
 Before that (2026-11-14, later): **x86 (32-bit PE) support** (design §13 question 2, decided: x64 and x86).
 - **Analysis:** PE32 images (`machine: x86`, features version `native-4-x86`, so x86 and x64 analyses are never

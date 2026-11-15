@@ -698,7 +698,8 @@ Each detour logs what its prototype makes meaningful, written by hand.
   globals (mutable globals the recording didn't capture; `__security_cookie` excepted, it's given MSVC's default),
   a write outside the stack, the recorded memory and the globals, a read of memory nobody
   recorded (except the rest of a 32-byte block that holds recorded bytes, for vectorized over-reads,
-  **[Guess]**), an interrupt or `syscall`, no return within 10M instructions, an unknown return type, nothing to
+  **[Guess]**; they read zeros, so a run that read one and then differs from the recording is inconclusive, not a
+  fail: scalar code reads them as data), an interrupt or `syscall`, no return within 10M instructions, an unknown return type, nothing to
   compare, or a pointer returned outside the recorded memory.
 - *Layout translation:* a recorded struct whose layout differs in the new build's PDB is rewritten into the new
   layout by field name, and only the fields both layouts have are compared. Since 2026-11-09 (zstd, below): a

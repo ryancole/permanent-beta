@@ -30,16 +30,19 @@
 //!
 //! Reads of uncaptured bytes in a 32-byte-aligned block that also holds captured bytes are allowed (they read
 //! zeros): vectorized string and memory code reads whole aligned blocks past the end of its data, which can't
-//! change a correct result. **[Guess]** at 32 (AVX2's width).
+//! change a correct result. **[Guess]** at 32 (AVX2's width). Scalar code can read them as data, though (a string
+//! loop past a short capture: zeros where the recorded process had characters), so a run notes the first such
+//! byte it reads ([`Ran::slack_read`]), and a result that differs after one isn't a failure (see `replay`).
 
 use crate::address::{AddressMap, Rebase, Rewritten};
 use crate::image::{Image, PAGE, page_up};
 use crate::imports::{self, CallView, StandIns};
-use icicle_vm::cpu::mem::{Mapping, perm};
+use icicle_vm::cpu::mem::{Mapping, Mmu, ReadAfterHook, perm};
 use icicle_vm::cpu::{Config, ExceptionCode, VmExit};
 use permanent_beta_model::EntryState;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::rc::Rc;
 
 /// Most instructions one case may run. **[Guess]**
 pub const MAX_INSTRUCTIONS: u64 = 10_000_000;
@@ -121,6 +124,9 @@ pub struct Ran {
     pub instructions: u64,
     /// The watched functions it entered ([`Setup::watch`]), in order of first entry.
     pub reached: Vec<u64>,
+    /// The first readable zero around the recorded memory that the function read ([`slack_ranges`]), if any: what
+    /// it read there isn't what the recorded process had.
+    pub slack_read: Option<u64>,
 }
 
 fn inside(ranges: &[Range<u64>], a: u64) -> bool {
@@ -145,21 +151,77 @@ fn place(
     Some(free)
 }
 
-fn page_ranges(regions: &[Placed]) -> Vec<Range<u64>> {
-    let mut pages: Vec<Range<u64>> = regions
-        .iter()
-        .filter(|r| !r.bytes.is_empty())
-        .map(|r| (r.address & !(PAGE - 1))..page_up(r.address + r.bytes.len() as u64))
-        .collect();
-    pages.sort_by_key(|r| r.start);
-    let mut merged: Vec<Range<u64>> = Vec::new();
-    for p in pages {
-        match merged.last_mut() {
-            Some(last) if p.start <= last.end => last.end = last.end.max(p.end),
-            _ => merged.push(p),
+fn merged(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    ranges.sort_by_key(|r| r.start);
+    let mut out: Vec<Range<u64>> = Vec::new();
+    for r in ranges {
+        match out.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => out.push(r),
         }
     }
-    merged
+    out
+}
+
+/// The readable zeros around the recorded memory: the `SLACK`-aligned blocks holding a region's bytes, less every
+/// region's bytes. Sorted, disjoint.
+fn slack_ranges(regions: &[Placed]) -> Vec<Range<u64>> {
+    let present = || regions.iter().filter(|r| !r.bytes.is_empty());
+    let blocks = merged(
+        present()
+            .map(|r| {
+                let end = r.address + r.bytes.len() as u64;
+                (r.address & !(SLACK - 1))..end.div_ceil(SLACK) * SLACK
+            })
+            .collect(),
+    );
+    let held = merged(
+        present()
+            .map(|r| r.address..r.address + r.bytes.len() as u64)
+            .collect(),
+    );
+    let mut out = Vec::new();
+    for b in blocks {
+        let mut at = b.start;
+        for h in held.iter().filter(|h| h.start < b.end && h.end > b.start) {
+            if h.start > at {
+                out.push(at..h.start);
+            }
+            at = at.max(h.end);
+        }
+        if at < b.end {
+            out.push(at..b.end);
+        }
+    }
+    out
+}
+
+/// Notes the first read that touches a slack byte.
+struct SlackReads {
+    slack: Rc<Vec<Range<u64>>>,
+    first: Rc<Cell<Option<u64>>>,
+}
+
+impl ReadAfterHook for SlackReads {
+    fn read(&mut self, _: &mut Mmu, addr: u64, value: &[u8]) {
+        if self.first.get().is_some() {
+            return;
+        }
+        let end = addr.saturating_add(value.len() as u64);
+        if let Some(s) = self.slack.iter().find(|s| s.start < end && addr < s.end) {
+            self.first.set(Some(addr.max(s.start)));
+        }
+    }
+}
+
+fn page_ranges(regions: &[Placed]) -> Vec<Range<u64>> {
+    merged(
+        regions
+            .iter()
+            .filter(|r| !r.bytes.is_empty())
+            .map(|r| (r.address & !(PAGE - 1))..page_up(r.address + r.bytes.len() as u64))
+            .collect(),
+    )
 }
 
 thread_local! {
@@ -583,6 +645,24 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
             .map_err(mem_err)?;
         }
     }
+    // A hook on each page holding slack, and only those: a hooked page is never cached, so its reads are slower.
+    // icicle calls it with the address an access starts at, so it checks the access's bytes against the slack.
+    let slack = Rc::new(slack_ranges(setup.regions));
+    let slack_read = Rc::new(Cell::new(None));
+    let mut slack_pages: Vec<u64> = slack
+        .iter()
+        .flat_map(|s| [s.start & !(PAGE - 1), (s.end - 1) & !(PAGE - 1)])
+        .collect();
+    slack_pages.sort_unstable();
+    slack_pages.dedup();
+    for p in slack_pages {
+        let hook = SlackReads {
+            slack: Rc::clone(&slack),
+            first: Rc::clone(&slack_read),
+        };
+        mem.add_read_after_hook(p, p + PAGE, Box::new(hook))
+            .ok_or("icicle couldn't add a read hook")?;
+    }
 
     // Entry state. x64: [rsp] the return trap, then the shadow space, then the recorded stack arguments. x86: [esp]
     // the return trap, then the recorded stack words.
@@ -843,6 +923,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
         image: base..base + image.size(),
         rewritten,
         reached: Vec::new(),
+        slack_read: slack_read.get(),
     })
 }
 
@@ -922,7 +1003,31 @@ fn reallocate(vm: &mut icicle_vm::Vm, old: Range<u64>, to: u64, size: u64) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::covered;
+    use super::{Placed, covered, slack_ranges};
+
+    fn placed(address: u64, len: usize) -> Placed {
+        Placed {
+            address,
+            bytes: vec![1; len],
+            unknown: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn slack_is_the_aligned_blocks_around_regions_less_their_bytes() {
+        // A 2-byte region mid-block: the rest of its 32-byte block on either side.
+        assert_eq!(
+            slack_ranges(&[placed(0x1008, 2)]),
+            vec![0x1000..0x1008, 0x100a..0x1020]
+        );
+        // Two regions sharing blocks: neither's bytes are slack; an empty region has none.
+        assert_eq!(
+            slack_ranges(&[placed(0x1000, 4), placed(0x1010, 0x14), placed(0x3000, 0)]),
+            vec![0x1004..0x1010, 0x1024..0x1040]
+        );
+        // Negative: a region filling whole blocks leaves none.
+        assert!(slack_ranges(&[placed(0x2000, 0x40)]).is_empty());
+    }
 
     #[test]
     fn imports_read_only_memory_something_put_there() {
