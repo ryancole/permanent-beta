@@ -24,11 +24,16 @@ const TWICE_FLOAT: u32 = 0x1030;
 const WIDE: u32 = 0x1040;
 /// `void copy8(void* dst, const void* src)`: memcpy(dst, src, 8) through the IAT; ret
 const COPY8: u32 = 0x1050;
+/// `int len(const char* s)`, a byte at a time: mov edx, [esp+4]; xor eax, eax; l: cmp byte [edx+eax], 0; jz d;
+/// inc eax; jmp l; d: ret
+const STRLEN: u32 = 0x1080;
 
 #[cfg(feature = "emulator")]
 const STRUCT_AT: u32 = 0x0050_0010;
 #[cfg(feature = "emulator")]
 const SRC_AT: u32 = 0x0050_1000;
+#[cfg(feature = "emulator")]
+const STR_AT: u32 = 0x0050_2008;
 
 fn text() -> Vec<u8> {
     let mut t = vec![0xcc; 0x200];
@@ -55,6 +60,13 @@ fn text() -> Vec<u8> {
     c.extend((BASE + IAT).to_le_bytes());
     c.extend([0x83, 0xc4, 0x0c, 0xc3]);
     put(COPY8, &c);
+    put(
+        STRLEN,
+        &[
+            0x8b, 0x54, 0x24, 0x04, 0x31, 0xc0, 0x80, 0x3c, 0x02, 0x00, 0x74, 0x03, 0x40, 0xeb,
+            0xf7, 0xc3,
+        ],
+    );
     t
 }
 
@@ -330,6 +342,38 @@ mod emulated {
         assert!(matches!(o, CaseOutcome::Pass { .. }), "{o:?}");
         // Negative: edx counts.
         let o = run(WIDE, &s, &case(0, &[0x1111, 0x2222], 0x1111, &[]));
+        assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
+    }
+
+    #[test]
+    fn reading_past_a_short_capture_is_never_a_failure() {
+        let s = spec(int4(), 1, Convention::Cdecl);
+        // The recorder captured 2 bytes of a 5-character string (a `wchar_t*` taken as an `array`, a string in
+        // the image): a scalar loop reads on into the zeros replay keeps around regions, and returns 2.
+        let c = with_region(case(0, &[STR_AT], 5, &[]), 0, STR_AT, b"ab", b"ab");
+        let o = run(STRLEN, &s, &c);
+        assert!(
+            matches!(&o, CaseOutcome::Inconclusive { reason }
+                if reason.contains("past the recorded memory") && reason.contains("0x50200a")),
+            "{o:?}"
+        );
+        // The whole string captured: a pass, and a recorded result it can't give is a fail (no slack read).
+        let c = with_region(
+            case(0, &[STR_AT], 5, &[]),
+            0,
+            STR_AT,
+            b"abcde\0",
+            b"abcde\0",
+        );
+        assert!(matches!(run(STRLEN, &s, &c), CaseOutcome::Pass { .. }));
+        let c = with_region(
+            case(0, &[STR_AT], 6, &[]),
+            0,
+            STR_AT,
+            b"abcde\0",
+            b"abcde\0",
+        );
+        let o = run(STRLEN, &s, &c);
         assert!(matches!(o, CaseOutcome::Fail { .. }), "{o:?}");
     }
 

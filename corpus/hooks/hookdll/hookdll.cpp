@@ -36,7 +36,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(_M_IX86)
+#pragma comment(linker, "/export:DetourFinishHelperProcess=_DetourFinishHelperProcess@16,@1,NONAME")
+#else
 #pragma comment(linker, "/export:DetourFinishHelperProcess,@1,NONAME")
+#endif
 #pragma comment(lib, "bcrypt.lib")
 
 namespace {
@@ -317,19 +321,75 @@ std::string lower(std::string s) {
 // that overlaps a redacted argument seen so far in the run. That's best effort: an import can still be handed
 // data derived from a redacted argument (a receipt formatted from a name), or a redacted value at an address no
 // redacted argument pointed to. `import_memory = false` captures no import memory at all, which is the guarantee.
+//
+// x86 (built for 32-bit, record_thunk32.asm; the spec's `abi = "win32"`): a case's abi is `win32`. Its entry's rcx
+// and rdx hold ecx and edx where the hook's `convention` passes an argument in them (`thiscall`: ecx; `fastcall`:
+// both) and zero otherwise, so leftover register values don't make identical calls look different; r8, r9 and xmm
+// are zero, and `stack` holds the hook's `stack_args` 4-byte words from esp+4. The observed rax is edx:eax, and xmm0
+// st(0) as the declared return type (`float:4` in 4 bytes, `float:8` in 8), zero for any other. Pointers in captured
+// memory are 4-byte words. An import call's entry is its first kImportStackArgs stack words (ecx and edx zero), and
+// its observed xmm0 st(0) as a double when the import left a value there.
 
-const char kRecorder[] = "permanent-beta-hookdll 0.2";
+const char kRecorder[] = "permanent-beta-hookdll 0.3";
 constexpr int kThunks = 16;
 constexpr int kMaxArgs = 16;
 // Import calls: patched import address table slots (the 256 import thunks in record_thunk.asm; zstd has 112 imports), stack arguments
-// recorded, and bytes captured behind an argument (kImportBlock) and behind a pointer inside that (kImportInner).
+// recorded (x86: words; the CRT's __stdio_common_v* functions take 6), and bytes captured behind an argument
+// (kImportBlock) and behind a pointer inside that (kImportInner).
 // [Guess]
 constexpr int kImportThunks = 256;
+#if defined(_M_IX86)
+constexpr bool kX86 = true;
+constexpr const char* kAbi = "win32";
+constexpr int kImportStackArgs = 12;
+constexpr unsigned kMaxStackArgs = 32;            // MAX_STACK_WORDS in record_thunk32.asm
+constexpr unsigned long long kFirstStackArg = 4;  // above the return address
+constexpr size_t kStackWord = 4;
+constexpr unsigned long long kUserMax = 0xffffffffull;
+#else
+constexpr bool kX86 = false;
+constexpr const char* kAbi = "win64";
 constexpr int kImportStackArgs = 8;
+constexpr unsigned kMaxStackArgs = 8;                // MAX_STACK_ARGS in record_thunk.asm
+constexpr unsigned long long kFirstStackArg = 0x28;  // above the return address and the shadow space
+constexpr size_t kStackWord = 8;
+constexpr unsigned long long kUserMax = 0x7fffffffffffull;
+#endif
+constexpr size_t kPtr = sizeof(void*);  // a pointer in captured memory
 constexpr size_t kImportBlock = 512;
 constexpr size_t kImportInner = 256;
 constexpr size_t kMaxImportCalls = 1024;  // per case; past it the case drops its import calls
 
+#if defined(_M_IX86)
+// Must match record_thunk32.asm.
+struct RecordFrame {
+    unsigned long gpr[3];         // ecx, edx, eax at entry
+    unsigned long slot;           // which thunk
+    unsigned long entry_rsp;      // [entry_rsp] is the return address
+    unsigned long rax;            // returned eax
+    unsigned long edx;            // returned edx
+    unsigned char st0_float[4];   // returned st(0) as a float, when `st0_result`
+    unsigned char st0_double[8];  // ... as a double
+    unsigned char st0_full[10];   // ... in full, loaded back for the caller
+    unsigned long pops;           // bytes of arguments the original removed
+    unsigned long st0_result;     // nonzero: the original left a value in st(0)
+    void* call;                   // the pending call (RecordCall or ImportRecord), or null when not recording it
+    void* original;
+    unsigned long esp_call;
+};
+static_assert(offsetof(RecordFrame, slot) == 0x0C, "record_thunk32.asm F_SLOT");
+static_assert(offsetof(RecordFrame, entry_rsp) == 0x10, "record_thunk32.asm F_ESP");
+static_assert(offsetof(RecordFrame, rax) == 0x14, "record_thunk32.asm F_RES_EAX");
+static_assert(offsetof(RecordFrame, edx) == 0x18, "record_thunk32.asm F_RES_EDX");
+static_assert(offsetof(RecordFrame, st0_float) == 0x1C, "record_thunk32.asm F_ST0_F");
+static_assert(offsetof(RecordFrame, st0_double) == 0x20, "record_thunk32.asm F_ST0_D");
+static_assert(offsetof(RecordFrame, st0_full) == 0x28, "record_thunk32.asm F_ST0_X");
+static_assert(offsetof(RecordFrame, pops) == 0x34, "record_thunk32.asm F_POPS");
+static_assert(offsetof(RecordFrame, st0_result) == 0x38, "record_thunk32.asm F_FLOAT");
+static_assert(offsetof(RecordFrame, call) == 0x3C, "record_thunk32.asm F_CALL");
+static_assert(offsetof(RecordFrame, original) == 0x40, "record_thunk32.asm F_ORIG");
+static_assert(sizeof(RecordFrame) == 0x48, "record_thunk32.asm FRAME_BYTES");
+#else
 // Must match record_thunk.asm.
 struct RecordFrame {
     unsigned long long gpr[4];      // rcx, rdx, r8, r9
@@ -347,6 +407,7 @@ static_assert(offsetof(RecordFrame, rax) == 0x70, "record_thunk.asm F_RAX");
 static_assert(offsetof(RecordFrame, xmm0) == 0x78, "record_thunk.asm F_XMM0");
 static_assert(offsetof(RecordFrame, call) == 0x88, "record_thunk.asm F_CALL");
 static_assert(sizeof(RecordFrame) == 0x90, "record_thunk.asm FRAME_BYTES");
+#endif
 
 // One argument of the spec (`[[hook.arg]]`).
 struct RecArg {
@@ -365,6 +426,8 @@ struct RecGlobal {
 
 struct RecHook {
     std::string name, rva;
+    std::string ret;         // the return value's type (`int:4`, `float:8`, ...)
+    std::string convention;  // x86: cdecl, stdcall, thiscall, fastcall
     unsigned stack_args = 0;
     std::vector<RecArg> args;
     std::vector<RecGlobal> globals;
@@ -378,6 +441,7 @@ struct RecPointer {
 
 struct RecSpec {
     std::string build;
+    std::string abi = "win64";
     unsigned max_cases = 32;
     bool import_memory = true;
     unsigned pointer_depth = 0;
@@ -443,6 +507,8 @@ bool parse_spec(const char* path, RecSpec& spec) {
         if (section == "top") {
             if (key == "build") {
                 spec.build = value;
+            } else if (key == "abi") {
+                spec.abi = value;
             } else if (key == "max_cases") {
                 spec.max_cases = static_cast<unsigned>(n);
             } else if (key == "import_memory") {
@@ -458,6 +524,10 @@ bool parse_spec(const char* path, RecSpec& spec) {
                 h.rva = value;
             } else if (key == "stack_args") {
                 h.stack_args = static_cast<unsigned>(n);
+            } else if (key == "ret") {
+                h.ret = value;
+            } else if (key == "convention") {
+                h.convention = value;
             }
         } else if (section == "arg") {
             RecArg& a = spec.hooks.back().args.back();
@@ -593,6 +663,21 @@ std::string sha256_hex(const std::vector<unsigned char>& data) {
     return hex_bytes(digest, sizeof digest);
 }
 
+#if defined(_M_IX86)
+// The value of an argument slot at entry (`ecx`, `edx`, `esp+0x4`): a pointer or a length, so one word.
+bool slot_value(const RecordFrame* f, const std::string& slot, unsigned long long& out) {
+    out = 0;
+    if (slot == "ecx" || slot == "edx") {
+        out = f->gpr[slot == "ecx" ? 0 : 1];
+        return true;
+    }
+    if (slot.compare(0, 4, "esp+") == 0) {
+        unsigned long long off = std::strtoull(slot.c_str() + 4, nullptr, 0);
+        return safe_copy(&out, reinterpret_cast<const void*>(f->entry_rsp + off), 4);
+    }
+    return false;
+}
+#else
 // The 64-bit value of an argument slot at entry (`rcx`, `xmm1`, `stack+0x28`).
 bool slot_value(const RecordFrame* f, const std::string& slot, unsigned long long& out) {
     static const char* const regs[] = {"rcx", "rdx", "r8", "r9"};
@@ -611,6 +696,42 @@ bool slot_value(const RecordFrame* f, const std::string& slot, unsigned long lon
         return safe_copy(&out, reinterpret_cast<const void*>(f->entry_rsp + off), 8);
     }
     return false;
+}
+#endif
+
+// What the call returned, as a recording says it: rax (x86: edx:eax), and xmm0 (x86: st(0) as `ret`, the declared
+// return type: a float in 4 bytes, a double in 8, zero for any other or when the call left nothing in st(0); for an
+// import, whose type isn't known, `ret` is "import": a double).
+unsigned long long observed_rax(const RecordFrame* f) {
+#if defined(_M_IX86)
+    return static_cast<unsigned long long>(f->edx) << 32 | f->rax;
+#else
+    return f->rax;
+#endif
+}
+
+void observed_xmm0(const RecordFrame* f, const std::string& ret, unsigned char out[16]) {
+    std::memset(out, 0, 16);
+#if defined(_M_IX86)
+    if (!f->st0_result) {
+        return;
+    }
+    if (ret == "float:4") {
+        std::memcpy(out, f->st0_float, 4);
+    } else if (ret == "float:8" || ret == "import") {
+        std::memcpy(out, f->st0_double, 8);
+    }
+#else
+    (void)ret;
+    std::memcpy(out, f->xmm0, 16);
+#endif
+}
+
+// Word i of a call's stack arguments (Win64: past the four register parameters), 0 if unreadable.
+unsigned long long stack_word(const RecordFrame* f, unsigned i) {
+    unsigned long long v = 0;
+    safe_copy(&v, reinterpret_cast<const void*>(f->entry_rsp + kFirstStackArg + kStackWord * i), kStackWord);
+    return v;
 }
 
 struct PendingRegion {
@@ -905,12 +1026,12 @@ void capture_pointees(RecordCall* call, const RecordFrame* f) {
             // Copied: add() may move the region.
             const PendingRegion from = call->regions[index];
             for (const RecPointer& field : g_pointers) {
-                if (field.layout != from.layout || field.offset + 8 > from.before.size()) {
+                if (field.layout != from.layout || field.offset + kPtr > from.before.size()) {
                     continue;
                 }
                 unsigned long long p = 0;
-                std::memcpy(&p, from.before.data() + field.offset, 8);
-                if (p < 0x10000 || p > 0x7fffffffffffull || (p >= g_image_base && p < g_image_base + g_image_size) ||
+                std::memcpy(&p, from.before.data() + field.offset, kPtr);
+                if (p < 0x10000 || p > kUserMax || (p >= g_image_base && p < g_image_base + g_image_size) ||
                     (p >= stack_low && p < f->entry_rsp) || inside(p)) {
                     continue;  // null, not a user address, the image, the recorder's own frames, or captured
                 }
@@ -1008,7 +1129,7 @@ void finish_case(RecordCall* call, const RecordFrame* f) {
     RecSite& site = *call->site;
     // Everything but the id, for spotting identical calls.
     std::string body = "\"build\":" + quoted(g_rec_build) + ",\"rva\":" + word(site.rva) + ",\"recorder\":" +
-                       quoted(kRecorder) + ",\"abi\":\"win64\",\"image_base\":" + word(g_image_base) +
+                       quoted(kRecorder) + ",\"abi\":" + quoted(kAbi) + ",\"image_base\":" + word(g_image_base) +
                        ",\"image_size\":" + word(g_image_size) +
                        ",\"entry\":{\"rcx\":" + word(call->gpr[0]) + ",\"rdx\":" + word(call->gpr[1]) +
                        ",\"r8\":" + word(call->gpr[2]) + ",\"r9\":" + word(call->gpr[3]) + ",\"xmm\":[";
@@ -1054,7 +1175,9 @@ void finish_case(RecordCall* call, const RecordFrame* f) {
     for (size_t i = 0; i < call->imports.size(); i++) {
         body += (i ? "," : "") + import_json(call->imports[i]);
     }
-    body += "],\"observed\":{\"rax\":" + word(f->rax) + ",\"xmm0\":" + quoted(hex_bytes(f->xmm0, 16)) + "}";
+    unsigned char xmm0[16];
+    observed_xmm0(f, site.hook.ret, xmm0);
+    body += "],\"observed\":{\"rax\":" + word(observed_rax(f)) + ",\"xmm0\":" + quoted(hex_bytes(xmm0, 16)) + "}";
 
     EnterCriticalSection(&g_lock);
     bool seen = false;
@@ -1093,12 +1216,17 @@ extern "C" void* pbeta_record_before(RecordFrame* f) {
     }
     auto* call = new RecordCall;
     call->site = &site;
+#if defined(_M_IX86)
+    // Only the registers the convention passes arguments in: the others hold leftovers.
+    const std::string& cc = site.hook.convention;
+    call->gpr[0] = cc == "thiscall" || cc == "fastcall" ? f->gpr[0] : 0;
+    call->gpr[1] = cc == "fastcall" ? f->gpr[1] : 0;
+#else
     std::memcpy(call->gpr, f->gpr, sizeof call->gpr);
     std::memcpy(call->xmm, f->xmm, sizeof call->xmm);
-    for (unsigned i = 0; i < site.hook.stack_args && i < 8; i++) {
-        unsigned long long v = 0;
-        safe_copy(&v, reinterpret_cast<const void*>(f->entry_rsp + 0x28 + 8 * i), 8);
-        call->stack.push_back(v);
+#endif
+    for (unsigned i = 0; i < site.hook.stack_args && i < kMaxStackArgs; i++) {
+        call->stack.push_back(stack_word(f, i));
     }
     for (const RecArg& a : site.hook.args) {
         unsigned long long address = 0;
@@ -1238,12 +1366,18 @@ extern "C" void* pbeta_import_before(RecordFrame* f) {
     }
     auto* r = new ImportRecord;
     r->name = site.name;
+#if !defined(_M_IX86)
+    // x86: the modelled imports (the CRT's) are __cdecl, every argument on the stack; ecx and edx stay zero.
     std::memcpy(r->gpr, f->gpr, sizeof r->gpr);
     std::memcpy(r->xmm, f->xmm, sizeof r->xmm);
+#endif
     for (int i = 0; i < kImportStackArgs; i++) {
-        safe_copy(&r->stack[i], reinterpret_cast<const void*>(f->entry_rsp + 0x28 + 8 * i), 8);
+        r->stack[i] = stack_word(f, static_cast<unsigned>(i));
     }
-    std::vector<unsigned long long> args(r->gpr, r->gpr + 4);
+    std::vector<unsigned long long> args;
+    if constexpr (!kX86) {
+        args.assign(r->gpr, r->gpr + 4);
+    }
     args.insert(args.end(), r->stack, r->stack + kImportStackArgs);
     for (unsigned long long a : g_import_memory ? args : std::vector<unsigned long long>()) {
         snap_add(r->memory, a, kImportBlock, true);
@@ -1251,9 +1385,9 @@ extern "C" void* pbeta_import_before(RecordFrame* f) {
     size_t outer = r->memory.size();
     for (size_t i = 0; i < outer; i++) {
         const std::vector<unsigned char> block = r->memory[i].before;
-        for (size_t off = 0; off + 8 <= block.size(); off += 8) {
+        for (size_t off = 0; off + kPtr <= block.size(); off += kPtr) {
             unsigned long long p = 0;
-            std::memcpy(&p, block.data() + off, 8);
+            std::memcpy(&p, block.data() + off, kPtr);
             snap_add(r->memory, p, kImportInner, false);
         }
     }
@@ -1268,8 +1402,8 @@ extern "C" void pbeta_import_after(RecordFrame* f) {
     if (!r) {
         return;
     }
-    r->rax = f->rax;
-    std::memcpy(r->xmm0, f->xmm0, sizeof r->xmm0);
+    r->rax = observed_rax(f);
+    observed_xmm0(f, "import", r->xmm0);
     for (Snap& s : r->memory) {
         if (s.outer) {
             s.after = readable_prefix(s.address, s.before.size());
@@ -1299,7 +1433,7 @@ extern "C" void* const pbeta_import_thunks[kImportThunks];
 void patch_imports() {
     auto base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
     const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (!dir.VirtualAddress) {
         g_imports_complete = true;
@@ -1313,10 +1447,10 @@ void patch_imports() {
             continue;  // this DLL, added to the import table by the launcher
         }
         DWORD names_rva = d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk;
-        auto names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + names_rva);
-        auto slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + d->FirstThunk);
+        auto names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + names_rva);
+        auto slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + d->FirstThunk);
         for (; names->u1.AddressOfData; names++, slots++) {
-            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal) || used == kImportThunks) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal) || used == kImportThunks) {
                 complete = false;
                 continue;
             }
@@ -1325,12 +1459,12 @@ void patch_imports() {
             site.name = dll + "!" + reinterpret_cast<const char*>(by_name->Name);
             site.real = reinterpret_cast<void*>(slots->u1.Function);
             DWORD old = 0;
-            if (!VirtualProtect(&slots->u1.Function, 8, PAGE_READWRITE, &old)) {
+            if (!VirtualProtect(&slots->u1.Function, sizeof slots->u1.Function, PAGE_READWRITE, &old)) {
                 complete = false;
                 continue;
             }
-            slots->u1.Function = reinterpret_cast<ULONGLONG>(pbeta_import_thunks[used]);
-            VirtualProtect(&slots->u1.Function, 8, old, &old);
+            slots->u1.Function = reinterpret_cast<ULONG_PTR>(pbeta_import_thunks[used]);
+            VirtualProtect(&slots->u1.Function, sizeof slots->u1.Function, old, &old);
             used++;
         }
     }
@@ -1351,6 +1485,11 @@ void record_all(const std::string& build) {
         emit("{\"event\":\"error\",\"detail\":" + quoted("record spec is for build " + spec.build) + "}");
         return;
     }
+    if (spec.abi != kAbi) {
+        emit("{\"event\":\"error\",\"detail\":" +
+             quoted("record spec is for abi " + spec.abi + ", this recorder is " + kAbi) + "}");
+        return;
+    }
     g_rec_build = build;
     g_rec_max = spec.max_cases;
     g_import_memory = spec.import_memory;
@@ -1360,7 +1499,7 @@ void record_all(const std::string& build) {
     g_image_base = reinterpret_cast<unsigned long long>(GetModuleHandleW(nullptr));
     {
         auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_image_base);
-        auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(g_image_base + dos->e_lfanew);
+        auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(g_image_base + dos->e_lfanew);
         g_image_size = nt->OptionalHeader.SizeOfImage;
     }
     CreateDirectoryA(g_rec_dir.c_str(), nullptr);

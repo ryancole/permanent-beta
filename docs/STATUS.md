@@ -4,7 +4,37 @@
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
 the hook loop.
 
-Latest work (2026-11-14, later): **x86 (32-bit PE) support** (design §13 question 2, decided: x64 and x86).
+Latest work (2026-11-14, latest): **the recorder on x86** (design §7.3), so x86 test cases can be recorded.
+- `corpus/hooks/hookdll` builds for x86 with `record_thunk32.asm` (modelled on the host's: entry stubs push N, an
+  ebp frame, 32 stack words copied, the original's pops measured and removed on return; `fxam` tells whether the
+  original left st(0), which is saved as float, double and in full and loaded back after the DLL runs, so import
+  thunks keep `sqrt`'s result too). A `win32` spec gives `win32` cases: ecx/edx only where the hook's convention
+  uses them (zero otherwise: leftovers would split identical calls), `stack_args` words from esp+4, edx:eax, st(0)
+  as the declared return type; 4-byte pointer words for pointees and import memory; 12 stack words per import
+  call. The DLL refuses a spec of the other ABI. Recorder version `permanent-beta-hookdll 0.3`.
+- `corpus/build-hooks.ps1 -Arch x86` (vcvars32, Detours `lib.X86`, `target/hooks-x86`); `Import-VsDevEnvironment
+  -Arch` in `corpus/lib/msvc.ps1`. **Not run** (corpus rule): the x86 hook loop is unverified, and `expected.toml`
+  was measured on x64.
+- Checked by hand, outside the corpus: the hook host's test app (`harness/host/test/hosttest.cpp`, /MD) built
+  x86 /O2 and /Od, recorded with a `pbeta harness-spec` spec under the DLL (output identical to a plain run), every
+  hook's cases replayed on the same binary: `add3`, `store`, `fib` pass; `sum12`, `mix`, `scalef`, `area`
+  (stdcall), `fsum` (fastcall) replay identically (inconclusive: constant results); `Box_get` (thiscall) and /Od
+  `count_chars` (unmodelled `wcslen`) inconclusive. Negatives: `mix` on `scalef` and `sum12` on `add3` fail,
+  `add3` on `fsum` inconclusive (unbalanced stack). x64 DLL builds and behaves as before on the same check.
+- **Found and fixed (replay), a false failure:** x86 /O2 `count_chars` failed replay on its own function. `wcslen`
+  is inlined, its argument points to a string literal in the old image, captured as `array` (2 bytes, not a heap
+  block), and the scalar loop read on into the 32-byte zeroed slack replay maps around regions for vectorized
+  over-reads: 1 character instead of 5 (x64 doesn't hit it only because `wcslen` stays an import there). Replay now
+  hooks reads of the pages holding slack and notes the first slack byte the function reads (`Ran::slack_read`);
+  a case that then differs from the recording is inconclusive, naming the address. A run that reads slack and
+  matches still passes, as before (vectorized over-reads). Tests: the slack ranges (with a negative: a region
+  filling whole blocks has none), and an x86 byte-at-a-time strlen past a 2-byte capture → inconclusive, with
+  negatives: the whole string captured and a wrong recorded length still fails. The repro is now inconclusive,
+  the hand-run negatives still fail. Fixture scorecards unchanged (0 wrong, every flag set at its `min_correct`;
+  they don't run replay). x64 hook loop with `-Replay` (also the rebuilt recorder): passed, unchanged (22 of 24
+  resolved hooks replay, all matching; the negative controls fail replay; redaction holds).
+
+Before that (2026-11-14, later): **x86 (32-bit PE) support** (design §13 question 2, decided: x64 and x86).
 - **Analysis:** PE32 images (`machine: x86`, features version `native-4-x86`, so x86 and x64 analyses are never
   compared; x64 output is byte-identical to before, checked on five corpus builds). No `.pdata`, so every boundary
   comes from discovery. Absolute operands count where x64's RIP-relative ones do (`call [__imp_f]`, `push offset s`,
@@ -27,8 +57,7 @@ Latest work (2026-11-14, later): **x86 (32-bit PE) support** (design §13 questi
 - **Hook host:** `build.ps1 -Arch x86` (`target/host-x86`, `host_thunk32.asm`: copies 32 stack words, measures what
   the original removed, keeps st(0) off the x87 stack while C++ runs). `test.ps1 -Arch x86` passes every check,
   with `__stdcall`, `__fastcall` and `__thiscall` hooks added; x64 unchanged. Both run in CI.
-- **Not done:** the recorder (`corpus/hooks/hookdll`) is still x64-only, so x86 cases can't be recorded yet, and the
-  corpus has no x86 variants: no x86 scorecards were run.
+- **Not done:** the corpus has no x86 variants: no x86 scorecards were run. (The recorder: above.)
 
 Before that (2026-11-14): **M7, the IDA plugin's markup carry-forward** (design §11.4).
 - `pbeta mappings --old --new [--store] [--markup] [--json]` lists a build pair's accepted function mappings: the

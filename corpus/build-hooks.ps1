@@ -36,12 +36,18 @@
   replayed on its new RVA (`pbeta replay`: a correct candidate must never fail), and the negative control's swapped
   hooks must fail replay. Builds pbeta with the `emulator` feature (icicle; nothing to install besides cargo).
 
-  Requires Visual Studio (or Build Tools) with the x64 C++ toolset, git (first run), and cargo.
+  -Arch x86 builds and runs everything 32-bit (vcvars32, Detours' X86 library, record_thunk32.asm) into
+  target/hooks-x86; pbeta itself stays a 64-bit build. The recorder then writes `win32` cases. expected.toml's
+  outcomes were measured on x64 builds.
+
+  Requires Visual Studio (or Build Tools) with the x64 (and for -Arch x86, x86) C++ toolset, git (first run), and
+  cargo.
 
 .EXAMPLE
   pwsh corpus/build-hooks.ps1 -Run
   pwsh corpus/build-hooks.ps1 -Flags o2 -Run
   pwsh corpus/build-hooks.ps1 -Run -Replay
+  pwsh corpus/build-hooks.ps1 -Arch x86 -Run -Replay
 #>
 [CmdletBinding()]
 param(
@@ -50,14 +56,17 @@ param(
     [switch] $Replay,
     # With -Run: use what's already built (Detours, the hook DLL and launcher, the apps, pbeta), as corpus/verify.ps1
     # does after building them once, so parallel jobs never rebuild a file another one is using.
-    [switch] $NoBuild
+    [switch] $NoBuild,
+    [ValidateSet('x64', 'x86')] [string] $Arch = 'x64'
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib/msvc.ps1')
 $repo = Split-Path -Parent $PSScriptRoot
 $hooksDir = Join-Path $PSScriptRoot 'hooks'
-$outRoot = Join-Path $repo 'target/hooks'
+$x86 = $Arch -eq 'x86'
+$outRoot = Join-Path $repo $(if ($x86) { 'target/hooks-x86' } else { 'target/hooks' })
+$detoursArch = if ($x86) { 'X86' } else { 'X64' }
 $detoursDir = Join-Path $repo 'target/hooks-src/Detours'
 $versions = 'v1', 'v2', 'v3'
 
@@ -73,12 +82,12 @@ function Build-Detours {
         Invoke-Native 'git' @('-C', $detoursDir, 'fetch', '--quiet', '--depth', '1', $detoursRepo, $detoursCommit)
         Invoke-Native 'git' @('-C', $detoursDir, '-c', 'advice.detachedHead=false', 'checkout', '--quiet', 'FETCH_HEAD')
     }
-    $lib = Join-Path $detoursDir 'lib.X64/detours.lib'
+    $lib = Join-Path $detoursDir "lib.$detoursArch/detours.lib"
     if (-not (Test-Path $lib)) {
-        Write-Host 'building Detours (x64)'
+        Write-Host "building Detours ($Arch)"
         Push-Location (Join-Path $detoursDir 'src')
         try {
-            $env:DETOURS_TARGET_PROCESSOR = 'X64'
+            $env:DETOURS_TARGET_PROCESSOR = $detoursArch
             Invoke-Native 'nmake' @('/nologo')
         } finally { Pop-Location }
     }
@@ -89,12 +98,18 @@ function Build-Harness {
     $bin = Join-Path $outRoot 'bin'
     New-Item -ItemType Directory -Force $bin | Out-Null
     $inc = "/I$(Join-Path $detoursDir 'include')"
-    $lib = Join-Path $detoursDir 'lib.X64/detours.lib'
+    $lib = Join-Path $detoursDir "lib.$detoursArch/detours.lib"
     $cl = @('/nologo', '/MD', '/O2', '/EHsc', '/W4', '/WX', '/std:c++17', '/Zi', '/D_CRT_SECURE_NO_WARNINGS', $inc)
     Write-Host 'building hookdll.dll and launcher.exe'
     # The record mode's register-capturing thunk (design §7.3).
-    Invoke-Native 'ml64.exe' @('/nologo', '/c', '/W3', '/WX', '/Zi', "/Fo$bin\record_thunk.obj",
-        (Join-Path $hooksDir 'hookdll/record_thunk.asm'))
+    if ($x86) {
+        # /safeseh: the thunk registers no exception handlers, so the DLL can keep /SAFESEH.
+        Invoke-Native 'ml.exe' @('/nologo', '/c', '/W3', '/WX', '/Zi', '/safeseh', "/Fo$bin\record_thunk.obj",
+            (Join-Path $hooksDir 'hookdll/record_thunk32.asm'))
+    } else {
+        Invoke-Native 'ml64.exe' @('/nologo', '/c', '/W3', '/WX', '/Zi', "/Fo$bin\record_thunk.obj",
+            (Join-Path $hooksDir 'hookdll/record_thunk.asm'))
+    }
     Invoke-Native 'cl.exe' ($cl + @('/LD', (Join-Path $hooksDir 'hookdll/hookdll.cpp'), "$bin\record_thunk.obj", "/Fo$bin\",
             "/Fd$bin\hookdll-cl.pdb", "/Fe$bin\hookdll.dll", '/link', $lib, "/PDB:$bin\hookdll.pdb"))
     Invoke-Native 'cl.exe' ($cl + @((Join-Path $hooksDir 'launcher/launcher.cpp'), "/Fo$bin\", "/Fd$bin\launcher-cl.pdb",
@@ -358,7 +373,7 @@ function Invoke-Loop([string] $flagName) {
     }
 }
 
-Import-VsDevEnvironment
+Import-VsDevEnvironment -Arch $Arch
 $flagNames = if ($Flags) { $Flags } else { @('o2', 'od') }
 if (-not ($NoBuild -and $Run)) {
     Build-Detours
