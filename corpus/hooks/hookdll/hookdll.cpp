@@ -1473,6 +1473,25 @@ void patch_imports() {
          (complete ? "true" : "false") + "}");
 }
 
+// Attaches one detour in a transaction of its own. Retried on ERROR_NOT_ENOUGH_MEMORY: with a 32-bit image below
+// 0x80000 (ASLR puts small ones as low as 0x50000), Detours looks for trampoline memory from the target up,
+// allocates a 64 KiB region below its own 0x80000 floor and rejects it. That region stays allocated, so the next
+// try skips it, and there are at most seven of them (from 0x10000) below 0x80000.
+LONG attach_detour(PVOID* target, PVOID detour) {
+    LONG err = ERROR_NOT_ENOUGH_MEMORY;
+    for (int i = 0; i < 8 && err == ERROR_NOT_ENOUGH_MEMORY; i++) {
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        err = DetourAttach(target, detour);
+        if (err == NO_ERROR) {
+            err = DetourTransactionCommit();
+        } else {
+            DetourTransactionAbort();
+        }
+    }
+    return err;
+}
+
 void record_all(const std::string& build) {
     emit("{\"event\":\"start\",\"build\":" + quoted(build) + "}");
     RecSpec spec;
@@ -1520,14 +1539,7 @@ void record_all(const std::string& build) {
         site.real = reinterpret_cast<unsigned char*>(g_image_base) + site.rva;
         CreateDirectoryA((g_rec_dir + "\\cases\\" + h.name).c_str(), nullptr);
 
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-        LONG err = DetourAttach(&site.real, reinterpret_cast<PVOID>(g_thunks[used]));
-        if (err == NO_ERROR) {
-            err = DetourTransactionCommit();
-        } else {
-            DetourTransactionAbort();
-        }
+        LONG err = attach_detour(&site.real, reinterpret_cast<PVOID>(g_thunks[used]));
         emit("{\"event\":\"attach\",\"hook\":" + quoted(h.name) + ",\"rva\":\"" + hex(site.rva) + "\",\"status\":" +
              quoted(err == NO_ERROR ? "ok" : "error " + num(err)) + "}");
         used++;
@@ -1574,14 +1586,7 @@ void attach_all() {
         d->site->rva = rva;
         *d->real = base + rva;
 
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-        LONG err = DetourAttach(d->real, d->detour);
-        if (err == NO_ERROR) {
-            err = DetourTransactionCommit();
-        } else {
-            DetourTransactionAbort();
-        }
+        LONG err = attach_detour(d->real, d->detour);
         emit("{\"event\":\"attach\",\"hook\":" + quoted(h.name) + ",\"rva\":\"" + hex(rva) + "\",\"status\":" +
              quoted(err == NO_ERROR ? "ok" : "error " + num(err)) + "}");
     }

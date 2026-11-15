@@ -37,8 +37,8 @@
   hooks must fail replay. Builds pbeta with the `emulator` feature (icicle; nothing to install besides cargo).
 
   -Arch x86 builds and runs everything 32-bit (vcvars32, Detours' X86 library, record_thunk32.asm) into
-  target/hooks-x86; pbeta itself stays a 64-bit build. The recorder then writes `win32` cases. expected.toml's
-  outcomes were measured on x64 builds.
+  target/hooks-x86; pbeta itself stays a 64-bit build. The recorder then writes `win32` cases. Its steps' baselines
+  in expected.toml are those with flags `x86-<flags>`.
 
   Requires Visual Studio (or Build Tools) with the x64 (and for -Arch x86, x86) C++ toolset, git (first run), and
   cargo.
@@ -264,7 +264,7 @@ function Invoke-Loop([string] $flagName) {
         $keyArgs = @('hook-check', '--old-map', "$dir\$old\app.map", '--new-map', "$dir\$new\app.map",
             '--old-hooks', "$dir\$old\hooks.toml", '--new-hooks', "$dir\$new\hooks.toml",
             '--old-analysis', "$dir\$old\analysis.json", '--new-analysis', "$dir\$new\analysis.json",
-            '--new-binary', "$dir\$new\app.exe", '--expected', $expected, '--flags', $flagName, '--step', $step)
+            '--new-binary', "$dir\$new\app.exe", '--expected', $expected, '--flags', $(if ($x86) { "x86-$flagName" } else { $flagName }), '--step', $step)
         foreach ($e in $earlier) { $keyArgs += @('--earlier-map', "$dir\$e\app.map", '--earlier-analysis', "$dir\$e\analysis.json") }
         $truth = Invoke-Allowing $corpus $keyArgs @(0, 1)
         if ($truth -ne 0) { $script:failures += "$step answer-key check" }
@@ -289,7 +289,8 @@ function Invoke-Loop([string] $flagName) {
             foreach ($p in @($r.proposals)) {
                 if (-not $p) { continue }
                 $shimCpp = "$dir\$new\shim-$($r.hook)-$($p.candidate).cpp"
-                Set-Content $shimCpp ("#include <cstdint>`n" + (Get-ShimStub $r.hook $dir $old) + "`n" + $p.shim)
+                # The app's struct the prototypes use (order_add, ship_order, format_receipt), declared.
+                Set-Content $shimCpp ("#include <cstdint>`nstruct Order;`n" + (Get-ShimStub $r.hook $dir $old) + "`n" + $p.shim)
                 & cl.exe /nologo /Zs /std:c++17 /W4 /WX /wd4505 $shimCpp | Out-Host
                 if ($LASTEXITCODE -ne 0) { $script:failures += "$step $($r.hook): proposed shim doesn't compile ($shimCpp)" }
             }
@@ -302,14 +303,20 @@ function Invoke-Loop([string] $flagName) {
         }
 
         # f. Recorded cases replayed on every resolved hook (all correct, per the answer key): none may fail. With
-        #    the old analysis, replay knows which functions changed and names the callee a difference may be due to.
+        #    the old analysis, replay knows which functions changed and names the callee a difference may be due to,
+        #    and takes only that build's cases: the analysis of the build the hook's old RVA is in (`from_build`
+        #    when repair took the hook from an earlier build).
         $replayed = @{}
         if ($Replay) {
+            $versionOf = @{}
+            foreach ($o in $older) { $versionOf[(Get-Content "$dir\$o\analysis.json" -Raw | ConvertFrom-Json).build.id] = $o }
             foreach ($r in $repairJson.repairs) {
                 $to = switch ($r.action.action) { 'relocated' { $r.action.new } 'unchanged' { $r.action.rva } default { $null } }
                 if (-not $to) { continue }
+                $from = if ($r.from_build) { $versionOf[$r.from_build] } else { $old }
+                if (-not $from) { throw "$step $($r.hook): repaired from build $($r.from_build), which isn't one of $($older -join ', ')" }
                 $j = & $pbeta (@('replay', '--binary', "$dir\$new\app.exe", '--old-rva', $r.old, '--new-rva', $to,
-                    '--new-analysis', "$dir\$new\analysis-pdb.json", '--old-analysis', "$dir\$old\analysis-pdb.json",
+                    '--new-analysis', "$dir\$new\analysis-pdb.json", '--old-analysis', "$dir\$from\analysis-pdb.json",
                     '--json') + $cases) | ConvertFrom-Json
                 $pass = @($j.cases | Where-Object outcome -eq 'pass').Count
                 $replayed[$r.hook] = "$($j.outcome) ($pass/$(@($j.cases).Count))"

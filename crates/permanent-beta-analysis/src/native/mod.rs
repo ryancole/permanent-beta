@@ -36,12 +36,19 @@ use std::path::Path;
 /// (they were missed, or taken into the function before them).
 pub const FEATURES_VERSION: &str = "native-4";
 
-/// The features version an image's analysis records: [`FEATURES_VERSION`] for x64, with `-x86` appended for x86.
-/// x86 code is normalized differently (absolute operands, stack arguments), so an x86 analysis is never compared
-/// with an x64 one: matching them fails on the features version, with both named.
+/// Bumped on a change to what a code feature covers for x86 code only, so x64 analyses stay comparable.
+///
+/// 2: inferred arguments: a prologue `push ecx` (room for a local) isn't a `this`, and stack arguments read after
+/// a call count (through `ebp`, or `esp` after a `__cdecl` call's cleanup).
+pub const X86_FEATURES_REVISION: u32 = 2;
+
+/// The features version an image's analysis records: [`FEATURES_VERSION`] for x64; for x86 with `-x86` and
+/// [`X86_FEATURES_REVISION`] appended. x86 code is normalized differently (absolute operands, stack arguments), so
+/// an x86 analysis is never compared with an x64 one: matching them fails on the features version, with both
+/// named.
 pub fn features_version(x86: bool) -> String {
     if x86 {
-        format!("{FEATURES_VERSION}-x86")
+        format!("{FEATURES_VERSION}-x86.{X86_FEATURES_REVISION}")
     } else {
         FEATURES_VERSION.to_owned()
     }

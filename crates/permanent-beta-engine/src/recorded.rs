@@ -128,12 +128,8 @@ impl RecordedCasesRunner {
     /// Replays every case recorded at `old_rva` (in `old_build`, or in any build when `None`) on `new_rva`.
     pub fn judge(&self, old_build: Option<&BuildId>, old_rva: Rva, new_rva: Rva) -> Judgement {
         let mut cases = Vec::new();
-        for rec in self
-            .recordings
-            .iter()
-            .filter(|r| old_build.is_none_or(|b| &r.spec.build == b))
-        {
-            for c in rec.cases.iter().filter(|c| c.case.rva == old_rva) {
+        for (rec, c) in cases_at(&self.recordings, old_build, old_rva) {
+            {
                 let ret = rec
                     .spec
                     .hook(&c.case.hook)
@@ -425,6 +421,24 @@ impl BehavioralRunner for RecordedCasesRunner {
     }
 }
 
+/// The cases recorded at `old_rva` in a recording of `old_build` (any build when `None`), with their recording.
+/// The same RVA in another build is usually another function.
+fn cases_at<'a>(
+    recordings: &'a [Recording],
+    old_build: Option<&'a BuildId>,
+    old_rva: Rva,
+) -> impl Iterator<Item = (&'a Recording, &'a LoadedCase)> + 'a {
+    recordings
+        .iter()
+        .filter(move |r| old_build.is_none_or(|b| &r.spec.build == b))
+        .flat_map(move |r| {
+            r.cases
+                .iter()
+                .filter(move |c| c.case.rva == old_rva)
+                .map(move |c| (r, c))
+        })
+}
+
 fn short(id: &BuildId) -> &str {
     id.0.get(..12).unwrap_or(&id.0)
 }
@@ -452,6 +466,57 @@ mod tests {
             },
             ..result(id, pass())
         }
+    }
+
+    /// A recording of `build` with one case per `(test id, rva)`.
+    fn recording(build: &str, cases: &[(&str, u64)]) -> Recording {
+        let zero = "0".repeat(32);
+        let spec = serde_json::from_value(serde_json::json!({ "build": build, "max_cases": 8 }))
+            .expect("a minimal spec");
+        let cases = cases
+            .iter()
+            .map(|&(id, rva)| LoadedCase {
+                case: serde_json::from_value(serde_json::json!({
+                    "test_id": id, "hook": "f", "build": build, "rva": format!("{rva:#x}"),
+                    "recorder": "test", "abi": "win32", "image_base": "0x400000",
+                    "entry": { "rcx": "0x0", "rdx": "0x0", "r8": "0x0", "r9": "0x0",
+                               "xmm": [zero, zero, zero, zero], "stack": [] },
+                    "regions": [], "globals": [], "imports": [],
+                    "observed": { "rax": "0x0", "xmm0": zero },
+                }))
+                .expect("a minimal case"),
+                regions: Vec::new(),
+                globals: Vec::new(),
+                imports: Vec::new(),
+            })
+            .collect();
+        Recording {
+            dir: "rec".into(),
+            spec,
+            cases,
+        }
+    }
+
+    #[test]
+    fn cases_are_those_of_the_old_build_at_the_old_rva() {
+        let recs = [
+            recording(
+                "v1",
+                &[("apply_discount-0001", 0x1030), ("v1-other", 0x1050)],
+            ),
+            recording("v2", &[("price_lookup-0001", 0x1030)]),
+        ];
+        let ids = |build: Option<&str>| {
+            let b = build.map(|b| BuildId(b.into()));
+            cases_at(&recs, b.as_ref(), Rva(0x1030))
+                .map(|(_, c)| c.case.test_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(Some("v2")), ["price_lookup-0001"]);
+        // Negative: v1's function at that RVA is another one; without a build, both builds' cases are taken.
+        assert_eq!(ids(Some("v1")), ["apply_discount-0001"]);
+        assert_eq!(ids(None), ["apply_discount-0001", "price_lookup-0001"]);
+        assert!(ids(Some("v3")).is_empty());
     }
 
     #[test]
