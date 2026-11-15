@@ -2,10 +2,10 @@
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
 (repair loop) is done**, recording harness included. 0 wrong matches on every x64 corpus variant, 0 wrong relocations in
-the hook loop (x64 and x86). **0 wrong matches on every x86 corpus variant too, all 68 gated** (below; branch
-`x86-corpus`, not merged).
+the hook loop (x64 and x86). **0 wrong matches on every x86 corpus variant too, all 68 gated** (below; merged in
+PR #4).
 
-**Done, not merged (2026-11-15, branch `x86-corpus`): the x86 corpus.** The x86 hook loop
+**Done (2026-11-15, merged in PR #4): the x86 corpus.** The x86 hook loop
 (`corpus/build-hooks.ps1 -Arch x86 -Run -Replay`) passes after every change below: 0 wrong relocations, every trace
 identical, the negative control caught by the answer key and replay, 20 of 22 resolved hooks replayed (unchanged).
 The x64 hook loop passes too (0 wrong relocations, negative control caught, 22 of 24 resolved hooks replayed, unchanged).

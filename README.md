@@ -27,17 +27,19 @@ Windows PE binaries, x64 and x86 (32-bit), built with MSVC. Free and open source
 ## Status
 
 Working end to end, measured on real projects: zlib, Lua, zstd, TinyXML-2, yaml-cpp and JsonCpp across release
-tags and optimization settings (`/O2`, `/Od`, identical-code folding, `/LTCG`, PGO), with **zero wrong matches**
-(see [docs/STATUS.md](docs/STATUS.md)). Debug builds with incremental linking are supported.
+tags and optimization settings (`/O2`, `/Od`, identical-code folding, `/LTCG`, PGO), built for both x64 and x86,
+with **zero wrong matches** on all 136 variants (68 per architecture, each gated; see
+[docs/STATUS.md](docs/STATUS.md)). The hook-repair loop has zero wrong relocations on both architectures. Debug
+builds with incremental linking are supported.
 
 | Part | State |
 |---|---|
-| Analysis of PE x64 and x86 binaries, with or without a PDB | Built (x86: corpus scorecards not yet built) |
+| Analysis of PE x64 and x86 binaries, with or without a PDB | Built; corpus-scored on both |
 | Matching (names, code hashes, strings, call graph, vtables, similarity) and verification | Built |
 | Hook repair, review queue, AOB patterns, offsets header | Built |
 | Prototype and struct-layout change proposals | Built (exact with PDBs; inferred without) |
-| Behavioral checks: trace diff, and replay of recorded calls by emulation | Built (recording via the corpus harness) |
-| Hook host: one DLL that runs your hooks in any build | Built ([harness/host](harness/host/README.md)) |
+| Behavioral checks: trace diff, and replay of recorded calls by emulation | Built, x64 and x86 (recording via the corpus harness) |
+| Hook host: one DLL that runs your hooks in any build | Built, x64 and x86 ([harness/host](harness/host/README.md)) |
 | AI proposer for unmatched functions (Claude, opt-in) | Built |
 | MCP server for agents (read, explain, propose; never accept) | Built (`pbeta-mcp`) |
 | Ghidra: headless exporter and review UI | Built ([integrations/ghidra](integrations/ghidra/README.md)) |
@@ -55,7 +57,9 @@ pwsh harness/host/build.ps1
 ```
 
 That gives `target/release/pbeta.exe` and `target/host/` (`pbeta-host.dll`, `pbeta-launch.exe`,
-`include/pbeta_handler.h`). Replay by emulation is optional: add `--features permanent-beta-replay/emulator`.
+`include/pbeta_handler.h`). For 32-bit programs, `pwsh harness/host/build.ps1 -Arch x86` builds the same into
+`target/host-x86`; one `pbeta` handles both. Replay by emulation is optional: add
+`--features permanent-beta-replay/emulator`.
 
 ## Walkthrough
 
@@ -206,13 +210,15 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 pwsh harness/host/test.ps1
+pwsh harness/host/test.ps1 -Arch x86
 ```
 
-CI runs the first three on Windows and Linux on every push. The corpus (building and scoring real projects across
-versions) takes a long time and runs only on demand: Actions → ci → Run workflow with "corpus" ticked, or locally
-`pwsh corpus/build-fixtures.ps1 -Score`, `pwsh corpus/build-projects.ps1 -Score` and
-`pwsh corpus/build-hooks.ps1 -Run`. Any change to analysis, matching or verification needs tests with a negative
-case, and must keep wrong matches at zero.
+CI runs the first three on Windows and Linux on every push, and the hook host test for both architectures. The
+corpus (building and scoring real projects across versions) takes a long time and runs only on demand: Actions → ci
+→ Run workflow with "corpus" ticked, or locally `pwsh corpus/build-fixtures.ps1 -Score`,
+`pwsh corpus/build-projects.ps1 -Score` and `pwsh corpus/build-hooks.ps1 -Run` (add `-Arch x86` to each for the
+32-bit variants). Any change to analysis, matching or verification needs tests with a negative case, and must keep
+wrong matches at zero on both architectures.
 
 This codebase is written by AI agents and reviewed by the owner; [CLAUDE.md](CLAUDE.md) has the rules they follow.
 Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
