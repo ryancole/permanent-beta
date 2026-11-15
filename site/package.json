@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "description": "Builds the project page's stylesheet. See .github/workflows/pages.yml.",
+  "scripts": {
+    "build": "tailwindcss -i tailwind.css -o dist/style.css --minify"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.3.4",
+    "tailwindcss": "4.3.4"
+  }
+}

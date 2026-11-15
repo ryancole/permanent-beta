@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Permanent Beta</title>
+<meta name="description" content="Keep function hooks working when the program they hook is rebuilt or updated. Free and open source, for Windows PE x64 and x86.">
+<link rel="icon" href="banner.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-paper font-sans text-[17px]/relaxed text-ink antialiased dark:bg-night dark:text-night-ink">
+
+<header class="border-b border-rule py-14 text-center dark:border-night-rule">
+  <div class="mx-auto max-w-3xl px-4">
+    <h1 class="sr-only">Permanent Beta</h1>
+    <img src="banner.svg" alt="permanent beta" width="420" height="140" class="mx-auto h-auto w-full max-w-[420px]">
+    <p class="mt-6 mb-2 text-[1.35rem]/snug font-semibold">
+      Keep function hooks working when the program they hook is rebuilt or updated.
+    </p>
+    <p class="mb-7 text-ink/70 dark:text-night-ink/70">
+      For Windows PE binaries, x64 and x86, built with MSVC. Free and open source (Apache-2.0).
+    </p>
+    <div class="flex flex-wrap justify-center gap-3">
+      <a href="https://github.com/ryancole/permanent-beta"
+         class="rounded-md border-2 border-stamp bg-stamp px-5 py-2.5 font-semibold text-paper hover:opacity-90 dark:border-night-stamp dark:bg-night-stamp dark:text-night">
+        View on GitHub
+      </a>
+      <a href="https://github.com/ryancole/permanent-beta/wiki"
+         class="rounded-md border-2 border-stamp px-5 py-2.5 font-semibold text-stamp hover:bg-stamp/5 dark:border-night-stamp dark:text-night-stamp dark:hover:bg-night-stamp/10">
+        Read the wiki
+      </a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="border-b border-rule py-10 dark:border-night-rule">
+    <div class="mx-auto max-w-3xl px-4">
+      <h2 class="section-label">What it does</h2>
+      <p class="mb-3.5">
+        A hook (Microsoft Detours, MinHook, …) patches a function at an address in one specific build. When the
+        program is rebuilt, every address moves and the hooks break, and normally someone re-finds each function by
+        hand in a disassembler.
+      </p>
+      <p class="mb-3.5">
+        <code class="inline-code">pbeta</code> does that part. It finds each hooked function in the new build,
+        verifies it's the same function, and rewrites your hook list with the new addresses. Anything it isn't sure
+        about goes to a review queue instead of being guessed. A generic hook DLL, the <strong>hook host</strong>,
+        then attaches your hooks in whichever build is running, so you don't write hook plumbing or hard-code
+        addresses.
+      </p>
+
+      <ol class="mt-5 grid gap-3">
+        <li class="card relative py-3.5 pr-4 pl-14">
+          <span class="absolute top-3.5 left-4 flex size-[26px] items-center justify-center rounded border-2 border-stamp text-sm font-bold text-stamp dark:border-night-stamp dark:text-night-stamp">1</span>
+          <strong class="block">Analyze</strong> the old and new builds, with PDBs if you have them.
+        </li>
+        <li class="card relative py-3.5 pr-4 pl-14">
+          <span class="absolute top-3.5 left-4 flex size-[26px] items-center justify-center rounded border-2 border-stamp text-sm font-bold text-stamp dark:border-night-stamp dark:text-night-stamp">2</span>
+          <strong class="block">Repair</strong> your hook manifest: each hook is unchanged, relocated, or sent to review.
+        </li>
+        <li class="card relative py-3.5 pr-4 pl-14">
+          <span class="absolute top-3.5 left-4 flex size-[26px] items-center justify-center rounded border-2 border-stamp text-sm font-bold text-stamp dark:border-night-stamp dark:text-night-stamp">3</span>
+          <strong class="block">Run</strong> the program through the hook host, which attaches only hooks verified for that build.
+        </li>
+      </ol>
+
+      <h3 class="mt-7 mb-2 text-[1.05rem] font-semibold">Principles</h3>
+      <ul class="list-disc space-y-1.5 pl-5">
+        <li><strong>Wrong is worse than unknown.</strong> A hook is never patched at a guessed address.</li>
+        <li><strong>Matching proposes, verification judges.</strong> Every candidate passes the same independent checks.</li>
+        <li><strong>Evidence is kept.</strong> Mappings and review decisions are stored with their evidence.</li>
+        <li><strong>Local by default.</strong> Nothing leaves the machine unless you opt in.</li>
+      </ul>
+      <p class="mt-3.5">
+        Tested on six open-source projects across release tags and optimization settings, for both x64 and x86, with
+        zero wrong matches on all 136 variants.
+      </p>
+    </div>
+  </section>
+
+  <section class="border-b border-rule py-10 dark:border-night-rule">
+    <div class="mx-auto max-w-3xl px-4">
+      <h2 class="section-label">Getting started</h2>
+      <p class="mb-3.5">
+        You need the stable Rust toolchain (<a class="link" href="https://rustup.rs">rustup.rs</a>). The hook host
+        also needs Visual Studio's C++ toolset and git.
+      </p>
+      <pre class="code-block"><code>git clone https://github.com/ryancole/permanent-beta
+cd permanent-beta
+cargo build --release
+pwsh harness/host/build.ps1</code></pre>
+
+      <h3 class="mt-7 mb-2 text-[1.05rem] font-semibold">Try the demo</h3>
+      <p class="mb-3.5">Two hand-written analyses and a manifest whose four hooks each show one outcome:</p>
+      <pre class="code-block"><code>cargo run -p permanent-beta-cli -- repair --old examples/demo/v1.json --new examples/demo/v2.json --hooks examples/demo/hooks.toml --out target/hooks.v2.toml --store target/demo-store.json
+cargo run -p permanent-beta-cli -- review list --store target/demo-store.json</code></pre>
+
+      <h3 class="mt-7 mb-2 text-[1.05rem] font-semibold">Use it on your own program</h3>
+      <p class="mb-3.5">
+        Take two builds of a program you have the right to instrument: <code class="inline-code">old\app.exe</code>,
+        the one your hooks were written for, and <code class="inline-code">new\app.exe</code>. Describe your hooks in
+        <code class="inline-code">hooks.toml</code>, then:
+      </p>
+      <pre class="code-block"><code>pbeta analyze old\app.exe --pdb old\app.pdb --out old.json
+pbeta analyze new\app.exe --pdb new\app.pdb --out new.json
+pbeta bind --hooks hooks.toml --binary old\app.exe
+pbeta repair --old old.json --new new.json --hooks hooks.toml --new-binary new\app.exe --out hooks.new.toml --store store.json
+pbeta host-config --hooks hooks.toml --hooks hooks.new.toml --analysis old.json --analysis new.json --out pbeta-host.toml
+pbeta-launch pbeta-host.toml new\app.exe</code></pre>
+      <p>
+        The <a class="link" href="https://github.com/ryancole/permanent-beta/wiki/Quick-Start">Quick Start</a> covers
+        each step, and the <a class="link" href="https://github.com/ryancole/permanent-beta/wiki/Hook-Manifest">Hook
+        Manifest</a> page shows how to write <code class="inline-code">hooks.toml</code>.
+      </p>
+    </div>
+  </section>
+
+  <section class="border-b border-rule py-10 dark:border-night-rule">
+    <div class="mx-auto max-w-3xl px-4">
+      <h2 class="section-label">Links</h2>
+      <div class="grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-3">
+        <a class="card block px-3.5 py-3 hover:border-stamp dark:hover:border-night-stamp" href="https://github.com/ryancole/permanent-beta">
+          <span class="block font-semibold text-stamp dark:text-night-stamp">Repository</span>
+          <span class="text-sm text-ink/70 dark:text-night-ink/70">Source, README and issues</span>
+        </a>
+        <a class="card block px-3.5 py-3 hover:border-stamp dark:hover:border-night-stamp" href="https://github.com/ryancole/permanent-beta/wiki">
+          <span class="block font-semibold text-stamp dark:text-night-stamp">Wiki</span>
+          <span class="text-sm text-ink/70 dark:text-night-ink/70">Guides and reference</span>
+        </a>
+        <a class="card block px-3.5 py-3 hover:border-stamp dark:hover:border-night-stamp" href="https://github.com/ryancole/permanent-beta/wiki/Installation">
+          <span class="block font-semibold text-stamp dark:text-night-stamp">Installation</span>
+          <span class="text-sm text-ink/70 dark:text-night-ink/70">Build requirements and setup</span>
+        </a>
+        <a class="card block px-3.5 py-3 hover:border-stamp dark:hover:border-night-stamp" href="https://github.com/ryancole/permanent-beta/wiki/CLI-Reference">
+          <span class="block font-semibold text-stamp dark:text-night-stamp">CLI reference</span>
+          <span class="text-sm text-ink/70 dark:text-night-ink/70">Every <code class="inline-code">pbeta</code> command</span>
+        </a>
+        <a class="card block px-3.5 py-3 hover:border-stamp dark:hover:border-night-stamp" href="https://github.com/ryancole/permanent-beta/wiki/How-It-Works">
+          <span class="block font-semibold text-stamp dark:text-night-stamp">How it works</span>
+          <span class="text-sm text-ink/70 dark:text-night-ink/70">Matching, verification, review</span>
+        </a>
+        <a class="card block px-3.5 py-3 hover:border-stamp dark:hover:border-night-stamp" href="https://github.com/ryancole/permanent-beta/wiki/FAQ">
+          <span class="block font-semibold text-stamp dark:text-night-stamp">FAQ</span>
+          <span class="text-sm text-ink/70 dark:text-night-ink/70">Common questions</span>
+        </a>
+        <a class="card block px-3.5 py-3 hover:border-stamp dark:hover:border-night-stamp" href="https://github.com/ryancole/permanent-beta/blob/master/docs/design.md">
+          <span class="block font-semibold text-stamp dark:text-night-stamp">Design document</span>
+          <span class="text-sm text-ink/70 dark:text-night-ink/70">Architecture and rationale</span>
+        </a>
+        <a class="card block px-3.5 py-3 hover:border-stamp dark:hover:border-night-stamp" href="https://github.com/ryancole/permanent-beta/issues">
+          <span class="block font-semibold text-stamp dark:text-night-stamp">Issues</span>
+          <span class="text-sm text-ink/70 dark:text-night-ink/70">Bugs and feature requests</span>
+        </a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="pt-8 pb-12 text-[0.9rem] text-ink/70 dark:text-night-ink/70">
+  <div class="mx-auto max-w-3xl space-y-2 px-4">
+    <p>
+      Only analyze and instrument software you have the right to. Permanent Beta doesn't support circumventing DRM,
+      anti-tamper or anti-cheat protections, and its analyzer refuses binaries that look packed or protected.
+    </p>
+    <p>Apache License 2.0. Integrations with Ghidra, IDA and MCP agents are covered in the wiki.</p>
+  </div>
+</footer>
+
+</body>
+</html>
