@@ -59,7 +59,7 @@ Detecting breakage is easy. **Repairing** it is the valuable part, and it requir
 | Hook libraries | Detours first, via a library-neutral hook manifest | **[Provisional]** |
 | Hook manifest format | New TOML manifest (§7.1) | **[Provisional]**. Existing hooks' locator style is still unknown |
 | Local storage | SQLite (the skeleton uses a JSON file as a stand-in) | **[Provisional]** |
-| Open-source license | Apache-2.0 for everything in this repository; contributions under the DCO | **[Decided]** 2026-11-08 (DCO 2026-11-13). See §11.5 |
+| Open-source license | Apache-2.0 for everything in this repository | **[Decided]** 2026-11-08. See §11.5 |
 | Development model | Code is AI-written; the owner reviews | **[Decided]** |
 
 ### 2.1 Why Rust (summary)
@@ -1442,10 +1442,9 @@ replay GPL-2.0 as a whole; GPL-2.0 and Apache-2.0 are generally considered incom
 Apache-2.0) with Ghidra's x86 SLEIGH specification (Apache-2.0, embedded with Ghidra's license in
 `permanent-beta-replay/sleigh/`), so every build can carry an Apache-2.0 license. Keep it that way: add no GPL
 dependency. Not legal advice.
-Contributor terms: the **DCO** (decided 2026-11-13; `DCO`, `CONTRIBUTING.md`). Each commit in a pull request carries a
-`Signed-off-by` line, checked in CI; contributors keep their copyright and contribute under Apache-2.0, whose patent
-grant covers contributions. A CLA was the alternative: it would keep relicensing open, which a free project doesn't
-need, at the cost of deterring contributors.
+Contributor terms: contributions are accepted under Apache-2.0, whose patent grant covers them, with no sign-off
+or CLA (decided 2026-11-14: the DCO adopted on 2026-11-13 was dropped, as the owner is the only author). Revisit
+if outside contributions arrive.
 
 ---
 
@@ -1505,7 +1504,7 @@ need, at the cost of deterring contributors.
     tracing)? Needs a literature and tool survey. **[Validate]**
 
 **Project**
-14. Open-source license: decided 2026-11-08, Apache-2.0. Still open: contributor terms (DCO vs CLA).
+14. Open-source license: decided 2026-11-08, Apache-2.0. Contributor terms: decided 2026-11-14, Apache-2.0 only (§11.5).
 15. Project name: decided as Permanent Beta (CLI `pbeta`). Trademark and crates.io availability not yet checked. **[Validate]**
 16. Who reviews AI-written code besides you, and what review is required to merge (e.g. corpus gate + owner
     approval)?
