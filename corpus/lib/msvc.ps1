@@ -54,19 +54,21 @@ function Get-MsvcFlagSet([string] $name) {
     $MsvcFlagSets[$name]
 }
 
-function Import-VsDevEnvironment {
-    if (Get-Command cl.exe -ErrorAction SilentlyContinue) { return }
+# The compiler environment for -Arch (x64, or x86 for 32-bit builds: vcvars32), unless it's already set up for it.
+function Import-VsDevEnvironment([ValidateSet('x64', 'x86')] [string] $Arch = 'x64') {
+    $other = $env:VSCMD_ARG_TGT_ARCH -and $env:VSCMD_ARG_TGT_ARCH -ne $Arch
+    if ((Get-Command cl.exe -ErrorAction SilentlyContinue) -and -not $other) { return }
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
     if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found; install Visual Studio with the C++ toolset." }
     $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if (-not $vs) { throw "No Visual Studio installation with the x64 C++ toolset was found." }
-    $vcvars = Join-Path $vs 'VC/Auxiliary/Build/vcvars64.bat'
-    $env:PATH = "$(Split-Path $vswhere);$env:PATH"  # vcvars64 calls vswhere itself
-    # Run vcvars64 in cmd and copy the resulting environment into this session.
+    $vcvars = Join-Path $vs "VC/Auxiliary/Build/$(if ($Arch -eq 'x86') { 'vcvars32.bat' } else { 'vcvars64.bat' })"
+    $env:PATH = "$(Split-Path $vswhere);$env:PATH"  # vcvars calls vswhere itself
+    # Run vcvars in cmd and copy the resulting environment into this session.
     cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
         if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
     }
-    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw "cl.exe still not on PATH after vcvars64." }
+    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw "cl.exe still not on PATH after $(Split-Path -Leaf $vcvars)." }
 }
 
 function Invoke-Native([string] $exe, [string[]] $arguments) {

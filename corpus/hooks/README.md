@@ -6,10 +6,12 @@ running it (design §7.3, option 3: scenario trace diff).
 ```bash
 pwsh corpus/build-hooks.ps1 -Run              # o2 and od
 pwsh corpus/build-hooks.ps1 -Flags o2 -Run
+pwsh corpus/build-hooks.ps1 -Arch x86 -Run    # 32-bit builds of the app, DLL and launcher
 ```
 
-Requires Visual Studio or Build Tools with the x64 C++ toolset (`cl`, `link`, `nmake`), git and network access
-the first time, and cargo. Output goes to `target/hooks/<flags>/v{1,2,3}/` and `target/hooks/bin/`.
+Requires Visual Studio or Build Tools with the x64 C++ toolset (`cl`, `link`, `nmake`; for `-Arch x86` the x86
+one too), git and network access the first time, and cargo. Output goes to `target/hooks/<flags>/v{1,2,3}/` and
+`target/hooks/bin/` (`-Arch x86`: `target/hooks-x86/`). `expected.toml`'s outcomes were measured on x64 builds.
 
 ## Pieces
 
@@ -83,7 +85,7 @@ SLEIGH specification). On top of the checks above:
 1. **Record:** v1 (after its baseline) and v2 (after its step) run once more under the hook DLL's record mode:
    `PBETA_RECORD` (the recording directory, `target/hooks/<flags>/<version>/rec`) and `PBETA_SPEC` (from
    `pbeta harness-spec` on the version's manifest and its `--pdb` analysis). `hookdll/record_thunk.asm` is the
-   generic thunk: it captures the argument registers and stack, the DLL the memory behind pointers and the
+   generic thunk (`record_thunk32.asm` on x86, which writes `win32` cases): it captures the argument registers and stack, the DLL the memory behind pointers and the
    globals the hook can reach before and after the call, and the app's import calls during it (its import table
    points at import thunks), one JSON case per distinct call.
 2. **Decide with them:** the decision step also gets `--cases` for every older version's recording. A replay

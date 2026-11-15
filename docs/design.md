@@ -670,7 +670,11 @@ Each detour logs what its prototype makes meaningful, written by hand.
   The format is `permanent_beta_model::TestCase`: entry registers and stack, `regions` (address, size, layout,
   `before` and `after` as `sha256:` blobs), `globals` (name, old RVA, before and after), the import calls made
   during the call (`imports`), and `observed` rax and xmm0. A recording directory holds the spec, `cases/<hook>/`
-  and `blobs/`.
+  and `blobs/`. x86 (the DLL built for 32-bit, `record_thunk32.asm`, a `win32` spec): the thunk copies 32 stack
+  words, returns removing what the original removed, and keeps st(0) (in full) off the x87 stack while the DLL
+  runs. Cases are `win32`: ecx and edx only where the hook's convention passes arguments in them (zero otherwise,
+  so leftovers don't split identical calls), the `stack_args` words from esp+4, edx:eax and st(0) as the declared
+  return type; pointers in captured memory are 4-byte words; import calls record 12 stack words.
 - *Import calls* (recorder): every named import of the app's own import address table points at an import thunk
   (64, **[Guess]**). A call made while a recorded call runs on the same thread (nested hooked calls included) is
   recorded into each of them: the argument registers and 8 stack arguments, what it returned, and for each
