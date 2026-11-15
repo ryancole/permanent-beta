@@ -1,7 +1,7 @@
 # pbeta hook host
 
 One Detours DLL that hooks any x64 program at the addresses pbeta found, with no address in your code and, for
-logging or short-circuiting a function, no code at all.
+logging or short-circuiting a function, no code at all. Built with `-Arch x86`, the same for 32-bit programs.
 
 ```
 pbeta repair ...          ->  repaired hook manifests (one per build)
@@ -82,6 +82,15 @@ Writes `target/host`: `pbeta-host.dll`, `pbeta-launch.exe` (keep them together) 
 Needs the MSVC x64 toolset; Microsoft Detours (MIT) is cloned at a pinned commit and built if
 `target/hooks-src/Detours` doesn't have it.
 
+`pwsh harness/host/build.ps1 -Arch x86` writes the same for 32-bit programs to `target/host-x86` (MSVC's x86
+toolset). Launch a 32-bit program with that `pbeta-launch.exe`. Run `pbeta host-config` with the build's analysis
+(`--analysis`, from `pbeta analyze`): it's what marks an x86 build's entries (`abi = "win32"`), with each hook's
+calling convention (the prototype's keyword, else the PDB signature's, else `__cdecl`) and stack argument bytes. The
+x86 host refuses entries without the mark, and the x64 host entries with it. `skip` and `return` remove the stack
+arguments as the convention says (`__stdcall`, `__thiscall`, `__fastcall`), so on x86 they need a prototype. A
+handler for a 32-bit program uses the function's convention: `PBETA_HOOK_CC` (`pbeta_handler.h`), with a member
+function's handler declared `__fastcall` with an unused second parameter; `pbeta handler-stubs` writes these.
+
 ## Testing
 
 ```
@@ -98,9 +107,16 @@ arguments, float and double arguments and results, mixed slots, a void result, s
 The app prints its own results, so a corrupted register or stack slot fails as a wrong number. Checked against
 two deliberately broken thunks (stack arguments off by one slot, `xmm1` not restored): both fail.
 
+`pwsh harness/host/test.ps1 -Arch x86` runs the same on a 32-bit build of the test app, with three more hooks, one
+per x86 convention whose callee removes its arguments (`__stdcall`, `__fastcall`, `__thiscall`), under every action,
+and one more negative: a config written without the build's analysis, refused entry by entry.
+
 ## Limits
 
-- x64 only. The launcher starts the program; attaching to a running process isn't built.
+- x64 and x86. The launcher starts the program; attaching to a running process isn't built.
+- x86: the generic thunk copies 32 stack words when it calls the original, so `pbeta host-config` refuses built-in
+  actions on functions with more than 128 bytes of stack arguments (a handler has no limit), and functions MSVC
+  compiled with a custom calling convention (`/LTCG` may for internal functions) aren't supported.
 - A handler's prototype isn't checked against the function when the DLL loads; `pbeta handler-stubs` writes it
   from the function's prototype instead.
 - The log is plain text, one line per call, unbuffered: very hot functions slow the program down.

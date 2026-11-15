@@ -1,4 +1,4 @@
-//! Native PE x64 analyzer (design §4.2).
+//! Native PE analyzer for x64 and x86 (design §4.2).
 //!
 //! Reads only what's in the binary: no PDB or map file. (The PDB GUID from the debug directory is recorded so
 //! the matching PDB can be found later, but no symbols are read.) Names come from exports only.
@@ -12,6 +12,7 @@ pub(crate) mod ilt;
 pub(crate) mod image;
 pub mod pattern;
 pub(crate) mod protection;
+pub(crate) mod x86_args;
 
 use crate::{AnalysisError, Analyzer};
 use permanent_beta_model::{
@@ -34,6 +35,17 @@ use std::path::Path;
 /// 4: the destructors and copy constructors a C++ throw site's ThrowInfo names are functions of their own
 /// (they were missed, or taken into the function before them).
 pub const FEATURES_VERSION: &str = "native-4";
+
+/// The features version an image's analysis records: [`FEATURES_VERSION`] for x64, with `-x86` appended for x86.
+/// x86 code is normalized differently (absolute operands, stack arguments), so an x86 analysis is never compared
+/// with an x64 one: matching them fails on the features version, with both named.
+pub fn features_version(x86: bool) -> String {
+    if x86 {
+        format!("{FEATURES_VERSION}-x86")
+    } else {
+        FEATURES_VERSION.to_owned()
+    }
+}
 
 pub const PRODUCER: &str = "permanent-beta-native-pe";
 
@@ -87,7 +99,7 @@ pub fn build_id(bytes: &[u8]) -> BuildId {
     )
 }
 
-/// Analyze an in-memory PE x64 image.
+/// Analyze an in-memory PE x64 or x86 image.
 pub fn analyze_bytes(bytes: &[u8], file_name: &str) -> Result<AnalysisExport, BytesError> {
     let image = parse_checked(bytes)?;
     let ranges = function::discover(&image);
@@ -156,11 +168,15 @@ pub(crate) fn analyze_ranges(
             id: BuildId(build_id),
             file_name: file_name.to_owned(),
             version: None,
-            machine: Machine::X64,
+            machine: if image.x86 {
+                Machine::X86
+            } else {
+                Machine::X64
+            },
             pdb: image.pdb.clone().map(|(guid, age)| PdbInfo { guid, age }),
         },
         producer,
-        features_version: Some(FEATURES_VERSION.to_owned()),
+        features_version: Some(features_version(image.x86)),
         functions,
         code_tables,
         types: Vec::new(),

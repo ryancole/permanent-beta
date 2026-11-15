@@ -1,7 +1,7 @@
 //! The hook host's configuration (`pbeta host-config`, `harness/host`): what the generic hook DLL attaches in
 //! each build, from the repaired hook manifests.
 //!
-//! The host is one DLL for any x64 program. It hashes the executable it's loaded into and attaches only the hooks
+//! The host is one DLL for any x64 program (and one for x86). It hashes the executable it's loaded into and attaches only the hooks
 //! listed for that build, at their RVAs, after checking each one's pattern. What it does per call is the hook's
 //! `detour` in the manifest, its **action**:
 //!
@@ -14,23 +14,34 @@
 //! The log decodes each argument from its Win64 slot by the hook's prototype (the manifest's, or the build's PDB
 //! signature from `--analysis`); without one it logs the four integer argument registers.
 //!
+//! An x86 build's hooks need the build's analysis (`--analysis`): it's what says the build is x86 (`abi =
+//! "win32"`), and the x86 host refuses any other entry. Their arguments are decoded from the slots the calling
+//! convention gives them (the prototype's keyword, else the PDB signature's, else `__cdecl`), and `skip` and
+//! `return` remove the stack arguments as the convention says, so they need a prototype that says how many bytes
+//! those are.
+//!
 //! A hook is listed for the build its locator is bound to, so one that `repair` sent to review stays on the build
 //! where it was verified and is never attached in the new one.
 
-use crate::harness::value_type;
+use crate::harness::{abi_of, value_type_for};
 use crate::prototype::Prototype;
 use permanent_beta_model::{
-    AnalysisExport, ArgSlot, BuildId, FunctionSignature, HookManifest, HookSpec, Rva, SkippedHook,
-    ValueType,
+    Abi, AnalysisExport, ArgSlot, BuildId, Convention, FunctionSignature, HookManifest, HookSpec,
+    Rva, SkippedHook, ValueType, slots32,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const HOST_CONFIG_VERSION: u32 = 1;
 
-/// Most parameters a hook with a built-in action can have: four in registers and the eight stack slots the host's
-/// generic thunk forwards. A handler is attached directly and has no limit.
+/// Most parameters a hook with a built-in action can have on x64: four in registers and the eight stack slots the
+/// host's generic thunk forwards. A handler is attached directly and has no limit, and neither has the x86 thunk,
+/// which leaves the arguments where they are.
 pub const MAX_PARAMS: usize = 12;
+
+/// Most bytes of stack arguments a hook with a built-in action can have on x86: the 32 stack words the x86 thunk
+/// copies when it calls the original.
+pub const MAX_STACK_BYTES_X86: u32 = 128;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostConfig {
@@ -57,6 +68,16 @@ pub struct HostHook {
     pub ret: Option<ValueType>,
     #[serde(rename = "arg", default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<HostArg>,
+    /// `win32` for an x86 build (known from its analysis). Each host attaches only entries of its own ABI.
+    #[serde(default, skip_serializing_if = "Abi::is_win64")]
+    pub abi: Abi,
+    /// Win32: the calling convention, when there's a prototype.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convention: Option<Convention>,
+    /// Win32: bytes of stack arguments, when the prototype says. With a convention whose callee removes them,
+    /// what `skip` and `return` remove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_bytes: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,6 +187,8 @@ pub fn config(
                 continue;
             };
             let build = &hook.target.build;
+            let analysis = analyses.iter().find(|a| &a.build.id == build);
+            let abi = analysis.map_or(Abi::Win64, abi_of);
             let prototype = prototype_of(hook, analyses).map(|(text, _)| text);
             let parsed = prototype.as_deref().and_then(Prototype::parse);
             let mut entry = HostHook {
@@ -177,16 +200,30 @@ pub fn config(
                 prototype: None,
                 ret: None,
                 args: Vec::new(),
+                abi,
+                convention: None,
+                stack_bytes: None,
             };
+            let returns_itself = matches!(action, Action::Skip | Action::Return(_));
+            if abi == Abi::Win32 && returns_itself && parsed.is_none() {
+                return Err(format!(
+                    "{}: `{action}` on x86 needs the hook's prototype, to remove its stack arguments as its \
+                     calling convention says",
+                    hook.name
+                ));
+            }
             if let (Some(text), Some(p)) = (&prototype, &parsed) {
-                if !matches!(action, Action::Handler { .. }) && p.params.len() > MAX_PARAMS {
+                if abi == Abi::Win64
+                    && !matches!(action, Action::Handler { .. })
+                    && p.params.len() > MAX_PARAMS
+                {
                     return Err(format!(
                         "{}: {} parameters; `{action}` handles at most {MAX_PARAMS}, use a handler",
                         hook.name,
                         p.params.len()
                     ));
                 }
-                let ret = host_value_type(&p.return_type());
+                let ret = host_value_type(abi, &p.return_type());
                 if let (Action::Return(_), ValueType::Float(_)) = (&action, ret) {
                     return Err(format!(
                         "{}: `{action}` can't return a floating-point result",
@@ -195,19 +232,59 @@ pub fn config(
                 }
                 entry.prototype = Some(text.clone());
                 entry.ret = Some(ret);
+                let values: Vec<ValueType> = p
+                    .params
+                    .iter()
+                    .map(|q| host_value_type(abi, &q.ty))
+                    .collect();
+                let slots: Vec<Option<ArgSlot>> = match abi {
+                    Abi::Win64 => values
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| Some(ArgSlot::for_param(i as u32, v.in_vector_register())))
+                        .collect(),
+                    Abi::Win32 => {
+                        let signature = analysis
+                            .and_then(|a| a.function(rva))
+                            .and_then(|f| f.signature.as_ref());
+                        let convention = crate::harness::convention(p, signature);
+                        let (slots, bytes) = slots32(convention, &values);
+                        if returns_itself && convention.callee_pops() && bytes.is_none() {
+                            return Err(format!(
+                                "{}: `{action}` can't remove the arguments of `{text}`: one is passed by value \
+                                 with a size the prototype doesn't give",
+                                hook.name
+                            ));
+                        }
+                        if !matches!(action, Action::Handler { .. })
+                            && bytes.is_some_and(|b| b > MAX_STACK_BYTES_X86)
+                        {
+                            return Err(format!(
+                                "{}: {} bytes of stack arguments; `{action}` handles at most \
+                                 {MAX_STACK_BYTES_X86} on x86, use a handler",
+                                hook.name,
+                                bytes.unwrap_or(0)
+                            ));
+                        }
+                        entry.convention = Some(convention);
+                        entry.stack_bytes = bytes;
+                        slots
+                    }
+                };
+                // An argument whose slot isn't known (after a struct by value on x86) isn't decoded.
                 entry.args = p
                     .params
                     .iter()
-                    .enumerate()
-                    .map(|(i, param)| {
-                        let value = host_value_type(&param.ty);
-                        HostArg {
-                            slot: ArgSlot::for_param(i as u32, value.in_vector_register()),
+                    .zip(values)
+                    .zip(slots)
+                    .filter_map(|((param, value), slot)| {
+                        Some(HostArg {
+                            slot: slot?,
                             name: param.name.clone(),
                             ty: param.ty.clone(),
                             value,
                             show: show(&param.ty),
-                        }
+                        })
                     })
                     .collect();
             }
@@ -273,8 +350,11 @@ pub fn handler_stubs(
     analyses: &[AnalysisExport],
     dll: Option<&str>,
 ) -> Result<HandlerStubs, String> {
-    // export -> (hook names, prototype text and source, parsed), in first-seen order.
-    type Entry = (Vec<String>, Option<(String, &'static str, Prototype)>);
+    // export -> (hook names, prototype text and source, parsed, x86 calling convention), in first-seen order.
+    type Entry = (
+        Vec<String>,
+        Option<(String, &'static str, Prototype, Option<Convention>)>,
+    );
     let mut entries: Vec<(String, Entry)> = Vec::new();
     let mut unparsable: Vec<SkippedHook> = Vec::new();
     let mut dlls: Vec<String> = Vec::new();
@@ -314,15 +394,27 @@ pub fn handler_stubs(
             });
             continue;
         };
+        // On x86 the handler must use the hooked function's calling convention.
+        let analysis = analyses.iter().find(|a| a.build.id == hook.target.build);
+        let convention = analysis.filter(|a| abi_of(a) == Abi::Win32).map(|a| {
+            let signature = hook
+                .target
+                .rva
+                .and_then(|r| a.function(r))
+                .and_then(|f| f.signature.as_ref());
+            crate::harness::convention(&parsed, signature)
+        });
         match proto {
-            Some((first, _, p)) if signature_key(p) != signature_key(&parsed) => {
+            Some((first, _, p, c))
+                if signature_key(p) != signature_key(&parsed) || *c != convention =>
+            {
                 return Err(format!(
                     "{export}: the hooked functions' prototypes differ (`{first}` and `{text}`); a handler has \
                      one prototype, so give each its own export"
                 ));
             }
             Some(_) => {}
-            None => *proto = Some((text, source, parsed)),
+            None => *proto = Some((text, source, parsed, convention)),
         }
     }
     let dll = match (dll, dlls.as_slice()) {
@@ -357,7 +449,7 @@ pub fn handler_stubs(
          #include <pbeta_handler.h>\n"
     );
     for (export, (hooks, proto)) in &entries {
-        let Some((proto_text, source, p)) = proto else {
+        let Some((proto_text, source, p, convention)) = proto else {
             if !unparsable.iter().any(|s| &s.name == export) {
                 skipped.push(SkippedHook {
                     name: export.clone(),
@@ -378,18 +470,38 @@ pub fn handler_stubs(
                 _ => (param.full(), format!("a{}", i + 1)),
             })
             .collect();
-        let names: Vec<&str> = typed.iter().map(|(_, n)| n.as_str()).collect();
-        let params: Vec<String> = typed.iter().map(|(t, n)| format!("{t} {n}")).collect();
+        let mut names: Vec<&str> = typed.iter().map(|(_, n)| n.as_str()).collect();
+        let mut params: Vec<String> = typed.iter().map(|(t, n)| format!("{t} {n}")).collect();
+        // MSVC allows __thiscall on member functions only. __fastcall with an unused second parameter is the same
+        // ABI: `this` in ecx, edx untouched, the rest on the stack, removed by the callee.
+        let thiscall = *convention == Some(Convention::Thiscall) && !params.is_empty();
+        if thiscall {
+            params.insert(1, "void* edx_unused".into());
+            names.insert(1, "edx_unused");
+        }
         let call = format!("PBETA_ORIGINAL({export})({})", names.join(", "));
         let body = if p.returns_void() {
             format!("    {call};\n")
         } else {
             format!("    return {call};\n")
         };
+        // x86: anything but __cdecl (the default) is spelled out.
+        let head = match convention {
+            Some(_) if thiscall => {
+                format!(
+                    "// __thiscall, as __fastcall with an unused edx parameter (pbeta_handler.h)\n\
+                     PBETA_HOOK_CC({}, __fastcall, {export},",
+                    p.return_type()
+                )
+            }
+            Some(c) if *c != Convention::Cdecl => {
+                format!("PBETA_HOOK_CC({}, {c}, {export},", p.return_type())
+            }
+            _ => format!("PBETA_HOOK({}, {export},", p.return_type()),
+        };
         text.push_str(&format!(
-            "\n// {}: {source} `{proto_text}`\nPBETA_HOOK({}, {export}, ({})) {{\n{body}}}\n",
+            "\n// {}: {source} `{proto_text}`\n{head} ({})) {{\n{body}}}\n",
             hooks.join(", "),
-            p.return_type(),
             params.join(", "),
         ));
         exports.push(export.clone());
@@ -466,17 +578,19 @@ fn render(name: &str, s: &FunctionSignature) -> String {
     )
 }
 
-/// Windows typedefs that the record spec's [`value_type`] doesn't know, for the log only.
-fn host_value_type(ty: &str) -> ValueType {
+/// Windows typedefs that the record spec's [`value_type_for`] doesn't know, for the log only.
+fn host_value_type(abi: Abi, ty: &str) -> ValueType {
     let words: Vec<&str> = ty
         .split_whitespace()
         .filter(|w| !matches!(*w, "const" | "volatile"))
         .collect();
     match words.as_slice() {
         [w] if POINTER_TYPEDEFS.contains(w) => ValueType::Pointer,
-        [w] if matches!(*w, "WPARAM" | "LPARAM" | "LRESULT") => ValueType::Int(8),
+        [w] if matches!(*w, "WPARAM" | "LPARAM" | "LRESULT") => {
+            ValueType::Int(abi.pointer_size() as u8)
+        }
         [w] if matches!(*w, "HRESULT" | "NTSTATUS") => ValueType::Int(4),
-        _ => value_type(ty),
+        _ => value_type_for(abi, ty),
     }
 }
 
@@ -896,5 +1010,144 @@ mod tests {
         // Negative: nothing usable at all is an error, not an empty file.
         let m = manifest(vec![hook("Q", "v1", Some(0x30), Some("h.dll!Q"), None)]);
         assert!(handler_stubs(&[m], &[], None).is_err());
+    }
+
+    fn x86_analysis(build: &str, cc: &str, params: &[(Option<&str>, &str)]) -> AnalysisExport {
+        let mut a = pdb_analysis(build, "int", params);
+        a.build.machine = Machine::X86;
+        a.functions[0]
+            .signature
+            .as_mut()
+            .unwrap()
+            .calling_convention = Some(cc.into());
+        a
+    }
+
+    #[test]
+    fn x86_hooks_get_their_conventions_slots_and_stack_bytes() {
+        let m = manifest(vec![
+            hook(
+                "Area",
+                "v1",
+                Some(0x10),
+                Some("skip"),
+                Some("int Area(int w, int h)"),
+            ),
+            hook(
+                "Name",
+                "v2",
+                Some(0x10),
+                None,
+                Some("int Name(const char* s)"),
+            ),
+        ]);
+        let analyses = [
+            x86_analysis("v1", "__stdcall", &[]),
+            x86_analysis("v2", "__cdecl", &[]),
+        ];
+        let (c, _) = config(&[m], &analyses).unwrap();
+        let area = &c.hooks[0];
+        assert_eq!(area.abi, Abi::Win32);
+        assert_eq!(area.convention, Some(Convention::Stdcall));
+        assert_eq!(area.stack_bytes, Some(8));
+        assert_eq!(area.args[1].slot, ArgSlot::Stack32(8));
+        assert_eq!(c.hooks[1].args[0].slot, ArgSlot::Stack32(4));
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("abi = \"win32\""), "{text}");
+        assert_eq!(toml::from_str::<HostConfig>(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn x86_skip_and_return_need_to_know_what_to_pop() {
+        // Negative: without a prototype, how many bytes a __stdcall callee removes isn't known.
+        let analyses = [x86_analysis("v1", "__stdcall", &[])];
+        let m = manifest(vec![hook("Area", "v1", Some(0x20), Some("return 1"), None)]);
+        assert!(
+            config(&[m], &analyses)
+                .unwrap_err()
+                .contains("needs the hook's prototype")
+        );
+        // Negative: nor after a struct passed by value.
+        let m = manifest(vec![hook(
+            "Area",
+            "v1",
+            Some(0x10),
+            Some("skip"),
+            Some("int Area(Rect r, int h)"),
+        )]);
+        assert!(
+            config(&[m], &analyses)
+                .unwrap_err()
+                .contains("can't remove")
+        );
+        // Negative: more stack than the x86 thunk copies (33 words); a handler has no limit.
+        let many = format!(
+            "int Many({})",
+            (0..33)
+                .map(|i| format!("int a{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let m = manifest(vec![hook("Many", "v1", Some(0x10), None, Some(&many))]);
+        assert!(config(&[m], &analyses).unwrap_err().contains("at most 128"));
+        let m = manifest(vec![hook(
+            "Many",
+            "v1",
+            Some(0x10),
+            Some("h.dll!Many"),
+            Some(&many),
+        )]);
+        assert!(config(&[m], &analyses).is_ok());
+        // Logging calls the original, which removes its own arguments: no prototype needed.
+        let m = manifest(vec![hook("Area", "v1", Some(0x20), None, None)]);
+        assert!(config(&[m], &analyses).is_ok());
+    }
+
+    #[test]
+    fn x86_handler_stubs_use_the_hooked_functions_convention() {
+        let m = manifest(vec![
+            hook(
+                "Area",
+                "v1",
+                Some(0x10),
+                Some("h.dll!Area"),
+                Some("int Area(int w, int h)"),
+            ),
+            hook(
+                "Get",
+                "v2",
+                Some(0x10),
+                Some("h.dll!Get"),
+                Some("int Get(Box* self, int i)"),
+            ),
+        ]);
+        let analyses = [
+            x86_analysis("v1", "__stdcall", &[]),
+            x86_analysis("v2", "__thiscall", &[]),
+        ];
+        let stubs = handler_stubs(std::slice::from_ref(&m), &analyses, None).unwrap();
+        assert!(
+            stubs
+                .text
+                .contains("PBETA_HOOK_CC(int, __stdcall, Area, (int w, int h))"),
+            "{}",
+            stubs.text
+        );
+        // __thiscall as __fastcall with an unused edx parameter, passed through to the original.
+        assert!(
+            stubs.text.contains(
+                "PBETA_HOOK_CC(int, __fastcall, Get, (Box* self, void* edx_unused, int i))"
+            ),
+            "{}",
+            stubs.text
+        );
+        assert!(
+            stubs
+                .text
+                .contains("PBETA_ORIGINAL(Get)(self, edx_unused, i)")
+        );
+        // Negative: without the analyses (x64), plain PBETA_HOOK.
+        let x64 = handler_stubs(&[m], &[], None).unwrap();
+        assert!(!x64.text.contains("PBETA_HOOK_CC"), "{}", x64.text);
     }
 }

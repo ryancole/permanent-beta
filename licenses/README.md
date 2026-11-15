@@ -14,5 +14,5 @@ decided 2026-11-08 (design §11.5).
 | Extended test corpus | separate private repo | Proprietary |
 | Hosted history service | separate private repo | Proprietary |
 
-Dependencies must be compatible with Apache-2.0: no GPL (CLAUDE.md). Open decision: contributor terms (DCO vs CLA).
+Dependencies must be compatible with Apache-2.0: no GPL (CLAUDE.md). Contributions are accepted under Apache-2.0, with no sign-off or CLA (design §11.5).
 Proprietary code must never be added to this repository. Keeping it separate is what keeps the open-core split clean.

@@ -1,8 +1,9 @@
 //! Record spec for the recording hook DLL (design §7.3, `pbeta harness-spec`): from the hook manifest, each hook's
 //! prototype and the build's PDB struct layouts, what to capture per call.
 //!
-//! Per parameter: its Win64 slot, how the value travels (integer, float, pointer) and its width, and for a
-//! pointer what it points to:
+//! Per parameter: its slot (Win64, or for an x86 build the slot its calling convention gives it: the prototype's
+//! keyword, else the PDB signature's, else `__cdecl`), how the value travels (integer, float, pointer) and its
+//! width, and for a pointer what it points to:
 //! - a struct the PDB lays out: that many bytes (`fixed`);
 //! - a scalar or a pointer (`int*`, `unsigned short*`, `T**`): `array`, the whole heap block holding it, since the
 //!   prototype can't say whether it's one value or an element of an array (zlib's `inflate_table(..., unsigned
@@ -33,8 +34,9 @@
 
 use crate::prototype::Prototype;
 use permanent_beta_model::{
-    AnalysisExport, ArgSlot, ArgSpec, CaptureKind, GlobalSpec, HarnessSpec, HookManifest,
-    HookRecordSpec, PointerField, Rva, SkippedHook, ValueType,
+    Abi, AnalysisExport, ArgSlot, ArgSpec, CaptureKind, Convention, FunctionSignature, GlobalSpec,
+    HarnessSpec, HookManifest, HookRecordSpec, Machine, PointerField, Rva, SkippedHook, ValueType,
+    slots32,
 };
 use std::collections::BTreeSet;
 
@@ -55,8 +57,10 @@ pub const SIZED_MAX: u64 = 256 * 1024;
 /// The spec for every hook of `manifest` bound to `build`'s build. `build` should be analyzed with `--pdb`, or
 /// no struct gets a layout (its pointers capture nothing).
 pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> HarnessSpec {
+    let abi = abi_of(build);
     let mut out = HarnessSpec {
         build: build.build.id.clone(),
+        abi,
         max_cases,
         import_memory: true,
         pointer_depth: DEFAULT_POINTER_DEPTH,
@@ -90,11 +94,46 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
                 .push(skip(format!("can't parse the prototype {text:?}")));
             continue;
         };
+        let values: Vec<ValueType> = proto
+            .params
+            .iter()
+            .map(|p| value_type_for(abi, &p.ty))
+            .collect();
+        let (slots, stack_args, convention) = match abi {
+            Abi::Win64 => (
+                (0..values.len() as u32)
+                    .map(|i| {
+                        Some(ArgSlot::for_param(
+                            i,
+                            values[i as usize].in_vector_register(),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+                proto.params.len().saturating_sub(4) as u32,
+                None,
+            ),
+            Abi::Win32 => {
+                let signature = build.function(rva).and_then(|f| f.signature.as_ref());
+                let convention = convention(&proto, signature);
+                let (slots, bytes) = slots32(convention, &values);
+                // Where the arguments past one passed by value are, and how much stack the callee removes,
+                // isn't known: recording it could corrupt the stack.
+                let Some(bytes) = bytes else {
+                    out.skipped.push(skip(format!(
+                        "a parameter is passed by value with a size the prototype doesn't give: {text:?}"
+                    )));
+                    continue;
+                };
+                (slots, bytes / 4, Some(convention))
+            }
+        };
         let mut args = Vec::new();
         for (i, p) in proto.params.iter().enumerate() {
-            let value = value_type(&p.ty);
+            let value = values[i];
             let index = i as u32;
-            let slot = ArgSlot::for_param(index, value.in_vector_register());
+            let Some(slot) = slots[i] else {
+                continue;
+            };
             let mut arg = ArgSpec {
                 index,
                 slot,
@@ -113,12 +152,13 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
                 match pointee(&p.ty) {
                     Pointee::Bytes { cstring } => {
                         let len = next.filter(|n| {
-                            matches!(value_type(&n.ty), ValueType::Int(_))
+                            matches!(value_type_for(abi, &n.ty), ValueType::Int(_))
                                 && n.name.as_deref().is_some_and(is_length_name)
                         });
-                        if len.is_some() {
+                        let len_slot = slots.get(i + 1).copied().flatten();
+                        if let (Some(_), Some(len_slot)) = (len, len_slot) {
                             arg.capture = CaptureKind::Sized;
-                            arg.len_slot = Some(ArgSlot::for_param(index + 1, false));
+                            arg.len_slot = Some(len_slot);
                             arg.max = Some(SIZED_MAX);
                         } else if cstring {
                             arg.capture = CaptureKind::Cstring;
@@ -143,7 +183,7 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
                     // they point to isn't followed.
                     Pointee::Unknown if is_pointer_to_pointer(&p.ty) => {
                         arg.capture = CaptureKind::Array;
-                        arg.size = Some(8);
+                        arg.size = Some(abi.pointer_size());
                     }
                     Pointee::Unknown => {}
                 }
@@ -154,8 +194,9 @@ pub fn spec(manifest: &HookManifest, build: &AnalysisExport, max_cases: u32) -> 
             name: hook.name.clone(),
             rva,
             prototype: text.to_owned(),
-            ret: return_type(&proto),
-            stack_args: proto.params.len().saturating_sub(4) as u32,
+            ret: value_type_for(abi, &proto.return_type()),
+            stack_args,
+            convention,
             args,
             globals: reachable_globals(build, rva),
         });
@@ -272,7 +313,10 @@ fn add_pointer_fields(out: &mut HarnessSpec, build: &AnalysisExport, from: usize
         let layout = out.layouts[i].clone();
         i += 1;
         for f in &layout.fields {
-            if f.size != 8 || f.bits.is_some() || value_type(&f.ty) != ValueType::Pointer {
+            if f.size != out.abi.pointer_size()
+                || f.bits.is_some()
+                || value_type_for(out.abi, &f.ty) != ValueType::Pointer
+            {
                 continue;
             }
             let target = match pointee(&f.ty) {
@@ -326,7 +370,7 @@ pub fn pointer_alias(
         .iter()
         .find(|f| f.name == field)
         .ok_or_else(|| bad(&format!("{layout} has no field {field}")))?;
-    if f.size != 8 || value_type(&f.ty) != ValueType::Pointer {
+    if f.size != spec.abi.pointer_size() || value_type_for(spec.abi, &f.ty) != ValueType::Pointer {
         return Err(bad(&format!("{layout}.{field} isn't a pointer")));
     }
     let offset = f.offset;
@@ -385,13 +429,27 @@ pub fn redact(spec: &mut HarnessSpec, what: &str) -> Result<(), String> {
     ))
 }
 
-fn return_type(proto: &Prototype) -> ValueType {
-    let ty: Vec<&str> = proto
+/// The ABI of a build's code: Win32 for an x86 build.
+pub fn abi_of(build: &AnalysisExport) -> Abi {
+    match build.build.machine {
+        Machine::X86 => Abi::Win32,
+        _ => Abi::Win64,
+    }
+}
+
+/// An x86 function's calling convention: the prototype's keyword (`int __stdcall F(...)`), else its PDB
+/// signature's, else `__cdecl`, MSVC's default for a free function.
+pub fn convention(proto: &Prototype, signature: Option<&FunctionSignature>) -> Convention {
+    proto
         .head
         .split_whitespace()
-        .filter(|w| !w.starts_with("__") && *w != "static" && *w != "inline")
-        .collect();
-    value_type(&ty.join(" "))
+        .find_map(Convention::from_keyword)
+        .or_else(|| {
+            signature
+                .and_then(|s| s.calling_convention.as_deref())
+                .and_then(Convention::from_keyword)
+        })
+        .unwrap_or(Convention::Cdecl)
 }
 
 /// Words that don't change how a value travels.
@@ -428,13 +486,36 @@ pub(crate) fn is_type_qualifier_keyword(w: &str) -> bool {
 
 /// How a parameter of type `ty` travels in Win64, and how wide it is.
 pub fn value_type(ty: &str) -> ValueType {
+    value_type_for(Abi::Win64, ty)
+}
+
+/// How a parameter of type `ty` travels under `abi`, and how wide it is: the pointer-sized integer types
+/// (`size_t`, `intptr_t`, `ULONG_PTR`, ...) are 4 bytes on Win32.
+pub fn value_type_for(abi: Abi, ty: &str) -> ValueType {
     if ty.contains('*') || ty.contains('&') || ty.contains('[') {
         return ValueType::Pointer;
     }
-    scalar(&significant_words(ty).join(" ")).unwrap_or(ValueType::Unknown)
+    let words = significant_words(ty).join(" ");
+    if abi == Abi::Win32 && POINTER_SIZED.contains(&words.as_str()) {
+        return ValueType::Int(4);
+    }
+    scalar(&words).unwrap_or(ValueType::Unknown)
 }
 
-/// Built-in and common fixed-width scalar types (LLP64: `long` is 4 bytes, MSVC's `long double` is 8).
+/// Integer types as wide as a pointer.
+const POINTER_SIZED: &[&str] = &[
+    "size_t",
+    "ptrdiff_t",
+    "intptr_t",
+    "uintptr_t",
+    "ssize_t",
+    "SIZE_T",
+    "ULONG_PTR",
+    "LONG_PTR",
+];
+
+/// Built-in and common fixed-width scalar types (LLP64: `long` is 4 bytes, MSVC's `long double` is 8). The
+/// pointer-sized ones ([`POINTER_SIZED`]) are Win64's 8 bytes here.
 fn scalar(ty: &str) -> Option<ValueType> {
     use ValueType::{Float, Int, Void};
     Some(match ty {
@@ -1142,5 +1223,92 @@ mod tests {
                 ("state", 8, None),
             ]
         );
+    }
+
+    fn x86(mut e: AnalysisExport) -> AnalysisExport {
+        e.build.machine = Machine::X86;
+        e
+    }
+
+    #[test]
+    fn an_x86_spec_follows_each_calling_convention() {
+        let m = manifest(&[
+            ("area", Some("int __stdcall area(int w, int h)"), "v1"),
+            (
+                "get",
+                Some("int __thiscall Box_get(Box* self, double d, size_t n)"),
+                "v1",
+            ),
+            ("fill", Some("int fill(char* buf, int len)"), "v1"),
+            ("byval", Some("int __stdcall byval(Order o, int x)"), "v1"),
+        ]);
+        let spec = spec(&m, &x86(export("v1", vec![order()])), 8);
+        assert_eq!(spec.abi, Abi::Win32);
+        let slots = |name: &str| -> Vec<String> {
+            spec.hook(name)
+                .unwrap()
+                .args
+                .iter()
+                .map(|a| a.slot.to_string())
+                .collect()
+        };
+        let area = spec.hook("area").unwrap();
+        assert_eq!(slots("area"), ["esp+0x4", "esp+0x8"]);
+        assert_eq!(
+            (area.convention, area.stack_args),
+            (Some(Convention::Stdcall), 2)
+        );
+        // `this` in ecx; the double takes two stack words; size_t is 4 bytes on x86.
+        let get = spec.hook("get").unwrap();
+        assert_eq!(slots("get"), ["ecx", "esp+0x4", "esp+0xc"]);
+        assert_eq!(get.args[2].value, ValueType::Int(4));
+        assert_eq!(get.stack_args, 3);
+        // No keyword and no PDB signature: __cdecl. The buffer's length is the next stack slot.
+        let fill = spec.hook("fill").unwrap();
+        assert_eq!(fill.convention, Some(Convention::Cdecl));
+        assert_eq!(fill.args[0].len_slot, Some(ArgSlot::Stack32(8)));
+        // Negative: a struct by value hides where the later arguments are and what the callee pops.
+        assert!(spec.hook("byval").is_none());
+        assert!(spec.skipped.iter().any(|s| s.name == "byval"));
+        // The spec round-trips with its ABI and conventions.
+        let text = toml::to_string_pretty(&spec).unwrap();
+        assert_eq!(toml::from_str::<HarnessSpec>(&text).unwrap(), spec);
+    }
+
+    #[test]
+    fn an_x64_spec_has_no_conventions_and_8_byte_size_t() {
+        // Negative: the same prototypes for an x64 build keep Win64's slots.
+        let m = manifest(&[(
+            "get",
+            Some("int __thiscall Box_get(Box* self, double d, size_t n)"),
+            "v1",
+        )]);
+        let spec = spec(&m, &export("v1", vec![]), 8);
+        let get = spec.hook("get").unwrap();
+        assert_eq!(spec.abi, Abi::Win64);
+        assert_eq!(get.convention, None);
+        assert_eq!(get.args[1].slot, ArgSlot::Vector(1));
+        assert_eq!(get.args[2].value, ValueType::Int(8));
+    }
+
+    #[test]
+    fn the_pdb_signature_gives_the_convention_when_the_prototype_doesnt() {
+        let p = Prototype::parse("int get(Box* self, int i)").unwrap();
+        let sig = |cc: &str| FunctionSignature {
+            calling_convention: Some(cc.into()),
+            return_type: None,
+            params: vec![],
+        };
+        assert_eq!(
+            convention(&p, Some(&sig("__thiscall"))),
+            Convention::Thiscall
+        );
+        // The prototype's own keyword wins; without either, __cdecl.
+        let explicit = Prototype::parse("int __stdcall get(Box* self, int i)").unwrap();
+        assert_eq!(
+            convention(&explicit, Some(&sig("__thiscall"))),
+            Convention::Stdcall
+        );
+        assert_eq!(convention(&p, None), Convention::Cdecl);
     }
 }

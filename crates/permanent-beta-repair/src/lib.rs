@@ -101,6 +101,25 @@ pub fn decide(
     new_fn: Option<&FunctionFeatures>,
     alternatives: Vec<VerificationReport>,
 ) -> HookRepair {
+    decide_for(
+        permanent_beta_model::Abi::Win64,
+        hook,
+        old_fn,
+        report,
+        new_fn,
+        alternatives,
+    )
+}
+
+/// [`decide`] for code of `abi` (Win32 for an x86 build), which says how the prototype check reads arguments.
+pub fn decide_for(
+    abi: permanent_beta_model::Abi,
+    hook: &HookSpec,
+    old_fn: Option<&FunctionFeatures>,
+    report: Option<VerificationReport>,
+    new_fn: Option<&FunctionFeatures>,
+    alternatives: Vec<VerificationReport>,
+) -> HookRepair {
     let review = |reason, detail: String, report| HookRepair {
         verification: report,
         ..HookRepair::new(
@@ -219,7 +238,7 @@ pub fn decide(
             if let Some(why) = hook
                 .prototype
                 .as_deref()
-                .and_then(|p| prototype_misfit(p, old_fn, new_fn))
+                .and_then(|p| prototype_misfit(p, abi, old_fn, new_fn))
             {
                 return review(
                     ReviewReason::SignatureChanged,
@@ -261,13 +280,19 @@ const ARG_REGISTERS: [(&str, &str); 4] = [
 /// already loose for the old build isn't the repair's news. The inferred arguments are a lower bound (the analyzer
 /// scans to the first call), so fewer than declared is never a misfit. `None` when it fits, or when there's
 /// nothing to judge by (no inferred arguments, a prototype that doesn't parse, a variadic one).
+///
+/// On Win32 ([`prototype_misfit_x86`]) the slots are the registers and stack words the calling convention uses.
 pub fn prototype_misfit(
     prototype: &str,
+    abi: permanent_beta_model::Abi,
     old: &FunctionFeatures,
     new: &FunctionFeatures,
 ) -> Option<String> {
     use permanent_beta_model::{ArgClass, ValueType};
     let proto = prototype::Prototype::parse(prototype)?;
+    if abi == permanent_beta_model::Abi::Win32 {
+        return prototype_misfit_x86(&proto, old, new);
+    }
     let declared: Vec<Option<ArgClass>> = proto
         .params
         .iter()
@@ -302,6 +327,58 @@ pub fn prototype_misfit(
                 )),
                 _ => {}
             }
+        }
+        Some(out)
+    };
+    let before = problems(old).unwrap_or_default();
+    let news: Vec<String> = problems(new)?
+        .into_iter()
+        .filter(|p| !before.contains(p))
+        .collect();
+    (!news.is_empty()).then(|| news.join("; "))
+}
+
+/// The x86 prototype check: the analyzer counts the register arguments the code reads (ecx, then edx: one
+/// `inferred_arg_classes` entry each) and then the stack words, up to the highest one read (`inferred_args` in all).
+/// A misfit is a register the prototype's calling convention ([`harness::convention`], falling back on the old
+/// function's PDB signature) doesn't pass an argument in (the function became a method, or `__fastcall`), or a
+/// stack word past the prototype's arguments. As on Win64, only what the old function didn't already do counts,
+/// and reading fewer is never a misfit.
+fn prototype_misfit_x86(
+    proto: &prototype::Prototype,
+    old: &FunctionFeatures,
+    new: &FunctionFeatures,
+) -> Option<String> {
+    use permanent_beta_model::{Abi, ArgSlot, slots32};
+    let convention = harness::convention(proto, old.signature.as_ref());
+    let values: Vec<_> = proto
+        .params
+        .iter()
+        .map(|p| harness::value_type_for(Abi::Win32, &p.ty))
+        .collect();
+    let (slots, bytes) = slots32(convention, &values);
+    let declared_regs = slots
+        .iter()
+        .filter(|s| matches!(s, Some(ArgSlot::Reg32(_))))
+        .count();
+    let declared_words = bytes.map(|b| (b / 4) as usize);
+    let problems = |f: &FunctionFeatures| -> Option<Vec<String>> {
+        let n = usize::from(f.inferred_args?);
+        let regs = f.inferred_arg_classes.len().min(n);
+        let mut out = Vec::new();
+        if regs > declared_regs {
+            out.push(format!(
+                "it reads {}, which a {convention} prototype like this one doesn't pass an argument in",
+                ["ecx", "ecx and edx"][regs.min(2) - 1]
+            ));
+        }
+        if let Some(words) = declared_words
+            && n - regs > words
+        {
+            out.push(format!(
+                "it reads {} words of stack arguments, where the prototype declares {words}",
+                n - regs
+            ));
         }
         Some(out)
     };
@@ -956,16 +1033,58 @@ mod tests {
         assert!(r.is_resolved(), "{:?}", r.action);
         // Nothing to judge by: no inference, or a variadic prototype.
         assert_eq!(
-            prototype_misfit("int f(int a)", &func(0x10, 0), &func(0x20, 0)),
+            prototype_misfit(
+                "int f(int a)",
+                permanent_beta_model::Abi::Win64,
+                &func(0x10, 0),
+                &func(0x20, 0)
+            ),
             None
         );
         assert_eq!(
             prototype_misfit(
                 "int f(const char* fmt, ...)",
+                permanent_beta_model::Abi::Win64,
                 &reads(func(0x10, 0), &[Integer]),
                 &reads(func(0x20, 0), &[Integer, Integer])
             ),
             None
         );
+    }
+
+    /// An x86 function that reads `regs` register arguments and then stack words up to `words`.
+    fn reads_x86(mut f: FunctionFeatures, regs: usize, words: u8) -> FunctionFeatures {
+        f.inferred_arg_classes = vec![permanent_beta_model::ArgClass::Integer; regs];
+        f.inferred_args = Some(regs as u8 + words);
+        f.signature = None;
+        f
+    }
+
+    #[test]
+    fn an_x86_function_that_started_reading_ecx_doesnt_fit_a_cdecl_prototype() {
+        use permanent_beta_model::Abi::Win32;
+        let old = reads_x86(func(0x10, 0), 0, 1);
+        let method = reads_x86(func(0x20, 0), 1, 1);
+        let why = prototype_misfit("int f(int a)", Win32, &old, &method).unwrap();
+        assert!(why.contains("reads ecx"), "{why}");
+        // Negative: a __thiscall prototype passes `this` in ecx.
+        assert_eq!(
+            prototype_misfit("int __thiscall f(T* self, int a)", Win32, &old, &method),
+            None
+        );
+    }
+
+    #[test]
+    fn an_x86_function_reading_past_its_stack_arguments_doesnt_fit() {
+        use permanent_beta_model::Abi::Win32;
+        let old = reads_x86(func(0x10, 0), 0, 1);
+        let more = reads_x86(func(0x20, 0), 0, 3);
+        let why = prototype_misfit("int f(int a)", Win32, &old, &more).unwrap();
+        assert!(why.contains("3 words of stack arguments"), "{why}");
+        // A double is two words: reading both of `g(double d)`'s is no misfit.
+        let two = reads_x86(func(0x20, 0), 0, 2);
+        assert_eq!(prototype_misfit("int g(double d)", Win32, &old, &two), None);
+        // Negative: what the old function already did isn't news.
+        assert_eq!(prototype_misfit("int f(int a)", Win32, &more, &more), None);
     }
 }

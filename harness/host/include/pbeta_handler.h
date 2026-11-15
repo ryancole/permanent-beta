@@ -15,6 +15,17 @@
 //
 // PBETA_HOOK(ret, name, params) exports `name` (the handler) and `pbeta_original_<name>`, a pointer the host sets
 // to the original before the first call. PBETA_ORIGINAL(name) is that pointer.
+//
+// In a 32-bit (x86) program the handler must also use the hooked function's calling convention:
+// PBETA_HOOK_CC(ret, convention, name, params), e.g. PBETA_HOOK_CC(int, __stdcall, Area, (int w, int h)). MSVC
+// allows __thiscall on member functions only, so a member function's handler is __fastcall with an unused second
+// parameter, which passes the same way (`this` in ecx, edx unused, the rest on the stack):
+//
+//     PBETA_HOOK_CC(int, __fastcall, Shape_Area, (Shape* self, void* edx_unused, int scale)) {
+//         return PBETA_ORIGINAL(Shape_Area)(self, edx_unused, scale);
+//     }
+//
+// `pbeta handler-stubs` writes these. On x64 there is one convention, and the keyword is ignored.
 
 #pragma once
 
@@ -28,6 +39,10 @@
 #define PBETA_HOOK(ret, name, params)                                                 \
     extern "C" __declspec(dllexport) ret(*pbeta_original_##name) params = nullptr; \
     extern "C" __declspec(dllexport) ret name params
+
+#define PBETA_HOOK_CC(ret, cc, name, params)                                                \
+    extern "C" __declspec(dllexport) ret(cc* pbeta_original_##name) params = nullptr; \
+    extern "C" __declspec(dllexport) ret cc name params
 
 #define PBETA_ORIGINAL(name) pbeta_original_##name
 

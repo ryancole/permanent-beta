@@ -11,7 +11,7 @@
 //! is at least [`MIN_LEN`] bytes. If no prefix of the function is unique (identical code elsewhere, e.g. a copy
 //! the linker didn't fold), there is no pattern: repair must not ship one that could resolve to the copy.
 
-use super::function::{FunctionRange, discover};
+use super::function::{FunctionRange, discover, is_immediate};
 use super::image::Image;
 use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind};
 use std::fmt;
@@ -114,7 +114,7 @@ pub struct PatternIndex {
 }
 
 impl PatternIndex {
-    /// Parse a PE x64 file.
+    /// Parse a PE x64 or x86 file.
     pub fn new(pe_bytes: &[u8]) -> Result<Self, String> {
         let image = Image::parse(pe_bytes)?;
         Ok(Self::from_image(image))
@@ -154,7 +154,8 @@ impl PatternIndex {
         let start_va = self.image.base + start as u64;
         let end_va = self.image.base + end as u64;
 
-        let mut decoder = Decoder::with_ip(64, bytes, start_va, DecoderOptions::NONE);
+        let mut decoder =
+            Decoder::with_ip(self.image.bitness(), bytes, start_va, DecoderOptions::NONE);
         let mut ins = Instruction::default();
         let mut pattern: Vec<Option<u8>> = Vec::new();
         let mut matches = 0;
@@ -219,21 +220,6 @@ impl PatternIndex {
             matches,
         })
     }
-}
-
-fn is_immediate(kind: OpKind) -> bool {
-    matches!(
-        kind,
-        OpKind::Immediate8
-            | OpKind::Immediate8_2nd
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64
-    )
 }
 
 /// Drop trailing wildcards: they never narrow a match.

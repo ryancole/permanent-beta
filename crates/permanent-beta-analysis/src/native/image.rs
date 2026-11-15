@@ -1,15 +1,15 @@
-//! A loaded PE x64 image: sections by RVA, exception table (`.pdata`), import address table, exports, and the
-//! code addresses stored in data (from base relocations).
+//! A loaded PE image, x64 (PE32+) or x86 (PE32): sections by RVA, exception table (`.pdata`, x64 only), import
+//! address table, exports, and the code addresses stored in data (from base relocations).
 //!
 //! `object` parses the headers and sections. The exception, import and base relocation directories are parsed
 //! by hand from section bytes: all are simple tables, and this keeps the parsing visible and testable.
 
 use object::pe::{
     IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_DIRECTORY_ENTRY_IMPORT,
-    IMAGE_REL_BASED_DIR64, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE,
+    IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE,
 };
-use object::read::pe::PeFile64;
-use object::{Architecture, LittleEndian as LE, Object, ObjectSection, SectionFlags};
+use object::read::pe::{ImageNtHeaders, PeFile, PeFile32, PeFile64};
+use object::{Architecture, FileKind, LittleEndian as LE, Object, ObjectSection, SectionFlags};
 use std::collections::{BTreeSet, HashMap};
 
 /// `UNW_FLAG_CHAININFO`: this RUNTIME_FUNCTION is a fragment (e.g. split cold code) of another function.
@@ -37,6 +37,9 @@ pub(crate) struct RuntimeFunction {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Image {
+    /// A 32-bit x86 image (PE32); otherwise x64 (PE32+). x86 code has no `.pdata`, addresses data with absolute
+    /// operands instead of RIP-relative ones, and stores 4-byte pointers.
+    pub x86: bool,
     pub base: u64,
     pub size_of_image: u32,
     pub entry: Option<u32>,
@@ -48,17 +51,24 @@ pub(crate) struct Image {
     pub exports: Vec<(u32, String)>,
     /// CodeView GUID and age from the debug directory (identifies the matching PDB; no symbols are read).
     pub pdb: Option<(String, u32)>,
-    /// Code addresses (RVAs, sorted, deduplicated) stored as 64-bit pointers in non-executable sections: every
-    /// `DIR64` base relocation whose slot is in data and whose value points into executable code. Function
-    /// tables, vtables, callbacks in initialized structs. Pointers stored in code are left out.
+    /// Code addresses (RVAs, sorted, deduplicated) stored as pointers in non-executable sections: every `DIR64`
+    /// (x64) or `HIGHLOW` (x86) base relocation whose slot is in data and whose value points into executable
+    /// code. Function tables, vtables, callbacks in initialized structs. Pointers stored in code are left out.
     pub code_pointers: Vec<u32>,
     /// The same pointers by where they're stored: (slot RVA, target RVA), sorted by slot. Consecutive slots are
     /// tables (vtables, function tables).
     pub code_pointer_slots: Vec<(u32, u32)>,
+    /// x86 only: the base relocation slots that are in executable code, i.e. absolute addresses in instruction
+    /// operands (`push offset f`, `mov eax, [g]`). With them, an operand is known to be an address rather than a
+    /// constant that happens to look like one. Empty for x64, and for an x86 image linked without relocations
+    /// (`/FIXED`): see [`Self::relocated`].
+    pub code_relocs: BTreeSet<u32>,
+    /// The image has a base relocation directory.
+    pub has_relocs: bool,
 }
 
 impl Image {
-    /// Parse a PE x64 file, refusing a protected or packed one (`protection`).
+    /// Parse a PE x64 or x86 file, refusing a protected or packed one (`protection`).
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let image = Self::parse_any(bytes)?;
         match super::protection::detect(&image) {
@@ -67,12 +77,26 @@ impl Image {
         }
     }
 
-    /// Parse a PE x64 file without the protection check: callers must make it themselves.
+    /// Parse a PE x64 or x86 file without the protection check: callers must make it themselves.
     pub fn parse_any(bytes: &[u8]) -> Result<Self, String> {
-        let pe = PeFile64::parse(bytes).map_err(|e| e.to_string())?;
-        if pe.architecture() != Architecture::X86_64 {
+        match FileKind::parse(bytes).map_err(|e| e.to_string())? {
+            FileKind::Pe64 => {
+                Self::load(&PeFile64::parse(bytes).map_err(|e| e.to_string())?, false)
+            }
+            FileKind::Pe32 => Self::load(&PeFile32::parse(bytes).map_err(|e| e.to_string())?, true),
+            kind => Err(format!("not a PE image ({kind:?})")),
+        }
+    }
+
+    fn load<Pe: ImageNtHeaders>(pe: &PeFile<'_, Pe>, x86: bool) -> Result<Self, String> {
+        let want = if x86 {
+            Architecture::I386
+        } else {
+            Architecture::X86_64
+        };
+        if pe.architecture() != want {
             return Err(format!(
-                "architecture {:?} (only x64 is supported)",
+                "architecture {:?} (only x64 and x86 are supported)",
                 pe.architecture()
             ));
         }
@@ -131,6 +155,7 @@ impl Image {
         );
 
         let mut image = Image {
+            x86,
             base,
             size_of_image,
             entry,
@@ -139,18 +164,41 @@ impl Image {
             pdb,
             ..Default::default()
         };
-        if let Some((rva, size)) = exception_dir {
+        // x86 keeps no RUNTIME_FUNCTION table; a stray exception directory isn't one.
+        if let Some((rva, size)) = exception_dir.filter(|_| !x86) {
             image.pdata = image.parse_pdata(rva, size);
         }
         if let Some((rva, _)) = import_dir {
             image.iat = image.parse_imports(rva);
         }
         if let Some((rva, size)) = reloc_dir {
-            image.code_pointer_slots = image.parse_code_pointers(rva, size);
+            image.has_relocs = true;
+            let (slots, in_code) = image.parse_relocs(rva, size);
+            image.code_pointer_slots = slots;
+            if x86 {
+                image.code_relocs = in_code;
+            }
             let targets: BTreeSet<u32> = image.code_pointer_slots.iter().map(|&(_, t)| t).collect();
             image.code_pointers = targets.into_iter().collect();
         }
         Ok(image)
+    }
+
+    /// Instruction width in bits, for the decoder.
+    pub fn bitness(&self) -> u32 {
+        if self.x86 { 32 } else { 64 }
+    }
+
+    /// Bytes in a pointer stored in data.
+    pub fn pointer_size(&self) -> u32 {
+        if self.x86 { 4 } else { 8 }
+    }
+
+    /// Whether the instruction at `[rva, rva + len)` holds a relocated address (x86): an absolute operand the
+    /// loader rebases, so an address and not a constant that happens to look like one. An image without
+    /// relocations gives no such evidence, so there every operand counts.
+    pub fn relocated(&self, rva: u32, len: u32) -> bool {
+        !self.has_relocs || self.code_relocs.range(rva..rva + len).next().is_some()
     }
 
     fn section_at(&self, rva: u32) -> Option<&Section> {
@@ -210,6 +258,15 @@ impl Image {
 
     fn u64_at(&self, rva: u32) -> Option<u64> {
         Some(u64::from_le_bytes(self.bytes(rva, 8)?.try_into().ok()?))
+    }
+
+    /// A pointer-sized value: 4 bytes on x86, 8 on x64.
+    pub fn ptr_at(&self, rva: u32) -> Option<u64> {
+        if self.x86 {
+            self.u32_at(rva).map(u64::from)
+        } else {
+            self.u64_at(rva)
+        }
     }
 
     /// NUL-terminated byte string at `rva` (any bytes, for names in PE tables).
@@ -304,9 +361,17 @@ impl Image {
     }
 
     /// Walk the base relocation table (blocks of: page RVA, block size, then 16-bit entries of type << 12 |
-    /// page offset) and keep the `DIR64` slots in data that point into executable code, as (slot, target).
-    fn parse_code_pointers(&self, rva: u32, size: u32) -> Vec<(u32, u32)> {
+    /// page offset). Returns the pointer slots in data that point into executable code, as (slot, target), and
+    /// every slot that's in executable code. Only the image's own pointer type counts: `DIR64` on x64,
+    /// `HIGHLOW` on x86.
+    fn parse_relocs(&self, rva: u32, size: u32) -> (Vec<(u32, u32)>, BTreeSet<u32>) {
+        let kind = if self.x86 {
+            IMAGE_REL_BASED_HIGHLOW
+        } else {
+            IMAGE_REL_BASED_DIR64
+        };
         let mut out = BTreeSet::new();
+        let mut in_code = BTreeSet::new();
         let mut at = rva;
         let end = rva.saturating_add(size);
         while at + 8 <= end {
@@ -321,14 +386,15 @@ impl Image {
                     break;
                 };
                 let e = u16::from_le_bytes([e[0], e[1]]);
-                if e >> 12 != IMAGE_REL_BASED_DIR64 {
+                if e >> 12 != kind {
                     continue;
                 }
                 let slot = page + u32::from(e & 0xfff);
                 if self.is_executable(slot) {
+                    in_code.insert(slot);
                     continue;
                 }
-                if let Some(target) = self.u64_at(slot).and_then(|v| self.va_to_rva(v))
+                if let Some(target) = self.ptr_at(slot).and_then(|v| self.va_to_rva(v))
                     && self.is_executable(target)
                 {
                     out.insert((slot, target));
@@ -336,7 +402,12 @@ impl Image {
             }
             at += block;
         }
-        out.into_iter().collect()
+        (out.into_iter().collect(), in_code)
+    }
+
+    #[cfg(test)]
+    fn parse_code_pointers(&self, rva: u32, size: u32) -> Vec<(u32, u32)> {
+        self.parse_relocs(rva, size).0
     }
 
     fn parse_imports(&self, rva: u32) -> HashMap<u32, String> {
@@ -355,20 +426,25 @@ impl Image {
             } else {
                 first_thunk
             };
+            let (width, ordinal_flag) = if self.x86 {
+                (4, 1u64 << 31)
+            } else {
+                (8, 1u64 << 63)
+            };
             for i in 0.. {
-                let Some(thunk) = self.u64_at(lookup + i * 8) else {
+                let Some(thunk) = self.ptr_at(lookup + i * width) else {
                     break;
                 };
                 if thunk == 0 {
                     break;
                 }
-                let func = if thunk & (1 << 63) != 0 {
+                let func = if thunk & ordinal_flag != 0 {
                     format!("#{}", thunk & 0xffff)
                 } else {
                     // IMAGE_IMPORT_BY_NAME: u16 hint, then the name.
                     self.c_name(thunk as u32 + 2).unwrap_or_default()
                 };
-                iat.insert(first_thunk + i * 8, format!("{dll}!{func}"));
+                iat.insert(first_thunk + i * width, format!("{dll}!{func}"));
             }
         }
         iat
@@ -537,6 +613,110 @@ pub(crate) mod tests {
         d[0x804..0x808].copy_from_slice(&10u32.to_le_bytes());
         d[0x808..0x80a].copy_from_slice(&dir64(0x80).to_le_bytes());
         assert!(img.parse_code_pointers(0x2800, 10).is_empty());
+    }
+
+    /// A minimal PE32 (x86) file with base 0x400000: `.text` at 0x1000 (`push offset 0x401010` at its start, its
+    /// operand relocated; `ret` at 0x1010), `.rdata` at 0x2000 (imports: `k.dll!Sleep` by name and ordinal 7;
+    /// relocations) and `.data` at 0x3000 (a pointer to 0x401010, relocated). `machine` is the COFF machine.
+    fn pe32(machine: u16) -> Vec<u8> {
+        const BASE: u32 = 0x40_0000;
+        let mut f = vec![0u8; 0xa00];
+        let mut put = |off: usize, bytes: &[u8]| f[off..off + bytes.len()].copy_from_slice(bytes);
+        put(0, b"MZ");
+        put(0x3c, &0x80u32.to_le_bytes());
+        put(0x80, b"PE  ");
+        put(0x84, &machine.to_le_bytes());
+        put(0x86, &3u16.to_le_bytes()); // sections
+        put(0x94, &0xe0u16.to_le_bytes()); // optional header size
+        put(0x96, &0x102u16.to_le_bytes()); // executable, 32-bit
+        let o = 0x98;
+        put(o, &0x10bu16.to_le_bytes()); // PE32
+        put(o + 16, &0x1010u32.to_le_bytes()); // entry point
+        put(o + 28, &BASE.to_le_bytes());
+        put(o + 32, &0x1000u32.to_le_bytes()); // section alignment
+        put(o + 36, &0x200u32.to_le_bytes()); // file alignment
+        put(o + 40, &6u16.to_le_bytes());
+        put(o + 48, &6u16.to_le_bytes());
+        put(o + 56, &0x4000u32.to_le_bytes()); // size of image
+        put(o + 60, &0x400u32.to_le_bytes()); // size of headers
+        put(o + 68, &3u16.to_le_bytes()); // console
+        put(o + 92, &16u32.to_le_bytes()); // data directories
+        put(o + 96 + 8, &0x2000u32.to_le_bytes()); // import directory
+        put(o + 96 + 12, &40u32.to_le_bytes());
+        put(o + 96 + 5 * 8, &0x2100u32.to_le_bytes()); // base relocations
+        put(o + 96 + 5 * 8 + 4, &32u32.to_le_bytes());
+        let sections = [
+            (b".text   ", 0x1000u32, 0x400u32, 0x6000_0020u32),
+            (b".rdata  ", 0x2000, 0x600, 0x4000_0040),
+            (b".data   ", 0x3000, 0x800, 0xc000_0040),
+        ];
+        for (i, (name, rva, raw, flags)) in sections.iter().enumerate() {
+            let h = 0x178 + 40 * i;
+            put(h, *name);
+            put(h + 8, &0x200u32.to_le_bytes());
+            put(h + 12, &rva.to_le_bytes());
+            put(h + 16, &0x200u32.to_le_bytes());
+            put(h + 20, &raw.to_le_bytes());
+            put(h + 36, &flags.to_le_bytes());
+        }
+        // .text: push 0x401010; ret ... 0x1010: ret
+        put(0x400, &[0x68, 0x10, 0x10, 0x40, 0x00, 0xc3]);
+        put(0x410, &[0xc3]);
+        // .rdata: one import descriptor (lookup 0x2040, name 0x2030, IAT 0x2050), then the null one.
+        let r = 0x600;
+        put(r, &0x2040u32.to_le_bytes());
+        put(r + 12, &0x2030u32.to_le_bytes());
+        put(r + 16, &0x2050u32.to_le_bytes());
+        put(r + 0x30, b"K.dll ");
+        for at in [r + 0x40, r + 0x50] {
+            put(at, &0x2060u32.to_le_bytes()); // by name
+            put(at + 4, &(0x8000_0000u32 | 7).to_le_bytes()); // by ordinal
+        }
+        put(r + 0x62, b"Sleep ");
+        // Relocations: page 0x1000 (HIGHLOW at +1, the push operand), page 0x3000 (HIGHLOW at +0, and a DIR64
+        // entry at +8 an x86 image doesn't use).
+        put(r + 0x100, &0x1000u32.to_le_bytes());
+        put(r + 0x104, &12u32.to_le_bytes());
+        put(r + 0x108, &((3u16 << 12) | 1).to_le_bytes());
+        put(r + 0x10c, &0x3000u32.to_le_bytes());
+        put(r + 0x110, &12u32.to_le_bytes());
+        put(r + 0x114, &(3u16 << 12).to_le_bytes());
+        put(r + 0x116, &((10u16 << 12) | 8).to_le_bytes());
+        // .data: a pointer to 0x401010, then (at +8) one to 0x401000 only a DIR64 entry names.
+        put(0x800, &0x40_1010u32.to_le_bytes());
+        put(0x808, &0x40_1000u32.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn a_pe32_image_is_read_as_x86() {
+        let img = Image::parse(&pe32(0x14c)).expect("PE32 parses");
+        assert!(img.x86);
+        assert_eq!((img.base, img.entry), (0x40_0000, Some(0x1010)));
+        // 4-byte IAT slots, the ordinal flag in bit 31.
+        assert_eq!(
+            img.iat.get(&0x2050).map(String::as_str),
+            Some("k.dll!Sleep")
+        );
+        assert_eq!(img.iat.get(&0x2054).map(String::as_str), Some("k.dll!#7"));
+        // The HIGHLOW pointer in data is a code pointer; the one in code is an operand's address.
+        assert_eq!(img.code_pointer_slots, vec![(0x3000, 0x1010)]);
+        assert_eq!(
+            img.code_relocs.iter().copied().collect::<Vec<_>>(),
+            vec![0x1001]
+        );
+        assert!(img.relocated(0x1000, 5));
+        // Negative: a DIR64 entry in an x86 image isn't a pointer, and an instruction without a relocation holds
+        // no address.
+        assert!(!img.code_pointers.contains(&0x1000));
+        assert!(!img.relocated(0x1005, 1));
+    }
+
+    #[test]
+    fn a_pe32_with_another_machine_is_refused() {
+        // Negative: a PE32 header claiming ARM (0x1c4) is neither x86 nor x64.
+        let err = Image::parse(&pe32(0x1c4)).unwrap_err();
+        assert!(err.contains("only x64 and x86"), "{err}");
     }
 
     #[test]

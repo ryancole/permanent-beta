@@ -16,12 +16,18 @@
   the original or call through; and negatives: a build the config doesn't list (no hooks), a pattern that doesn't
   match (that hook refused), a handler DLL without the export (refused).
 
-  Output in target/host-test.
+  Output in target/host-test. With -Arch x86, the x86 host (target/host-x86) on a 32-bit build of the test app, with
+  three more hooks, one per x86 calling convention that isn't __cdecl (__stdcall, __fastcall, __thiscall), in
+  target/host-test-x86.
 #>
+param(
+    [ValidateSet('x64', 'x86')] [string] $Arch = 'x64'
+)
 $ErrorActionPreference = 'Stop'
+$x86 = $Arch -eq 'x86'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
-$out = Join-Path $repo 'target/host-test'
-$host_ = Join-Path $repo 'target/host'
+$out = Join-Path $repo $(if ($x86) { 'target/host-test-x86' } else { 'target/host-test' })
+$host_ = Join-Path $repo $(if ($x86) { 'target/host-x86' } else { 'target/host' })
 $failures = 0
 
 function Invoke-Native([string] $exe, [string[]] $arguments) {
@@ -40,7 +46,7 @@ function Check([bool] $ok, [string] $what) {
 
 # --- build -------------------------------------------------------------------------------------------------
 
-& (Join-Path $PSScriptRoot 'build.ps1') | Out-Null   # also puts cl.exe on PATH for this session
+& (Join-Path $PSScriptRoot 'build.ps1') -Arch $Arch | Out-Null   # also puts cl.exe for $Arch on PATH for this session
 if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
     $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -85,12 +91,21 @@ $prototypes = [ordered]@{
     count_chars = 'size_t count_chars(const char* s, const wchar_t* w)'
     fib         = 'unsigned long long fib(unsigned n)'
 }
+# The PDB's name for each hook's function, where it isn't the hook's.
+$pdbNames = @{ Box_get = 'Box::get' }
+if ($x86) {
+    $prototypes['area'] = 'int __stdcall area(int w, int h)'
+    $prototypes['fsum'] = 'int __fastcall fsum(int a, int b, int c)'
+    $prototypes['Box_get'] = 'int __thiscall Box_get(void* self, int i)'
+}
+$hookCount = $prototypes.Count
 foreach ($v in 'v1', 'v2') {
     Invoke-Native $pbeta @('analyze', $exe[$v], '--pdb', (Join-Path $out "$v/hosttest.pdb"), '--out', "$work\$v.json") | Out-Null
 }
 $functions = (Get-Content "$work\v1.json" -Raw | ConvertFrom-Json).functions
 $manifest = foreach ($name in $prototypes.Keys) {
-    $f = $functions | Where-Object { $_.name -eq $name }
+    $pdbName = if ($pdbNames.ContainsKey($name)) { $pdbNames[$name] } else { $name }
+    $f = $functions | Where-Object { $_.name -eq $pdbName }
     if (-not $f) { throw "no function $name in the v1 analysis" }
     "[[hook]]`nname = `"$name`"`ndetour = `"log`"`nprototype = `"$($prototypes[$name])`"`n`n[hook.target]`nbuild = `"v1`"`nrva = $($f.rva)`n"
 }
@@ -104,8 +119,10 @@ Check ($LASTEXITCODE -eq 0) 'every hook resolved'
 # --- running -------------------------------------------------------------------------------------------------
 
 # Manifests with these actions (hook name -> detour; the rest log), and the host config for them.
-function New-Config([string] $name, [hashtable] $actions, [string[]] $builds = @('v1', 'v2')) {
+function New-Config([string] $name, [hashtable] $actions, [string[]] $builds = @('v1', 'v2'), [switch] $NoAnalysis) {
     $hooks = @()
+    # The builds' analyses: what tells host-config an x86 build is one.
+    $analyses = if ($NoAnalysis) { @() } else { @('--analysis', "$work\v1.json", '--analysis', "$work\v2.json") }
     foreach ($b in $builds) {
         $text = Get-Content "$work\hooks.$b.toml" -Raw
         foreach ($k in $actions.Keys) {
@@ -116,7 +133,7 @@ function New-Config([string] $name, [hashtable] $actions, [string[]] $builds = @
         $hooks += @('--hooks', $path)
     }
     $config = "$work\$name.host.toml"
-    Invoke-Native $pbeta (@('host-config') + $hooks + @('--out', $config)) | Out-Null
+    Invoke-Native $pbeta (@('host-config') + $hooks + $analyses + @('--out', $config)) | Out-Null
     $config
 }
 
@@ -136,9 +153,12 @@ function Lines([string[]] $lines) { ($lines | Where-Object { $_ -notmatch '^bann
 function Has([string[]] $log, [string] $line) { $log -contains $line }
 function Count([string[]] $log, [string] $prefix) { @($log | Where-Object { $_.StartsWith($prefix) }).Count }
 
-$baseline = @(
-    'add3 9', 'add3 0', 'sum12 650', 'mix 6.75', 'scalef 6', 'store 7', 'count_chars 10', 'fib 55', 'threads 2006000'
-) -join "`n"
+# x86: the conventions' lines, between fib and threads.
+function Results([string[]] $common, [string[]] $x86Lines, [string] $threads) {
+    (@($common) + $(if ($x86) { @($x86Lines) } else { @() }) + @($threads)) -join "`n"
+}
+$baseline = Results @('add3 9', 'add3 0', 'sum12 650', 'mix 6.75', 'scalef 6', 'store 7', 'count_chars 10', 'fib 55') `
+    @('area 13', 'fsum 14', 'box 72') 'threads 2006000'
 
 Write-Host 'unhooked'
 foreach ($b in 'v1', 'v2') {
@@ -151,7 +171,7 @@ $config = New-Config 'log' @{}
 foreach ($b in 'v1', 'v2') {
     $r = Invoke-Hosted $config $b 'log'
     Check ($r.Code -eq 0 -and (Lines $r.Output) -eq $baseline) "$b output unchanged"
-    Check ((Count $r.Log '') -gt 0 -and @($r.Log | Where-Object { $_ -match ': attached at ' }).Count -eq 7) "$b all 7 hooks attached"
+    Check ((Count $r.Log '') -gt 0 -and @($r.Log | Where-Object { $_ -match ': attached at ' }).Count -eq $hookCount) "$b all $hookCount hooks attached"
     Check (Has $r.Log 'add3(a=2, b=3, c=4) -> 9') "$b add3 arguments and result"
     Check (Has $r.Log 'add3(a=-1, b=-2, c=3) -> 0') "$b negative integers"
     Check (Has $r.Log 'sum12(a1=1, a2=2, a3=3, a4=4, a5=5, a6=6, a7=7, a8=8, a9=9, a10=10, a11=11, a12=12) -> 650') "$b eight stack arguments"
@@ -161,12 +181,23 @@ foreach ($b in 'v1', 'v2') {
     Check (@($r.Log | Where-Object { $_ -match '^count_chars\(s=0x[0-9a-f]+ "hello", w=0x[0-9a-f]+ "wörld"\) -> 10$' }).Count -eq 1) "$b char and wchar_t strings"
     Check ((Count $r.Log 'fib(') -eq 177 -and (Has $r.Log 'fib(n=10) -> 55')) "$b recursion (177 calls)"
     Check ((Count $r.Log 'add3(') -eq 4002) "$b calls from 4 threads (4002 add3 lines)"
+    if ($x86) {
+        Check (Has $r.Log 'area(w=3, h=4) -> 13') "$b __stdcall arguments and result"
+        Check (Has $r.Log 'fsum(a=1, b=2, c=3) -> 14') "$b __fastcall: ecx, edx and the stack"
+        Check (@($r.Log | Where-Object { $_ -match '^Box_get\(self=0x[0-9a-f]+, i=2\) -> 72$' }).Count -eq 1) "$b __thiscall: this in ecx"
+    }
 }
 
 Write-Host 'return and skip: the original never runs'
-$config = New-Config 'short' @{ add3 = 'return 42'; store = 'skip'; mix = 'skip' }
-$expected = @('add3 42', 'add3 42', 'sum12 650', 'mix 0', 'scalef 6', 'store 0', 'count_chars 10', 'fib 55',
-    'threads 168000') -join "`n"
+$short = @{ add3 = 'return 42'; store = 'skip'; mix = 'skip' }
+if ($x86) {
+    # The callee removes the arguments in both: `return` and `skip` must too.
+    $short['area'] = 'return 42'
+    $short['Box_get'] = 'skip'
+}
+$config = New-Config 'short' $short
+$expected = Results @('add3 42', 'add3 42', 'sum12 650', 'mix 0', 'scalef 6', 'store 0', 'count_chars 10', 'fib 55') `
+    @('area 42', 'fsum 14', 'box 0') 'threads 168000'
 foreach ($b in 'v1', 'v2') {
     $r = Invoke-Hosted $config $b 'short'
     Check ($r.Code -eq 0 -and (Lines $r.Output) -eq $expected) "$b output: add3 returns 42, store and mix skipped"
@@ -175,15 +206,20 @@ foreach ($b in 'v1', 'v2') {
 }
 
 Write-Host 'handlers: one replaces the original, two call through'
-$config = New-Config 'handlers' @{
+$handlers = @{
     add3 = 'hosttest_handlers.dll!add3'; sum12 = 'hosttest_handlers.dll!sum12'; mix = 'hosttest_handlers.dll!mix'
 }
-$expected = @('add3 24', 'add3 6', 'sum12 651', 'mix 13.5', 'scalef 6', 'store 7', 'count_chars 10', 'fib 55',
-    'threads 1998000') -join "`n"
+if ($x86) {
+    $handlers['area'] = 'hosttest_handlers.dll!area'
+    $handlers['Box_get'] = 'hosttest_handlers.dll!Box_get'
+}
+$config = New-Config 'handlers' $handlers
+$expected = Results @('add3 24', 'add3 6', 'sum12 651', 'mix 13.5', 'scalef 6', 'store 7', 'count_chars 10', 'fib 55') `
+    @('area 113', 'fsum 14', 'box 144') 'threads 1998000'
 foreach ($b in 'v1', 'v2') {
     $r = Invoke-Hosted $config $b 'handlers'
     Check ($r.Code -eq 0 -and (Lines $r.Output) -eq $expected) "$b output from the handlers"
-    Check (@($r.Log | Where-Object { $_ -match '^(add3|sum12|mix): attached at .*, handled by hosttest_handlers\.dll!' }).Count -eq 3) "$b 3 handlers attached"
+    Check (@($r.Log | Where-Object { $_ -match '^(add3|sum12|mix|area|Box_get): attached at .*, handled by hosttest_handlers\.dll!' }).Count -eq $handlers.Count) "$b $($handlers.Count) handlers attached"
     Check (Has $r.Log 'handler: sum12 -> 650') "$b handler logs through the host"
 }
 
@@ -205,17 +241,30 @@ Check (-not ((Get-Content "$work\stubs.v1.toml" -Raw) -match 'prototype = "[^"]*
 Invoke-Native $pbeta @('handler-stubs', '--hooks', "$work\stubs.v1.toml", '--hooks', "$work\stubs.v2.toml",
     '--analysis', "$work\v1.json", '--analysis', "$work\v2.json", '--out', "$work\stubs.cpp") | Out-Null
 $stubs = Get-Content "$work\stubs.cpp" -Raw
-Check (([regex]::Matches($stubs, 'PBETA_HOOK\(')).Count -eq 7) '7 stubs generated'
+Check (([regex]::Matches($stubs, 'PBETA_HOOK(_CC)?\(')).Count -eq $hookCount) "$hookCount stubs generated"
+if ($x86) {
+    Check ($stubs -match 'PBETA_HOOK_CC\(int, __stdcall, area,') 'area stub is __stdcall'
+    Check ($stubs -match 'PBETA_HOOK_CC\(int, __fastcall, Box_get, \(void\* self, void\* edx_unused, int i\)\)') 'Box_get stub is __fastcall with an unused edx'
+}
 Check ($stubs -match '// fib: PDB signature') 'fib stub from the PDB signature'
 Invoke-Native 'cl.exe' ($cl + @('/LD', "/I$host_\include", "$work\stubs.cpp", "/Fo$work\", "/Fd$work\stubs-cl.pdb",
         "/Fe$work\stubs.dll", '/link', "/IMPLIB:$work\stubs.lib")) | Out-Null
 foreach ($b in 'v1', 'v2') {
     $r = Invoke-Hosted $config $b 'stubs'
     Check ($r.Code -eq 0 -and (Lines $r.Output) -eq $baseline) "$b output unchanged through the stubs"
-    Check (@($r.Log | Where-Object { $_ -match ', handled by stubs\.dll!' }).Count -eq 7) "$b 7 stubs attached"
+    Check (@($r.Log | Where-Object { $_ -match ', handled by stubs\.dll!' }).Count -eq $hookCount) "$b $hookCount stubs attached"
 }
 & $pbeta handler-stubs --hooks "$work\stubs.v1.toml" --out "$work\stubs.cpp" 2>&1 | Out-Null
 Check ($LASTEXITCODE -ne 0) 'negative: an existing handler file is not overwritten'
+
+if ($x86) {
+    Write-Host "negative: a config written without the x86 build's analysis"
+    $config = New-Config 'noanalysis' @{ add3 = 'return 42' } -NoAnalysis
+    $r = Invoke-Hosted $config 'v1' 'noanalysis'
+    Check ($r.Code -eq 0 -and (Lines $r.Output) -eq $baseline) 'v1 runs unhooked'
+    Check (@($r.Log | Where-Object { $_ -match '^add3: skipped \(a win64 entry; this host is win32' }).Count -eq 1 -and
+        -not ($r.Log | Where-Object { $_ -match ': attached at ' })) 'every entry refused as x64'
+}
 
 Write-Host 'negative: a build the config does not list'
 $config = New-Config 'v2only' @{ add3 = 'return 42' } @('v2')

@@ -18,6 +18,84 @@ use std::str::FromStr;
 
 /// The recorder's ABI: Win64 (`rcx`, `rdx`, `r8`, `r9` / `xmm0`–`xmm3`, then the stack).
 pub const ABI_WIN64: &str = "win64";
+/// The recorder's ABI for x86 (32-bit) code: MSVC's conventions ([`Convention`]). Arguments are on the stack from
+/// `esp+4` up, except `this` in ecx (`__thiscall`) and the first two small ones in ecx and edx (`__fastcall`).
+/// Results are in eax (edx:eax for 8 bytes) and, for floating point, in st(0).
+pub const ABI_WIN32: &str = "win32";
+
+/// Which ABI a record spec's slots and a recording's registers follow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Abi {
+    #[default]
+    Win64,
+    Win32,
+}
+
+impl Abi {
+    /// The name a [`TestCase`] records ([`ABI_WIN64`], [`ABI_WIN32`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Win64 => ABI_WIN64,
+            Self::Win32 => ABI_WIN32,
+        }
+    }
+
+    /// Bytes in a pointer.
+    pub fn pointer_size(self) -> u64 {
+        match self {
+            Self::Win64 => 8,
+            Self::Win32 => 4,
+        }
+    }
+
+    pub fn is_win64(&self) -> bool {
+        *self == Self::Win64
+    }
+}
+
+/// An x86 calling convention (MSVC). Win64 has one convention, so it needs none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Convention {
+    /// Arguments on the stack; the caller removes them. MSVC's default for free functions.
+    Cdecl,
+    /// Arguments on the stack; the callee removes them (`ret n`). Most Win32 API functions.
+    Stdcall,
+    /// `this` in ecx, the rest on the stack; the callee removes them. MSVC's default for member functions.
+    Thiscall,
+    /// The first two arguments of 4 bytes or less in ecx and edx, the rest on the stack; the callee removes them.
+    Fastcall,
+}
+
+impl Convention {
+    /// The convention a keyword names (`__stdcall`, `__thiscall`, ...), if it names one.
+    pub fn from_keyword(word: &str) -> Option<Self> {
+        Some(match word.trim_start_matches('_') {
+            "cdecl" => Self::Cdecl,
+            "stdcall" => Self::Stdcall,
+            "thiscall" => Self::Thiscall,
+            "fastcall" => Self::Fastcall,
+            _ => return None,
+        })
+    }
+
+    /// The callee removes the stack arguments when it returns (`ret n`).
+    pub fn callee_pops(self) -> bool {
+        self != Self::Cdecl
+    }
+}
+
+impl fmt::Display for Convention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cdecl => "__cdecl",
+            Self::Stdcall => "__stdcall",
+            Self::Thiscall => "__thiscall",
+            Self::Fastcall => "__fastcall",
+        })
+    }
+}
 
 /// What the recording hook DLL captures for each hook of one build (`pbeta harness-spec`): the argument slots,
 /// how each value travels, and what each pointer argument points to. Hand-editable: `capture` can be changed or
@@ -26,6 +104,9 @@ pub const ABI_WIN64: &str = "win64";
 pub struct HarnessSpec {
     /// The build the RVAs are valid for. The recorder skips the spec in any other build.
     pub build: BuildId,
+    /// The ABI the slots follow: the build's (`win32` for an x86 build). A spec without the key is Win64.
+    #[serde(default, skip_serializing_if = "Abi::is_win64")]
+    pub abi: Abi,
     /// At most this many distinct cases per hook. Identical calls (same registers, stack and memory) are
     /// recorded once.
     pub max_cases: u32,
@@ -34,7 +115,7 @@ pub struct HarnessSpec {
     /// (a formatted string passed to `printf`), and replay can't stand in for imports that read memory.
     #[serde(default = "default_true")]
     pub import_memory: bool,
-    /// How many pointers deep the recorder follows from the arguments' memory: each 8-byte word in captured memory
+    /// How many pointers deep the recorder follows from the arguments' memory: each pointer-sized word in captured memory
     /// that points to readable memory outside the image leads to a [`CaptureKind::Pointee`] region (a whole heap
     /// block, or a fixed block from the pointer), and so on, this many times. 0 captures the arguments' memory
     /// only (and is what a spec without the key means). Redacted memory is never captured.
@@ -79,8 +160,13 @@ pub struct HookRecordSpec {
     /// The return value's register class and width. `unknown` (e.g. a struct by value) makes its cases
     /// inconclusive on replay: there's nothing sound to compare.
     pub ret: ValueType,
-    /// Parameters past the fourth are on the stack: how many 8-byte slots above the shadow space to record.
+    /// The stack words to record. Win64: parameters past the fourth, 8-byte slots above the shadow space. Win32:
+    /// every stack argument, 4-byte words from `esp+4` up (an 8-byte argument takes two).
     pub stack_args: u32,
+    /// Win32: the calling convention, which says where the arguments are and whether the callee removes the
+    /// `stack_args` words when it returns. None on Win64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convention: Option<Convention>,
     #[serde(rename = "arg", default)]
     pub args: Vec<ArgSpec>,
     /// Globals the function or anything it calls refers to (the analysis's `data_refs`, named by the PDB):
@@ -232,8 +318,9 @@ impl FromStr for ValueType {
     }
 }
 
-/// Where a Win64 argument is at the function's entry: `rcx`/`rdx`/`r8`/`r9`, `xmm0`–`xmm3`, or the stack slot at
-/// `rsp + offset` (the fifth parameter is at `stack+0x28`, above the return address and the shadow space).
+/// Where an argument is at the function's entry. Win64: `rcx`/`rdx`/`r8`/`r9`, `xmm0`–`xmm3`, or the stack slot at
+/// `rsp + offset` (the fifth parameter is at `stack+0x28`, above the return address and the shadow space). Win32:
+/// `ecx`/`edx`, or the stack at `esp + offset` (the first stack argument is at `esp+0x4`, above the return address).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ArgSlot {
     /// 0–3: rcx, rdx, r8, r9.
@@ -242,9 +329,55 @@ pub enum ArgSlot {
     Vector(u8),
     /// Byte offset from rsp at entry.
     Stack(u32),
+    /// Win32, 0–1: ecx, edx.
+    Reg32(u8),
+    /// Win32: byte offset from esp at entry.
+    Stack32(u32),
 }
 
 pub const INT_ARG_REGS: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
+pub const REG32_ARG_REGS: [&str; 2] = ["ecx", "edx"];
+
+/// Bytes a value takes on the x86 stack: 4, or 8 for a 64-bit integer or a double. `None` for a struct by value or
+/// an unknown type, whose size the value type doesn't say.
+pub fn stack32_size(value: ValueType) -> Option<u32> {
+    match value {
+        ValueType::Int(8) | ValueType::Float(8) => Some(8),
+        ValueType::Int(_) | ValueType::Float(_) | ValueType::Pointer => Some(4),
+        ValueType::Void | ValueType::Unknown => None,
+    }
+}
+
+/// x86 argument slots for parameters of these value types under `convention`, and the bytes of stack arguments.
+/// Once a parameter's stack size isn't known (a struct by value), it and every later stack parameter get `None`,
+/// and so does the byte count: where they are isn't known.
+pub fn slots32(
+    convention: Convention,
+    values: &[ValueType],
+) -> (Vec<Option<ArgSlot>>, Option<u32>) {
+    let mut next_reg = 0u8;
+    let mut offset = Some(4u32);
+    let mut out = Vec::with_capacity(values.len());
+    for (i, &v) in values.iter().enumerate() {
+        // `this` is in ecx; fastcall takes the first two arguments of 4 bytes or less, in order.
+        let in_register = match convention {
+            Convention::Thiscall => i == 0,
+            Convention::Fastcall => {
+                next_reg < 2 && matches!(v, ValueType::Int(1 | 2 | 4) | ValueType::Pointer)
+            }
+            Convention::Cdecl | Convention::Stdcall => false,
+        };
+        if in_register {
+            out.push(Some(ArgSlot::Reg32(next_reg)));
+            next_reg += 1;
+            continue;
+        }
+        let size = stack32_size(v);
+        out.push(offset.filter(|_| size.is_some()).map(ArgSlot::Stack32));
+        offset = offset.zip(size).map(|(o, s)| o + s);
+    }
+    (out, offset.map(|o| o - 4))
+}
 
 impl ArgSlot {
     /// The slot of the parameter at `index` (0-based), passed in a vector register when `vector`.
@@ -263,6 +396,8 @@ impl fmt::Display for ArgSlot {
             Self::Int(i) => f.write_str(INT_ARG_REGS[usize::from(*i).min(3)]),
             Self::Vector(i) => write!(f, "xmm{i}"),
             Self::Stack(off) => write!(f, "stack+{off:#x}"),
+            Self::Reg32(i) => f.write_str(REG32_ARG_REGS[usize::from(*i).min(1)]),
+            Self::Stack32(off) => write!(f, "esp+{off:#x}"),
         }
     }
 }
@@ -285,6 +420,16 @@ impl FromStr for ArgSlot {
             && off % 8 == 0
         {
             return Ok(Self::Stack(off));
+        }
+        if let Some(i) = REG32_ARG_REGS.iter().position(|r| *r == s) {
+            return Ok(Self::Reg32(i as u8));
+        }
+        if let Some(off) = s.strip_prefix("esp+0x")
+            && let Ok(off) = u32::from_str_radix(off, 16)
+            && off >= 4
+            && off % 4 == 0
+        {
+            return Ok(Self::Stack32(off));
         }
         Err(format!("unknown argument slot {s:?}"))
     }
@@ -465,13 +610,16 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Argument registers and stack at a call. Win32 uses the same fields: `rcx` and `rdx` hold ecx and edx, `r8`,
+/// `r9` and `xmm` are zero, and `stack` holds 4-byte words.
 pub struct EntryState {
     pub rcx: Word,
     pub rdx: Word,
     pub r8: Word,
     pub r9: Word,
     pub xmm: [Xmm; 4],
-    /// The stack slots of parameters past the fourth, from `rsp+0x28` up.
+    /// Win64: the stack slots of parameters past the fourth, from `rsp+0x28` up. Win32: the stack arguments, 4-byte
+    /// words from `esp+4` up.
     #[serde(default)]
     pub stack: Vec<Word>,
 }
@@ -499,6 +647,14 @@ impl EntryState {
                 let i = (off.checked_sub(0x28)? / 8) as usize;
                 self.stack.get(i).map(|w| w.0)
             }
+            ArgSlot::Reg32(i) => Some(self.int_reg(i) & 0xffff_ffff),
+            // An 8-byte value takes two words, the low one first.
+            ArgSlot::Stack32(off) => {
+                let i = (off.checked_sub(4)? / 4) as usize;
+                let lo = self.stack.get(i)?.0 & 0xffff_ffff;
+                let hi = self.stack.get(i + 1).map_or(0, |w| w.0 & 0xffff_ffff);
+                Some(lo | hi << 32)
+            }
         }
     }
 }
@@ -520,7 +676,8 @@ pub struct Region {
     pub after: BlobRef,
 }
 
-/// What the call returned.
+/// What the call returned. Win32: `rax` holds edx:eax (eax in the low half), and `xmm0` holds st(0) as the declared
+/// return type (a `float` in 4 bytes, a `double` in 8), zero for anything else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observed {
     pub rax: Word,
@@ -543,9 +700,85 @@ mod tests {
     }
 
     #[test]
+    fn win32_slots_round_trip_and_follow_each_convention() {
+        for s in ["ecx", "edx", "esp+0x4", "esp+0xc"] {
+            assert_eq!(s.parse::<ArgSlot>().unwrap().to_string(), s);
+        }
+        use ValueType::{Float, Int, Pointer, Unknown};
+        let s = |c, v: &[ValueType]| {
+            let (slots, bytes) = slots32(c, v);
+            let slots: Vec<String> = slots
+                .iter()
+                .map(|s| s.map_or("?".into(), |s| s.to_string()))
+                .collect();
+            (slots.join(" "), bytes)
+        };
+        let args = [Pointer, Int(4), Float(8), Int(2)];
+        assert_eq!(
+            s(Convention::Cdecl, &args),
+            ("esp+0x4 esp+0x8 esp+0xc esp+0x14".into(), Some(20))
+        );
+        assert_eq!(
+            s(Convention::Thiscall, &args),
+            ("ecx esp+0x4 esp+0x8 esp+0x10".into(), Some(16))
+        );
+        assert_eq!(
+            s(Convention::Fastcall, &args),
+            ("ecx edx esp+0x4 esp+0xc".into(), Some(12))
+        );
+        // fastcall: a double goes to the stack, and the next small arguments still get the registers.
+        assert_eq!(
+            s(Convention::Fastcall, &[Float(8), Int(4), Int(8), Int(1)]),
+            ("esp+0x4 ecx esp+0xc edx".into(), Some(16))
+        );
+        // Negative: after a struct by value, where the rest are isn't known.
+        assert_eq!(
+            s(Convention::Stdcall, &[Int(4), Unknown, Int(4)]),
+            ("esp+0x4 ? ?".into(), None)
+        );
+        assert!(Convention::Stdcall.callee_pops() && !Convention::Cdecl.callee_pops());
+        assert_eq!(
+            Convention::from_keyword("__thiscall"),
+            Some(Convention::Thiscall)
+        );
+        assert_eq!(Convention::from_keyword("__vectorcall"), None);
+    }
+
+    #[test]
+    fn win32_stack_values_take_one_or_two_words() {
+        let entry = EntryState {
+            rcx: Word(0xdead_beef_0000_0001),
+            rdx: Word(2),
+            r8: Word(0),
+            r9: Word(0),
+            xmm: [Xmm::default(); 4],
+            stack: vec![Word(0x11), Word(0x22), Word(0x33)],
+        };
+        assert_eq!(
+            entry.slot_value(ArgSlot::Reg32(0)),
+            Some(1),
+            "ecx is 32 bits"
+        );
+        assert_eq!(entry.slot_value(ArgSlot::Stack32(4)), Some(0x22_0000_0011));
+        assert_eq!(entry.slot_value(ArgSlot::Stack32(0xc)), Some(0x33));
+        // Negative: below the first argument (the return address), or past what was recorded.
+        assert_eq!(entry.slot_value(ArgSlot::Stack32(0)), None);
+        assert_eq!(entry.slot_value(ArgSlot::Stack32(0x10)), None);
+    }
+
+    #[test]
     fn bad_slots_and_types_are_refused() {
         // Negative: a fifth register, the shadow space, a misaligned slot, an unknown width.
-        for s in ["r10", "xmm4", "stack+0x20", "stack+0x29", "rax"] {
+        for s in [
+            "r10",
+            "xmm4",
+            "stack+0x20",
+            "stack+0x29",
+            "rax",
+            "esp+0x0",
+            "esp+0x6",
+            "eax",
+        ] {
             assert!(s.parse::<ArgSlot>().is_err(), "{s}");
         }
         for s in ["int:3", "float:2", "pointer:4", "struct", ""] {

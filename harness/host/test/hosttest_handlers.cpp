@@ -17,6 +17,18 @@ PBETA_HOOK(long long, sum12,
     return r + 1;
 }
 
+#if defined(_M_IX86)
+// x86 calling conventions: __stdcall calls through and adds 100; __thiscall (as __fastcall with an unused edx, see
+// pbeta_handler.h) calls through and doubles.
+PBETA_HOOK_CC(int, __stdcall, area, (int w, int h)) {
+    return PBETA_ORIGINAL(area)(w, h) + 100;
+}
+
+PBETA_HOOK_CC(int, __fastcall, Box_get, (void* self, void* edx_unused, int i)) {
+    return PBETA_ORIGINAL(Box_get)(self, edx_unused, i) * 2;
+}
+#endif
+
 // Calls through with mixed slots, then doubles the result.
 PBETA_HOOK(double, mix, (int a, double b, int c, float d)) {
     return PBETA_ORIGINAL(mix)(a, b, c, d) * 2;

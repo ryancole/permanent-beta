@@ -1,5 +1,6 @@
 //! The new build's image as the emulator maps it: the file's headers and sections laid out by RVA, which
 //! sections are executable and writable, the import address table, base relocations and the security cookie.
+//! x64 (PE32+) or x86 (PE32): an x86 image has 4-byte pointers (`HIGHLOW` relocations, 4-byte IAT slots).
 //!
 //! `object` parses the headers and sections; the import, relocation and load-config directories are simple
 //! tables, read by hand.
@@ -7,11 +8,11 @@
 use object::LittleEndian as LE;
 use object::pe::{
     IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_IMPORT,
-    IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, IMAGE_REL_BASED_DIR64, IMAGE_SCN_MEM_EXECUTE,
-    IMAGE_SCN_MEM_WRITE,
+    IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW,
+    IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE,
 };
-use object::read::pe::PeFile64;
-use object::{Architecture, Object, ObjectSection, SectionFlags};
+use object::read::pe::{ImageNtHeaders, PeFile, PeFile32, PeFile64};
+use object::{Architecture, FileKind, Object, ObjectSection, SectionFlags};
 use permanent_beta_model::BuildId;
 use sha2::{Digest, Sha256};
 
@@ -28,6 +29,8 @@ pub struct Section {
 #[derive(Debug, Clone)]
 pub struct Image {
     pub build: BuildId,
+    /// A 32-bit x86 image (PE32); otherwise x64.
+    pub x86: bool,
     /// The base the image was linked for.
     pub preferred_base: u64,
     /// Headers and sections at their RVAs, `size_of_image` bytes (page-aligned).
@@ -35,7 +38,7 @@ pub struct Image {
     pub sections: Vec<Section>,
     /// Import address table slots: (slot RVA, `dll!name`).
     pub imports: Vec<(u32, String)>,
-    /// RVAs of the 64-bit absolute addresses the loader rebases (`DIR64` base relocations).
+    /// RVAs of the absolute addresses the loader rebases: `DIR64` (8 bytes) on x64, `HIGHLOW` (4) on x86.
     pub relocations: Vec<u32>,
     /// RVA of `__security_cookie` (from the load config), which /GS code reads and that holds no state worth
     /// recording.
@@ -50,15 +53,42 @@ pub fn page_up(n: u64) -> u64 {
 
 impl Image {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let pe = PeFile64::parse(bytes).map_err(|e| e.to_string())?;
-        if pe.architecture() != Architecture::X86_64 {
+        match FileKind::parse(bytes).map_err(|e| e.to_string())? {
+            FileKind::Pe64 => Self::load(
+                &PeFile64::parse(bytes).map_err(|e| e.to_string())?,
+                bytes,
+                false,
+            ),
+            FileKind::Pe32 => Self::load(
+                &PeFile32::parse(bytes).map_err(|e| e.to_string())?,
+                bytes,
+                true,
+            ),
+            kind => Err(format!("not a PE image ({kind:?})")),
+        }
+    }
+
+    fn load<Pe: ImageNtHeaders>(
+        pe: &PeFile<'_, Pe>,
+        bytes: &[u8],
+        x86: bool,
+    ) -> Result<Self, String> {
+        let want = if x86 {
+            Architecture::I386
+        } else {
+            Architecture::X86_64
+        };
+        if pe.architecture() != want {
             return Err(format!(
-                "architecture {:?} (only x64 is supported)",
+                "architecture {:?} (only x64 and x86 are supported)",
                 pe.architecture()
             ));
         }
         let preferred_base = pe.relative_address_base();
-        let headers_len = pe.nt_headers().optional_header.size_of_headers.get(LE) as usize;
+        let headers_len = {
+            use object::read::pe::ImageOptionalHeader;
+            pe.nt_headers().optional_header().size_of_headers() as usize
+        };
         let mut sections = Vec::new();
         let mut layout: Vec<(u32, Vec<u8>)> = Vec::new();
         for s in pe.sections() {
@@ -104,6 +134,7 @@ impl Image {
         };
         let mut image = Image {
             build: BuildId(hex(&Sha256::digest(bytes))),
+            x86,
             preferred_base,
             memory,
             sections,
@@ -118,10 +149,15 @@ impl Image {
             image.relocations = image.parse_relocations(rva, size);
         }
         if let Some((rva, size)) = dir(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) {
-            // IMAGE_LOAD_CONFIG_DIRECTORY64.SecurityCookie, a VA, at offset 0x58.
-            image.security_cookie = (size >= 0x60)
-                .then(|| image.u64_at(rva + 0x58))
-                .flatten()
+            // SecurityCookie, a VA: IMAGE_LOAD_CONFIG_DIRECTORY64's at offset 0x58, ...32's at 0x3c.
+            let cookie = if x86 {
+                (size >= 0x40)
+                    .then(|| image.u32_at(rva + 0x3c).map(u64::from))
+                    .flatten()
+            } else {
+                (size >= 0x60).then(|| image.u64_at(rva + 0x58)).flatten()
+            };
+            image.security_cookie = cookie
                 .and_then(|va| va.checked_sub(preferred_base))
                 .filter(|&r| r != 0 && r < image.memory.len() as u64)
                 .map(|r| r as u32);
@@ -131,6 +167,11 @@ impl Image {
 
     pub fn size(&self) -> u64 {
         self.memory.len() as u64
+    }
+
+    /// Bytes in a pointer: 4 on x86, 8 on x64.
+    pub fn pointer_size(&self) -> usize {
+        if self.x86 { 4 } else { 8 }
     }
 
     pub fn section_at(&self, rva: u64) -> Option<&Section> {
@@ -175,20 +216,30 @@ impl Image {
             }
             let dll = self.c_name(name).unwrap_or_default().to_ascii_lowercase();
             let names = if lookup != 0 { lookup } else { iat };
+            let (width, ordinal) = if self.x86 {
+                (4, 1u64 << 31)
+            } else {
+                (8, 1u64 << 63)
+            };
             for j in 0..65536u32 {
-                let Some(entry) = self.u64_at(names + 8 * j) else {
+                let entry = if self.x86 {
+                    self.u32_at(names + width * j).map(u64::from)
+                } else {
+                    self.u64_at(names + width * j)
+                };
+                let Some(entry) = entry else {
                     break;
                 };
                 if entry == 0 {
                     break;
                 }
-                let func = if entry & (1 << 63) != 0 {
+                let func = if entry & ordinal != 0 {
                     format!("#{}", entry & 0xffff)
                 } else {
                     self.c_name((entry & 0x7fff_ffff) as u32 + 2)
                         .unwrap_or_else(|| "?".into())
                 };
-                out.push((iat + 8 * j, format!("{dll}!{func}")));
+                out.push((iat + width * j, format!("{dll}!{func}")));
             }
         }
         out
@@ -208,7 +259,12 @@ impl Image {
                 let Some(e) = self.u16_at(at + 8 + 2 * k) else {
                     break;
                 };
-                if e >> 12 == IMAGE_REL_BASED_DIR64 {
+                let kind = if self.x86 {
+                    IMAGE_REL_BASED_HIGHLOW
+                } else {
+                    IMAGE_REL_BASED_DIR64
+                };
+                if e >> 12 == kind {
                     out.push(page + u32::from(e & 0xfff));
                 }
             }
@@ -224,7 +280,12 @@ impl Image {
         if delta != 0 {
             for &r in &self.relocations {
                 let r = r as usize;
-                if let Some(slot) = mem.get_mut(r..r + 8) {
+                if self.x86 {
+                    if let Some(slot) = mem.get_mut(r..r + 4) {
+                        let v = u32::from_le_bytes(slot.try_into().expect("4 bytes"));
+                        slot.copy_from_slice(&v.wrapping_add(delta as u32).to_le_bytes());
+                    }
+                } else if let Some(slot) = mem.get_mut(r..r + 8) {
                     let v = u64::from_le_bytes(slot.try_into().expect("8 bytes"));
                     slot.copy_from_slice(&v.wrapping_add(delta).to_le_bytes());
                 }

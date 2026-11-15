@@ -1,4 +1,5 @@
-// pbeta hook host (harness/host/README.md): one Detours DLL for any x64 program.
+// pbeta hook host (harness/host/README.md): one Detours DLL for any x64 program, and built for 32-bit, one for any x86
+// program. Each attaches only config entries of its own ABI (`abi = "win32"` marks an x86 build's).
 //
 // On load it hashes the executable it was loaded into (SHA-256, the build id `pbeta analyze` records), reads the
 // host config (`pbeta host-config`) and attaches every hook listed for that build:
@@ -16,7 +17,8 @@
 //   PBETA_HOST_LOG     the log, appended to (default: pbeta-host.log next to the config)
 //
 // Log lines: `CenterWindow(hWnd=0x00000000000a02ba) -> 1`, `... -> 1 (skipped: returned without calling it)`.
-// Arguments are decoded by the hook's prototype; without one the four integer argument registers are shown.
+// Arguments are decoded by the hook's prototype; without one the four integer argument registers are shown (x86:
+// ecx, edx and the first four stack words).
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -35,7 +37,11 @@
 #pragma comment(lib, "bcrypt.lib")
 
 // Detours needs ordinal 1 in a DLL it injects (DetourCreateProcessWithDllEx).
+#if defined(_M_IX86)
+#pragma comment(linker, "/export:DetourFinishHelperProcess=_DetourFinishHelperProcess@16,@1,NONAME")
+#else
 #pragma comment(linker, "/export:DetourFinishHelperProcess,@1,NONAME")
+#endif
 
 namespace {
 
@@ -91,7 +97,7 @@ struct HostArg {
 };
 
 struct HostHook {
-    std::string build, name, rva, pattern, action, prototype, ret;
+    std::string build, name, rva, pattern, action, prototype, ret, abi, convention, stack_bytes;
     std::vector<HostArg> args;
 };
 
@@ -165,6 +171,9 @@ bool parse_config(const std::wstring& path, std::vector<HostHook>& hooks) {
             else if (key == "action") h.action = value;
             else if (key == "prototype") h.prototype = value;
             else if (key == "ret") h.ret = value;
+            else if (key == "abi") h.abi = value;
+            else if (key == "convention") h.convention = value;
+            else if (key == "stack_bytes") h.stack_bytes = value;
         } else if (section == "arg" && !h.args.empty()) {
             HostArg& a = h.args.back();
             if (key == "slot") a.slot = value;
@@ -209,6 +218,35 @@ bool safe_string(const void* p, size_t width, size_t max, std::vector<unsigned s
 // ---------------------------------------------------------------------------------------------------------------
 // Sites: one per attached hook
 
+#if defined(_M_IX86)
+constexpr const char* kAbi = "win32";
+
+// Must match host_thunk32.asm.
+struct HostFrame {
+    unsigned long gpr[3];      // ecx, edx, eax at entry
+    unsigned long slot;        // which site
+    unsigned long entry_rsp;   // [entry_rsp] is the return address
+    unsigned long rax;         // result: eax
+    unsigned long edx;         // result: edx
+    unsigned char st0[8];      // result: st(0) as a double
+    unsigned long pops;        // bytes of arguments removed (measured, or the convention's when not calling it)
+    unsigned long st0_result;  // nonzero: the result is in st(0)
+    void* call;                // per-call state (the call's log line)
+    void* original;
+    unsigned long esp_call;
+};
+static_assert(offsetof(HostFrame, slot) == 0x0C, "host_thunk32.asm F_SLOT");
+static_assert(offsetof(HostFrame, entry_rsp) == 0x10, "host_thunk32.asm F_ESP");
+static_assert(offsetof(HostFrame, rax) == 0x14, "host_thunk32.asm F_RES_EAX");
+static_assert(offsetof(HostFrame, edx) == 0x18, "host_thunk32.asm F_RES_EDX");
+static_assert(offsetof(HostFrame, st0) == 0x1C, "host_thunk32.asm F_ST0");
+static_assert(offsetof(HostFrame, pops) == 0x24, "host_thunk32.asm F_POPS");
+static_assert(offsetof(HostFrame, st0_result) == 0x28, "host_thunk32.asm F_FLOAT");
+static_assert(offsetof(HostFrame, call) == 0x2C, "host_thunk32.asm F_CALL");
+static_assert(sizeof(HostFrame) == 0x38, "host_thunk32.asm FRAME_BYTES");
+#else
+constexpr const char* kAbi = "win64";
+
 // Must match host_thunk.asm.
 struct HostFrame {
     unsigned long long gpr[4];      // rcx, rdx, r8, r9
@@ -226,6 +264,7 @@ static_assert(offsetof(HostFrame, rax) == 0x70, "host_thunk.asm F_RAX");
 static_assert(offsetof(HostFrame, xmm0) == 0x78, "host_thunk.asm F_XMM0");
 static_assert(offsetof(HostFrame, call) == 0x88, "host_thunk.asm F_CALL");
 static_assert(sizeof(HostFrame) == 0x90, "host_thunk.asm FRAME_BYTES");
+#endif
 
 enum class Kind { Log, Skip, Return };
 
@@ -234,14 +273,35 @@ struct Site {
     Kind kind = Kind::Log;
     unsigned long long value = 0;  // Return
     PVOID original = nullptr;      // the Detours trampoline after attaching
+    unsigned long pops = 0;        // x86: bytes of arguments `skip` and `return` remove (the convention's)
 };
 
 constexpr int kThunks = 64;  // REPT count in host_thunk.asm
 Site g_sites[kThunks];
 int g_used = 0;
 
+#if defined(_M_IX86)
+// The value of an argument slot at entry (`ecx`, `edx`, `esp+0x4`): `width` bytes (8 for a double or a 64-bit
+// integer on the stack).
+bool slot_value(const HostFrame* f, const std::string& slot, size_t width, unsigned long long& out) {
+    out = 0;
+    if (slot == "ecx") {
+        out = f->gpr[0];
+        return true;
+    }
+    if (slot == "edx") {
+        out = f->gpr[1];
+        return true;
+    }
+    if (slot.compare(0, 4, "esp+") == 0) {
+        unsigned long off = std::strtoul(slot.c_str() + 4, nullptr, 0);
+        return safe_copy(&out, reinterpret_cast<const void*>(f->entry_rsp + off), width > 4 ? 8 : 4);
+    }
+    return false;
+}
+#else
 // The 64-bit value of an argument slot at entry (`rcx`, `xmm1`, `stack+0x28`).
-bool slot_value(const HostFrame* f, const std::string& slot, unsigned long long& out) {
+bool slot_value(const HostFrame* f, const std::string& slot, size_t, unsigned long long& out) {
     static const char* const regs[] = {"rcx", "rdx", "r8", "r9"};
     for (int i = 0; i < 4; i++) {
         if (slot == regs[i]) {
@@ -258,6 +318,12 @@ bool slot_value(const HostFrame* f, const std::string& slot, unsigned long long&
         return safe_copy(&out, reinterpret_cast<const void*>(f->entry_rsp + off), 8);
     }
     return false;
+}
+#endif
+
+// Bytes a value of this `value` kind takes: `int:8` and `float:8` 8, anything else no more than 8.
+size_t value_width(const std::string& kind) {
+    return kind == "int:8" || kind == "float:8" ? 8 : 4;
 }
 
 std::string utf8(const std::vector<unsigned short>& units, bool wide) {
@@ -325,7 +391,17 @@ constexpr size_t kMaxText = 256;  // characters of a string argument shown
 std::string format_args(const Site& s, const HostFrame* f) {
     std::string out = s.hook.name + "(";
     if (s.hook.prototype.empty()) {
+#if defined(_M_IX86)
+        out += "ecx=" + hex(f->gpr[0]) + ", edx=" + hex(f->gpr[1]);
+        for (int i = 1; i <= 4; i++) {
+            char slot[16];
+            std::snprintf(slot, sizeof slot, "esp+0x%x", 4 * i);
+            unsigned long long w = 0;
+            out += std::string(", ") + slot + "=" + (slot_value(f, slot, 4, w) ? hex(w) : "?");
+        }
+#else
         out += "rcx=" + hex(f->gpr[0]) + ", rdx=" + hex(f->gpr[1]) + ", r8=" + hex(f->gpr[2]) + ", r9=" + hex(f->gpr[3]);
+#endif
         return out + ")";
     }
     bool first = true;
@@ -338,14 +414,19 @@ std::string format_args(const Site& s, const HostFrame* f) {
             out += a.name + "=";
         }
         unsigned long long raw = 0;
-        if (!slot_value(f, a.slot, raw)) {
+        if (!slot_value(f, a.slot, value_width(a.value), raw)) {
             out += "?";
             continue;
         }
+#if defined(_M_IX86)
+        // A float on the x86 stack: its bytes are the slot's.
+        const unsigned char* xmm = reinterpret_cast<const unsigned char*>(&raw);
+#else
         const unsigned char* xmm = nullptr;
         if (a.slot.compare(0, 3, "xmm") == 0) {
             xmm = f->xmm[a.slot[3] - '0'];
         }
+#endif
         out += format_value(a.value, raw, xmm);
         if (!a.show.empty() && raw != 0) {
             bool wide = a.show == "wstring";
@@ -364,7 +445,21 @@ std::string format_result(const Site& s, const HostFrame* f) {
     if (s.hook.ret == "void") {
         return "";
     }
+#if defined(_M_IX86)
+    // edx:eax; a floating-point result is st(0), kept as a double.
+    unsigned long long raw = f->rax | (static_cast<unsigned long long>(f->edx) << 32);
+    if (s.hook.ret == "float:4") {
+        double d;
+        std::memcpy(&d, f->st0, 8);
+        float v = static_cast<float>(d);
+        unsigned char bytes[8] = {};
+        std::memcpy(bytes, &v, 4);
+        return " -> " + format_value(s.hook.ret, raw, bytes);
+    }
+    return " -> " + format_value(s.hook.ret.empty() ? "unknown" : s.hook.ret, raw, f->st0);
+#else
     return " -> " + format_value(s.hook.ret.empty() ? "unknown" : s.hook.ret, f->rax, f->xmm0);
+#endif
 }
 
 }  // namespace
@@ -372,6 +467,13 @@ std::string format_result(const Site& s, const HostFrame* f) {
 extern "C" void* pbeta_host_before(HostFrame* f) {
     Site& s = g_sites[f->slot];
     f->call = new std::string(format_args(s, f));
+#if defined(_M_IX86)
+    // The caller expects a floating-point result on the x87 stack, even a skipped one (0.0).
+    f->st0_result = s.hook.ret.compare(0, 6, "float:") == 0 ? 1 : 0;
+    if (s.kind != Kind::Log) {
+        f->pops = s.pops;
+    }
+#endif
     switch (s.kind) {
         case Kind::Log:
             return s.original;
@@ -379,7 +481,10 @@ extern "C" void* pbeta_host_before(HostFrame* f) {
             f->rax = 0;
             return nullptr;
         case Kind::Return:
-            f->rax = s.value;
+            f->rax = static_cast<decltype(f->rax)>(s.value);
+#if defined(_M_IX86)
+            f->edx = static_cast<unsigned long>(s.value >> 32);
+#endif
             return nullptr;
     }
     return s.original;
@@ -495,6 +600,28 @@ bool attach(PVOID* target, PVOID detour) {
     return DetourTransactionCommit() == NO_ERROR;
 }
 
+// An export by its source name. A 32-bit DLL exports a __stdcall function as `_name@<bytes>` and a __fastcall one
+// as `@name@<bytes>`; it finds those too.
+FARPROC find_export(HMODULE module, const std::string& name) {
+    if (FARPROC p = GetProcAddress(module, name.c_str())) {
+        return p;
+    }
+#if defined(_M_IX86)
+    for (int bytes = 0; bytes <= 512; bytes += 4) {
+        for (const char* prefix : {"_", "@"}) {
+            std::string decorated = prefix + name + "@" + std::to_string(bytes);
+            if (FARPROC p = GetProcAddress(module, decorated.c_str())) {
+                return p;
+            }
+        }
+    }
+    if (FARPROC p = GetProcAddress(module, ("_" + name).c_str())) {
+        return p;
+    }
+#endif
+    return nullptr;
+}
+
 // Loads `<config folder>\dll` and attaches its `export` at `at`, with `pbeta_original_<export>` as the original.
 void attach_handler(const HostHook& h, unsigned char* at, const std::wstring& folder) {
     size_t bang = h.action.find('!');
@@ -506,8 +633,8 @@ void attach_handler(const HostHook& h, unsigned char* at, const std::wstring& fo
         log("%s: skipped (can't load %s: error %lu)", h.name.c_str(), dll.c_str(), GetLastError());
         return;
     }
-    PVOID detour = reinterpret_cast<PVOID>(GetProcAddress(module, exported.c_str()));
-    auto original = reinterpret_cast<PVOID*>(GetProcAddress(module, ("pbeta_original_" + exported).c_str()));
+    PVOID detour = reinterpret_cast<PVOID>(find_export(module, exported));
+    auto original = reinterpret_cast<PVOID*>(find_export(module, "pbeta_original_" + exported));
     if (!detour || !original) {
         log("%s: skipped (%s doesn't export %s and pbeta_original_%s: declare it with PBETA_HOOK)", h.name.c_str(),
             dll.c_str(), exported.c_str(), exported.c_str());
@@ -552,6 +679,14 @@ void attach_all(const std::wstring& config_path) {
             log("%s: skipped (no RVA)", h.name.c_str());
             continue;
         }
+        // A config entry for the other ABI (an x86 build's in the x64 host, or one written without the build's
+        // analysis, so taken for x64, in the x86 host) would decode and return wrongly.
+        std::string abi = h.abi.empty() ? "win64" : h.abi;
+        if (abi != kAbi) {
+            log("%s: skipped (a %s entry; this host is %s%s)", h.name.c_str(), abi.c_str(), kAbi,
+                abi == "win64" ? ": pass the build's analysis to pbeta host-config" : "");
+            continue;
+        }
         unsigned char* at = base + rva;
         if (!h.pattern.empty() && !matches_pattern(at, h.pattern)) {
             log("%s: skipped (the code at %s doesn't match its pattern)", h.name.c_str(), h.rva.c_str());
@@ -577,6 +712,10 @@ void attach_all(const std::wstring& config_path) {
         } else {
             log("%s: skipped (unknown action \"%s\")", h.name.c_str(), h.action.c_str());
             continue;
+        }
+        // x86: `skip` and `return` remove the stack arguments when the convention has the callee do it.
+        if (h.convention == "stdcall" || h.convention == "thiscall" || h.convention == "fastcall") {
+            s.pops = static_cast<unsigned long>(std::strtoul(h.stack_bytes.c_str(), nullptr, 0));
         }
         s.original = at;
         bool ok = attach(&s.original, pbeta_host_thunks[g_used]);

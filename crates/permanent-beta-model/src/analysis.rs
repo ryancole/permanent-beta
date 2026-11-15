@@ -248,10 +248,13 @@ pub struct FunctionFeatures {
     /// Register arguments the code reads before writing (Win64: rcx/xmm0, rdx/xmm1, r8/xmm2, r9/xmm3), up to
     /// the first call, as 1 + the highest slot used. A lower bound on the parameter count: unused trailing
     /// parameters and stack arguments are invisible. Capped at 4. Inferred from code; no symbols needed.
+    /// x86: the register arguments read (ecx, or ecx and edx) plus 1 + the highest stack argument word read;
+    /// capped at 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inferred_args: Option<u8>,
     /// Register class of each inferred argument slot, `inferred_args` long: which of the slot's two registers
-    /// (integer or vector) the code read. Empty if the analyzer didn't compute it.
+    /// (integer or vector) the code read. Empty if the analyzer didn't compute it. x86: one `integer` per
+    /// register argument (ecx, edx), so its length tells the register arguments from the stack words.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inferred_arg_classes: Vec<ArgClass>,
     /// Memory the function reads or writes through its pointer arguments, in address order: where a struct's
@@ -276,7 +279,8 @@ pub struct FunctionFeatures {
 /// One access through a pointer argument: `[rcx+0x8]`, 4 bytes, read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArgAccess {
-    /// The argument slot (0–3: rcx, rdx, r8, r9) whose pointer the address is based on.
+    /// The argument slot (0–3: rcx, rdx, r8, r9) whose pointer the address is based on. x86: the parameter's
+    /// position as the code takes it: ecx and edx when read as arguments, then the stack arguments.
     pub slot: u8,
     pub offset: u32,
     /// Bytes accessed.

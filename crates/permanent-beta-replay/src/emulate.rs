@@ -1,5 +1,12 @@
 //! Running one function of the new build in icicle (design §7.3, replay by emulation). icicle executes Ghidra's
-//! SLEIGH specification of x86-64 (`sleigh`), so replay and Ghidra share one definition of the instruction set.
+//! SLEIGH specification of x86-64 (`sleigh`), or of x86 for a 32-bit image, so replay and Ghidra share one
+//! definition of the instruction set.
+//!
+//! x86 (Win32) differs in the entry state and the results: `esp` points at the return trap with the recorded stack
+//! words above it, ecx and edx hold the recorded registers, and the result is edx:eax and st(0). A callee that
+//! removes its stack arguments (`__stdcall`, `__thiscall`, `__fastcall`) returns with `esp` that many bytes higher
+//! ([`Setup::pops`]). Everything is placed below 4 GiB. icicle keeps x87 values as `f64`s, which is the precision
+//! MSVC's x86 runtime sets the x87 unit to.
 //!
 //! The address space holds only what the replay is entitled to:
 //! - the new image at a base clear of the recorded memory (rebased if needed), its import address table pointing
@@ -39,6 +46,8 @@ pub const MAX_INSTRUCTIONS: u64 = 10_000_000;
 const STACK_SIZE: u64 = 0x10_0000;
 /// The value `__security_cookie` gets: MSVC's default (its top 16 bits must be zero for the cookie check).
 const SECURITY_COOKIE: u64 = 0x0000_2B99_2DDF_A232;
+/// The x86 runtime's default `__security_cookie`.
+const SECURITY_COOKIE_X86: u32 = 0xBB40_E64E;
 const SLACK: u64 = 32;
 
 /// Memory placed at a fixed address before the run.
@@ -65,6 +74,8 @@ pub struct Setup<'a> {
     /// RVAs of functions to note when the run enters them (the new build's changed functions): [`Ran::reached`]
     /// and [`Stopped::reached`] list those it entered, in order of first entry. The function run is never noted.
     pub watch: &'a [u64],
+    /// x86: the bytes of stack arguments the function removes when it returns (0 for `__cdecl`).
+    pub pops: u64,
 }
 
 /// Why a run stopped before the function returned: the case can't be judged as a pass or fail from the run's
@@ -87,8 +98,13 @@ struct Notes {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ran {
+    /// x86: edx:eax.
     pub rax: u64,
     pub xmm0: [u8; 16],
+    /// x86: st(0) at the return as an f64's bits, for a floating-point result.
+    pub st0: Option<u64>,
+    /// Bytes in a pointer: 8, or 4 on x86.
+    pub pointer_size: usize,
     /// Each placed region's bytes after the call, in `Setup::regions` order.
     pub regions: Vec<Vec<u8>>,
     /// Per region: the function freed it (`free`, or a `realloc` that moved it). What a freed block holds
@@ -147,11 +163,12 @@ fn page_ranges(regions: &[Placed]) -> Vec<Range<u64>> {
 }
 
 thread_local! {
-    /// One VM per thread: building one compiles the SLEIGH specification. Reset before every case.
-    static VM: RefCell<Option<icicle_vm::Vm>> = const { RefCell::new(None) };
+    /// One VM per thread and architecture (x64, x86): building one compiles the SLEIGH specification. Reset before
+    /// every case.
+    static VM: RefCell<[Option<icicle_vm::Vm>; 2]> = const { RefCell::new([None, None]) };
 }
 
-fn new_vm() -> Result<icicle_vm::Vm, String> {
+fn new_vm(x86: bool) -> Result<icicle_vm::Vm, String> {
     let processors = crate::sleigh::processors()?;
     let config = Config {
         // Returns go to our traps, which no call pushed: icicle's shadow stack would flag them.
@@ -160,10 +177,14 @@ fn new_vm() -> Result<icicle_vm::Vm, String> {
         // becomes readable byte by byte as the function writes it, so reading what it never wrote is
         // inconclusive, not garbage. Everything else is granted INIT with its read permission.
         track_uninitialized: true,
-        ..Config::from_target_triple("x86_64-none")
+        ..Config::from_target_triple(if x86 { "i686-none" } else { "x86_64-none" })
     };
-    icicle_vm::build_with_path(&config, &processors)
-        .map_err(|e| format!("icicle couldn't build an x86-64 VM: {e}"))
+    icicle_vm::build_with_path(&config, &processors).map_err(|e| {
+        format!(
+            "icicle couldn't build an {} VM: {e}",
+            if x86 { "x86" } else { "x86-64" }
+        )
+    })
 }
 
 /// Where the case may read and write, for the reasons it stopped.
@@ -230,7 +251,7 @@ fn reg(vm: &icicle_vm::Vm, name: &str) -> Result<pcode::VarNode, String> {
         .arch
         .sleigh
         .get_varnode(name)
-        .ok_or_else(|| format!("the x86-64 specification has no register {name}"))
+        .ok_or_else(|| format!("the x86 specification has no register {name}"))
 }
 
 fn read_mem(vm: &mut icicle_vm::Vm, address: u64, len: usize) -> Option<Vec<u8>> {
@@ -249,6 +270,7 @@ fn read_mem(vm: &mut icicle_vm::Vm, address: u64, len: usize) -> Option<Vec<u8>>
 struct EmuView<'v> {
     vm: RefCell<&'v mut icicle_vm::Vm>,
     exact: &'v [Range<u64>],
+    x86: bool,
 }
 
 /// Whether `ranges` cover every byte of `want`.
@@ -269,8 +291,23 @@ fn covered(ranges: &[Range<u64>], want: Range<u64>) -> bool {
 }
 
 impl CallView for EmuView<'_> {
+    fn abi(&self) -> permanent_beta_model::Abi {
+        if self.x86 {
+            permanent_beta_model::Abi::Win32
+        } else {
+            permanent_beta_model::Abi::Win64
+        }
+    }
+
     fn arg(&self, i: usize) -> Option<u64> {
         let mut vm = self.vm.borrow_mut();
+        if self.x86 {
+            // At the trap, [esp] is the return address: stack word i is at esp + 4 + 4i.
+            let esp = reg(&vm, "ESP").ok()?;
+            let esp = vm.cpu.read_reg(esp);
+            let b = read_mem(&mut vm, esp + 4 + 4 * i as u64, 4)?;
+            return Some(u64::from(u32::from_le_bytes(b.try_into().ok()?)));
+        }
         if let Some(name) = ["RCX", "RDX", "R8", "R9"].get(i) {
             let r = reg(&vm, name).ok()?;
             return Some(vm.cpu.read_reg(r));
@@ -309,9 +346,10 @@ pub fn run(setup: &Setup) -> Result<Ran, Stopped> {
 
 fn run_noting(setup: &Setup, notes: &mut Notes) -> Result<Ran, String> {
     VM.with(|cell| {
-        let mut slot = cell.borrow_mut();
+        let mut vms = cell.borrow_mut();
+        let slot = &mut vms[usize::from(setup.image.x86)];
         if slot.is_none() {
-            *slot = Some(new_vm()?);
+            *slot = Some(new_vm(setup.image.x86)?);
         }
         let vm = slot.as_mut().expect("built above");
         // Reset first: it drops every translated block, so the last case's breakpoints can then be removed
@@ -343,6 +381,24 @@ fn map(vm: &mut icicle_vm::Vm, start: u64, len: u64, perm: u8, value: u8) -> Res
 
 fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ran, String> {
     let image = setup.image;
+    let x86 = image.x86;
+    let ptr = image.pointer_size();
+    // Where to look for room: x64 well above the recorded memory's usual addresses; x86 below 4 GiB.
+    let image_candidates: Vec<u64> = if x86 {
+        (1..0x40u64).map(|i| 0x4000_0000 + i * 0x100_0000).collect()
+    } else {
+        (1..256u64)
+            .map(|i| 0x7000_0000_0000 + i * 0x1_0000_0000)
+            .collect()
+    };
+    let stack_candidates = (1..if x86 { 0x40u64 } else { 4096 }).map(|i| i * 0x100_0000);
+    let trap_candidates: Vec<u64> = if x86 {
+        (1..0x100u64).map(|i| 0x8000_0000 + i * 0x10_0000).collect()
+    } else {
+        (1..4096u64)
+            .map(|i| 0x6000_0000_0000 + i * 0x100_0000)
+            .collect()
+    };
     // The recorded heap blocks the stand-ins will hand out, reserved like the recorded memory.
     let allocations = setup
         .imports
@@ -362,20 +418,14 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
     let base = place(
         image.size(),
         &mut taken,
-        std::iter::once(image.preferred_base)
-            .chain((1..256u64).map(|i| 0x7000_0000_0000 + i * 0x1_0000_0000)),
+        std::iter::once(image.preferred_base).chain(image_candidates),
     )
     .ok_or("no room for the image clear of the recorded memory")?;
-    let stack_base = place(STACK_SIZE, &mut taken, (1..4096u64).map(|i| i * 0x100_0000))
+    let stack_base = place(STACK_SIZE, &mut taken, stack_candidates)
         .ok_or("no room for a stack clear of the recorded memory")?;
     let import_count = image.imports.len() as u64;
     let traps_len = 16 * (import_count + 1);
-    let traps = place(
-        traps_len,
-        &mut taken,
-        (1..4096u64).map(|i| 0x6000_0000_0000 + i * 0x100_0000),
-    )
-    .ok_or("no room for import traps")?;
+    let traps = place(traps_len, &mut taken, trap_candidates).ok_or("no room for import traps")?;
     let import_trap = |i: u64| traps + 16 * (i + 1);
     let layout = Layout {
         image: base..base + image.size(),
@@ -393,6 +443,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
 
     // Old-image addresses in the inputs, rewritten to the new image where the map knows them.
     let rebase = setup.addresses.map(|(old_image, map)| Rebase {
+        width: ptr,
         map,
         old_image,
         new_base: base,
@@ -435,13 +486,17 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
     let mut memory = image.loaded_at(base);
     for (i, (slot, _)) in image.imports.iter().enumerate() {
         let s = *slot as usize;
-        if let Some(b) = memory.get_mut(s..s + 8) {
-            b.copy_from_slice(&import_trap(i as u64).to_le_bytes());
+        if let Some(b) = memory.get_mut(s..s + ptr) {
+            b.copy_from_slice(&import_trap(i as u64).to_le_bytes()[..ptr]);
         }
     }
     if let Some(r) = image.security_cookie {
         let r = r as usize;
-        memory[r..r + 8].copy_from_slice(&SECURITY_COOKIE.to_le_bytes());
+        if x86 {
+            memory[r..r + 4].copy_from_slice(&SECURITY_COOKIE_X86.to_le_bytes());
+        } else {
+            memory[r..r + 8].copy_from_slice(&SECURITY_COOKIE.to_le_bytes());
+        }
     }
     for (g, bytes) in setup.globals.iter().zip(&global_bytes) {
         let at = g.address as usize;
@@ -468,7 +523,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
             .map_err(mem_err)?;
     }
     if let Some(r) = image.security_cookie {
-        mem.update_perm(base + u64::from(r), 8, perm::READ | perm::INIT)
+        mem.update_perm(base + u64::from(r), ptr as u64, perm::READ | perm::INIT)
             .map_err(mem_err)?;
     }
     for g in setup.globals.iter().filter(|g| !g.bytes.is_empty()) {
@@ -529,32 +584,52 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
         }
     }
 
-    // Entry state: [rsp] the return trap, then the shadow space, then the recorded stack arguments.
-    let rsp0 = ((stack_base + STACK_SIZE - 0x1000) & !0xf) - 8; // as after a `call`
-    mem.write_bytes(rsp0, &layout.return_trap.to_le_bytes(), perm::NONE)
+    // Entry state. x64: [rsp] the return trap, then the shadow space, then the recorded stack arguments. x86: [esp]
+    // the return trap, then the recorded stack words.
+    let rsp0 = ((stack_base + STACK_SIZE - 0x1000) & !0xf) - ptr as u64; // as after a `call`
+    mem.write_bytes(rsp0, &layout.return_trap.to_le_bytes()[..ptr], perm::NONE)
         .map_err(mem_err)?;
     for (i, w) in stack_args.iter().enumerate() {
-        mem.write_bytes(rsp0 + 0x28 + 8 * i as u64, &w.to_le_bytes(), perm::NONE)
-            .map_err(mem_err)?;
+        let (at, bytes) = if x86 {
+            (rsp0 + 4 + 4 * i as u64, &w.to_le_bytes()[..4])
+        } else {
+            (rsp0 + 0x28 + 8 * i as u64, &w.to_le_bytes()[..])
+        };
+        mem.write_bytes(at, bytes, perm::NONE).map_err(mem_err)?;
     }
-    for name in [
-        "RAX", "RBX", "RBP", "RSI", "RDI", "R10", "R11", "R12", "R13", "R14", "R15",
-    ] {
+    let zeroed: &[&str] = if x86 {
+        &["EAX", "EBX", "EBP", "ESI", "EDI"]
+    } else {
+        &[
+            "RAX", "RBX", "RBP", "RSI", "RDI", "R10", "R11", "R12", "R13", "R14", "R15",
+        ]
+    };
+    for name in zeroed {
         let r = reg(vm, name)?;
         vm.cpu.write_reg(r, 0);
     }
-    for (name, v) in [
-        ("RSP", rsp0),
-        ("RCX", entry_regs[0]),
-        ("RDX", entry_regs[1]),
-        ("R8", entry_regs[2]),
-        ("R9", entry_regs[3]),
-        ("MXCSR", 0x1f80),
-    ] {
+    let entry: Vec<(&str, u64)> = if x86 {
+        vec![
+            ("ESP", rsp0),
+            ("ECX", entry_regs[0] & 0xffff_ffff),
+            ("EDX", entry_regs[1] & 0xffff_ffff),
+            ("MXCSR", 0x1f80),
+        ]
+    } else {
+        vec![
+            ("RSP", rsp0),
+            ("RCX", entry_regs[0]),
+            ("RDX", entry_regs[1]),
+            ("R8", entry_regs[2]),
+            ("R9", entry_regs[3]),
+            ("MXCSR", 0x1f80),
+        ]
+    };
+    for (name, v) in entry {
         let r = reg(vm, name)?;
         vm.cpu.write_reg(r, v);
     }
-    for (i, x) in setup.entry.xmm.iter().enumerate() {
+    for (i, x) in setup.entry.xmm.iter().enumerate().filter(|_| !x86) {
         let lo = u64::from_le_bytes(x.0[..8].try_into().expect("8 bytes"));
         let hi = u64::from_le_bytes(x.0[8..].try_into().expect("8 bytes"));
         let (a, b) = (
@@ -617,6 +692,7 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
                     let view = EmuView {
                         vm: RefCell::new(vm),
                         exact: &exact,
+                        x86,
                     };
                     match imports::execute(&name, &view) {
                         Some(ran) => ran?,
@@ -688,14 +764,21 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
                     }
                     None => {}
                 }
-                let (rax, rsp) = (reg(vm, "RAX")?, reg(vm, "RSP")?);
+                // The modelled imports are the C runtime's, __cdecl on x86: the caller removes the arguments.
+                let (ax, sp_name) = if x86 { ("EAX", "ESP") } else { ("RAX", "RSP") };
+                let (rax, rsp) = (reg(vm, ax)?, reg(vm, sp_name)?);
                 vm.cpu.write_reg(rax, effect.rax);
+                if x86 {
+                    let edx = reg(vm, "EDX")?;
+                    vm.cpu.write_reg(edx, effect.rax >> 32);
+                }
                 let sp = vm.cpu.read_reg(rsp);
-                let ret = read_mem(vm, sp, 8)
+                let ret = read_mem(vm, sp, ptr)
                     .ok_or_else(|| format!("returning from the stand-in for {name}: no stack"))?;
-                vm.cpu.write_reg(rsp, sp + 8);
-                vm.cpu
-                    .write_pc(u64::from_le_bytes(ret.try_into().expect("8 bytes")));
+                vm.cpu.write_reg(rsp, sp + ptr as u64);
+                let mut word = [0u8; 8];
+                word[..ptr].copy_from_slice(&ret);
+                vm.cpu.write_pc(u64::from_le_bytes(word));
                 import_calls += 1;
             }
             VmExit::InstructionLimit => {
@@ -707,15 +790,24 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
             other => return Err(format!("emulation stopped: {other:?}")),
         }
     }
-    let rsp = reg(vm, "RSP")?;
-    if vm.cpu.read_reg(rsp) != rsp0 + 8 {
+    let rsp = reg(vm, if x86 { "ESP" } else { "RSP" })?;
+    let pops = if x86 { setup.pops } else { 0 };
+    if vm.cpu.read_reg(rsp) != rsp0 + ptr as u64 + pops {
         return Err("returned with an unbalanced stack".into());
     }
     if let Some(s) = &mut stand_ins {
         s.finish()?;
     }
-    let rax = reg(vm, "RAX")?;
-    let rax = vm.cpu.read_reg(rax);
+    let (rax, st0) = if x86 {
+        let (eax, edx) = (reg(vm, "EAX")?, reg(vm, "EDX")?);
+        let rax = (vm.cpu.read_reg(eax) & 0xffff_ffff) | (vm.cpu.read_reg(edx) << 32);
+        // icicle holds an x87 register's value as an f64 in its low 8 bytes (MM0 overlays ST0's).
+        let mm0 = reg(vm, "MM0")?;
+        (rax, Some(vm.cpu.read_reg(mm0)))
+    } else {
+        let rax = reg(vm, "RAX")?;
+        (vm.cpu.read_reg(rax), None)
+    };
     let (lo, hi) = (reg(vm, "XMM0_Qa")?, reg(vm, "XMM0_Qb")?);
     let mut xmm0 = [0u8; 16];
     xmm0[..8].copy_from_slice(&vm.cpu.read_reg(lo).to_le_bytes());
@@ -741,6 +833,8 @@ fn run_on(vm: &mut icicle_vm::Vm, setup: &Setup, notes: &mut Notes) -> Result<Ra
     Ok(Ran {
         rax,
         xmm0,
+        st0,
+        pointer_size: ptr,
         regions,
         released,
         globals,

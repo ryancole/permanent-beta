@@ -134,8 +134,33 @@ pub fn infer(
     let Some(proto) = hook.prototype.as_deref().and_then(Prototype::parse) else {
         return Vec::new();
     };
+    // Which of a function's argument-access slots (`ArgAccess::slot`) each parameter is. Win64: its position, for
+    // the four register parameters. Win32: ecx and edx as the function reads them (one inferred class each), then
+    // the stack words, so a parameter on the stack is the registers plus its word.
+    let abi = crate::harness::abi_of(new_build);
+    let x86_slots = (abi == permanent_beta_model::Abi::Win32).then(|| {
+        let values: Vec<_> = proto
+            .params
+            .iter()
+            .map(|p| crate::harness::value_type_for(abi, &p.ty))
+            .collect();
+        let convention = crate::harness::convention(&proto, old.signature.as_ref());
+        permanent_beta_model::slots32(convention, &values).0
+    });
+    let access_slot = |i: usize, f: &FunctionFeatures| -> Option<usize> {
+        let Some(slots) = &x86_slots else {
+            return (i < 4).then_some(i);
+        };
+        match slots.get(i).copied().flatten()? {
+            permanent_beta_model::ArgSlot::Reg32(r) => Some(usize::from(r)),
+            permanent_beta_model::ArgSlot::Stack32(off) => {
+                Some(f.inferred_arg_classes.len() + (off as usize - 4) / 4)
+            }
+            _ => None,
+        }
+    };
     let mut out = Vec::new();
-    for (slot, p) in proto.params.iter().enumerate().take(4) {
+    for (slot, p) in proto.params.iter().enumerate() {
         if p.ty.matches('*').count() != 1 {
             continue;
         }
@@ -175,9 +200,12 @@ pub fn infer(
             continue; // not a struct, or the PDB knows it exactly (`propose`)
         }
         let through = |f: &FunctionFeatures| -> Vec<ArgAccess> {
+            let Some(at) = access_slot(slot, f) else {
+                return Vec::new();
+            };
             f.arg_accesses
                 .iter()
-                .filter(|a| usize::from(a.slot) == slot)
+                .filter(|a| usize::from(a.slot) == at)
                 .copied()
                 .collect()
         };
