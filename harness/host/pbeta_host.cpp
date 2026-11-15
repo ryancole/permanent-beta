@@ -589,15 +589,23 @@ std::wstring env(const wchar_t* name) {
     return n > 0 && n < ARRAYSIZE(buf) ? std::wstring(buf, n) : std::wstring();
 }
 
+// Retried on ERROR_NOT_ENOUGH_MEMORY: with a 32-bit image below 0x80000 (ASLR puts small ones as low as 0x50000),
+// Detours looks for trampoline memory from the target up, allocates a 64 KiB region below its own 0x80000 floor
+// and rejects it. That region stays allocated, so the next try skips it, and there are at most seven of them
+// (from 0x10000) below 0x80000.
 bool attach(PVOID* target, PVOID detour) {
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-    LONG err = DetourAttach(target, detour);
-    if (err != NO_ERROR) {
-        DetourTransactionAbort();
-        return false;
+    LONG err = ERROR_NOT_ENOUGH_MEMORY;
+    for (int i = 0; i < 8 && err == ERROR_NOT_ENOUGH_MEMORY; i++) {
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        err = DetourAttach(target, detour);
+        if (err != NO_ERROR) {
+            DetourTransactionAbort();
+            continue;
+        }
+        return DetourTransactionCommit() == NO_ERROR;
     }
-    return DetourTransactionCommit() == NO_ERROR;
+    return false;
 }
 
 // An export by its source name. A 32-bit DLL exports a __stdcall function as `_name@<bytes>` and a __fastcall one

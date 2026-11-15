@@ -13,6 +13,10 @@
 //! ```
 //!
 //! Symbol lines are `section:offset  name  va  [f] [i]  lib:object`. `f` marks a function.
+//!
+//! An x86 (32-bit) map has 8-digit addresses and decorated C names: `_name` (`__cdecl`), `_name@8` (`__stdcall`),
+//! `@name@12` (`__fastcall`). They're undecorated to the source name, as the PDB names them; C++ names (`?...`)
+//! are kept as they are.
 
 use permanent_beta_model::Rva;
 
@@ -125,7 +129,8 @@ fn parse_symbol_line(line: &str) -> Option<RawSymbol<'_>> {
     }
     let name = tokens.next()?;
     let va_text = tokens.next()?;
-    if va_text.len() != 16 || !is_hex(va_text) {
+    // 16 digits on x64, 8 on x86.
+    if !matches!(va_text.len(), 8 | 16) || !is_hex(va_text) {
         return None;
     }
     let va = u64::from_str_radix(va_text, 16).ok()?;
@@ -133,11 +138,37 @@ fn parse_symbol_line(line: &str) -> Option<RawSymbol<'_>> {
     let object = *rest.last()?;
     let flags = &rest[..rest.len() - 1];
     Some(RawSymbol {
-        name,
+        name: if va_text.len() == 8 {
+            undecorate32(name)
+        } else {
+            name
+        },
         va,
         is_function: flags.contains(&"f"),
         object,
     })
+}
+
+/// An x86 C name's source name: `_f` and `_f@8` → `f`, `@f@12` → `f`. C++ names (`?...`) and anything else are
+/// kept.
+fn undecorate32(name: &str) -> &str {
+    let (body, sized) = if let Some(rest) = name.strip_prefix('@') {
+        (rest, true)
+    } else if let Some(rest) = name.strip_prefix('_') {
+        (rest, false)
+    } else {
+        return name;
+    };
+    // `@<bytes>` at the end: required for __fastcall, there for __stdcall.
+    match body.rsplit_once('@') {
+        Some((n, bytes))
+            if !n.is_empty() && !bytes.is_empty() && bytes.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            n
+        }
+        _ if sized => name,
+        _ => body,
+    }
 }
 
 fn is_hex(s: &str) -> bool {
@@ -202,6 +233,51 @@ mod tests {
             !map.symbols.iter().any(|s| s.name == "__guard_flags"),
             "absolute symbols are skipped, not rejected as below the base"
         );
+    }
+
+    #[test]
+    fn x86_maps_have_8_digit_addresses_and_decorated_c_names() {
+        let text = "\
+ Preferred load address is 00400000
+
+  Address         Publics by Value              Rva+Base       Lib:Object
+
+ 0001:000000b0       _log_event                 004010b0 f   app.obj
+ 0001:000000c0       _area@8                    004010c0 f   app.obj
+ 0001:000000d0       @fsum@12                   004010d0 f   app.obj
+ 0001:000000e0       ?get@Box@@QAEHH@Z          004010e0 f   app.obj
+ 0001:000003b0       @__security_check_cookie@4 004013b0 f   MSVCRT:secchk.obj
+ 0001:00000c10       ___scrt_unhandled_exception_filter@4 00401c10 f   MSVCRT:utility_desktop.obj
+";
+        let map = parse(text).unwrap();
+        assert_eq!(map.preferred_base, 0x40_0000);
+        let names: Vec<_> = map
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.rva))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("log_event", Rva(0x10b0)),
+                ("area", Rva(0x10c0)),
+                ("fsum", Rva(0x10d0)),
+                ("?get@Box@@QAEHH@Z", Rva(0x10e0)),
+                ("__security_check_cookie", Rva(0x13b0)),
+                ("__scrt_unhandled_exception_filter", Rva(0x1c10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn x64_names_are_never_undecorated() {
+        // Negative: on x64 a leading underscore or an `@` is part of the name.
+        let text = " Preferred load address is 0000000140000000\n  Address  Publics by Value\n \
+                    0001:00000000       _f@8                       0000000140001000 f   x.obj\n";
+        assert_eq!(parse(text).unwrap().symbols[0].name, "_f@8");
+        // Nor is an x86 name that isn't a decorated C name.
+        assert_eq!(undecorate32("plain"), "plain");
+        assert_eq!(undecorate32("@not_fastcall"), "@not_fastcall");
     }
 
     #[test]

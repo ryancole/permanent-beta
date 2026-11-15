@@ -127,15 +127,40 @@ fn reads(access: OpAccess) -> bool {
     )
 }
 
+/// Whether `ins` is a prologue instruction: `push ebp`, `mov ebp, esp`, `push <register>`, `sub esp, imm`.
+fn is_prologue(ins: &Instruction) -> bool {
+    let reg0 =
+        (ins.op_count() > 0 && ins.op0_kind() == OpKind::Register).then(|| ins.op0_register());
+    match ins.mnemonic() {
+        Mnemonic::Push => reg0.is_some(),
+        Mnemonic::Mov => {
+            reg0 == Some(Register::EBP)
+                && ins.op1_kind() == OpKind::Register
+                && ins.op1_register() == Register::ESP
+        }
+        Mnemonic::Sub => {
+            reg0 == Some(Register::ESP) && super::function::is_immediate(ins.op1_kind())
+        }
+        _ => false,
+    }
+}
+
 /// How many register arguments the code takes: 1 if it reads ecx before writing it (`__thiscall`, or a
 /// one-argument `__fastcall`), 2 if it reads edx so (`__fastcall`), else 0. Scanned up to the first call or
-/// return.
+/// return. A `push ecx` (or edx) in the prologue isn't a read: MSVC pushes ecx to make room for a 4-byte local
+/// (`push ebp; mov ebp, esp; push ecx`), whatever ecx holds; a `__thiscall` function reads `this` from ecx after
+/// that too (`mov [ebp-4], ecx`).
 pub(crate) fn register_args(insns: &[Instruction]) -> u8 {
     let mut seen: BTreeMap<Register, bool> = BTreeMap::new();
     let mut factory = InstructionInfoFactory::new();
+    let mut prologue = true;
     for ins in insns {
         if matches!(ins.flow_control(), FlowControl::Call | FlowControl::Return) {
             break;
+        }
+        prologue = prologue && is_prologue(ins);
+        if prologue && ins.mnemonic() == Mnemonic::Push {
+            continue;
         }
         let info = factory.info(ins);
         // Reads first: `add ecx, edx` reads ecx before writing it.
@@ -161,18 +186,75 @@ pub(crate) fn register_args(insns: &[Instruction]) -> u8 {
     }
 }
 
-/// 1 + the highest argument slot the code reads before writing, scanning in address order up to the first call
-/// or return; capped at [`MAX_SLOTS`]. Slots as in the module docs: ecx and edx when read as arguments, then the
-/// stack arguments. A lower bound, like the x64 count: unused trailing parameters are invisible.
+/// Whether `ins` is `add esp, imm`.
+fn is_esp_cleanup(ins: &Instruction) -> bool {
+    ins.mnemonic() == Mnemonic::Add
+        && ins.op_count() == 2
+        && ins.op0_kind() == OpKind::Register
+        && ins.op0_register() == Register::ESP
+        && super::function::is_immediate(ins.op1_kind())
+}
+
+/// Whether the call at `insns[i]` is followed by its caller's cleanup: the next instruction that changes `esp` is
+/// `add esp, imm`, with no control flow before it (MSVC may put other instructions in between).
+fn cleaned_up_after(insns: &[Instruction], i: usize, factory: &mut InstructionInfoFactory) -> bool {
+    for next in &insns[i + 1..] {
+        if is_esp_cleanup(next) {
+            return true;
+        }
+        if next.flow_control() != FlowControl::Next {
+            return false;
+        }
+        let writes_esp = factory
+            .info(next)
+            .used_registers()
+            .iter()
+            .any(|u| u.register().full_register32() == Register::ESP && writes(u.access()));
+        if writes_esp {
+            return false;
+        }
+    }
+    false
+}
+
+/// 1 + the highest argument slot the code reads before writing, scanning in address order; capped at
+/// [`MAX_SLOTS`]. Slots as in the module docs: ecx and edx when read as arguments, then the stack arguments. A
+/// lower bound, like the x64 count: unused trailing parameters are invisible.
+///
+/// Unlike register arguments, stack arguments survive calls and are read on every path, so the whole function is
+/// scanned (stopping at the first call or return made the count depend on code order: a guard reading the last
+/// parameter first changed it). Where `esp` and `ebp` are is followed as in [`Stack`], and:
+/// - a call whose caller's cleanup follows (`add esp, imm`, a `__cdecl` callee's arguments) leaves `esp` where it
+///   was; after any other call `esp` is unknown (the callee may have removed its arguments itself);
+/// - after a return both are unknown, and a branch's target gets them as they were at the branch, so the code after
+///   an early return is placed again.
+///
+/// Reads that can't be placed are left out.
 pub(crate) fn inferred_args(insns: &[Instruction]) -> u8 {
     let regs = register_args(insns);
     let mut stack = Stack::new();
     let mut written: Vec<u8> = Vec::new();
     let mut highest: Option<u8> = None;
     let mut factory = InstructionInfoFactory::new();
-    for ins in insns {
-        if matches!(ins.flow_control(), FlowControl::Call | FlowControl::Return) {
-            break;
+    let mut at_target: BTreeMap<u64, (Option<i64>, Option<i64>)> = BTreeMap::new();
+    for (i, ins) in insns.iter().enumerate() {
+        if let Some(&(esp, ebp)) = at_target.get(&ins.ip()) {
+            stack.esp = stack.esp.or(esp);
+            stack.ebp = stack.ebp.or(ebp);
+        }
+        if matches!(
+            ins.flow_control(),
+            FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+        ) && matches!(ins.op0_kind(), OpKind::NearBranch32 | OpKind::NearBranch16)
+        {
+            at_target
+                .entry(ins.near_branch_target())
+                .or_insert((stack.esp, stack.ebp));
+        }
+        if ins.flow_control() == FlowControl::Return {
+            stack.esp = None;
+            stack.ebp = None;
+            continue;
         }
         let info = factory.info(ins);
         for m in info.used_memory() {
@@ -187,6 +269,12 @@ pub(crate) fn inferred_args(insns: &[Instruction]) -> u8 {
             } else if writes(m.access()) {
                 written.push(k);
             }
+        }
+        if ins.flow_control() == FlowControl::Call {
+            if !cleaned_up_after(insns, i, &mut factory) {
+                stack.esp = None;
+            }
+            continue;
         }
         stack.step(ins);
     }
@@ -356,6 +444,77 @@ mod tests {
         // Negative: ecx written before it's read isn't an argument.
         // mov ecx, [esp+4]; mov eax, [ecx]; ret
         let code = [0x8b, 0x4c, 0x24, 0x04, 0x8b, 0x01, 0xc3];
+        assert_eq!(inferred_args(&decode(&code)), 1);
+    }
+
+    #[test]
+    fn a_push_ecx_making_room_for_a_local_isnt_a_this() {
+        // MSVC /Od: push ebp; mov ebp, esp; push ecx (a local); mov eax, [ebp+8]; add eax, [ebp+0Ch];
+        // mov esp, ebp; pop ebp; ret   (__cdecl, two stack arguments)
+        let code = [
+            0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x08, 0x03, 0x45, 0x0c, 0x8b, 0xe5, 0x5d, 0xc3,
+        ];
+        assert_eq!(register_args(&decode(&code)), 0);
+        assert_eq!(inferred_args(&decode(&code)), 2);
+        // Negative: a __thiscall method that stores ecx into that local still takes `this` in ecx.
+        // push ebp; mov ebp, esp; push ecx; mov [ebp-4], ecx; mov eax, [ebp+8]; mov esp, ebp; pop ebp; ret 4
+        let code = [
+            0x55, 0x8b, 0xec, 0x51, 0x89, 0x4d, 0xfc, 0x8b, 0x45, 0x08, 0x8b, 0xe5, 0x5d, 0xc2,
+            0x04, 0x00,
+        ];
+        assert_eq!(register_args(&decode(&code)), 1);
+        assert_eq!(inferred_args(&decode(&code)), 2);
+        // Negative: a push of ecx past the prologue (an argument for a call) is a read.
+        // mov eax, [esp+4]; push ecx; call $+5; ...
+        let code = [
+            0x8b, 0x44, 0x24, 0x04, 0x51, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xc3,
+        ];
+        assert_eq!(register_args(&decode(&code)), 1);
+    }
+
+    #[test]
+    fn stack_arguments_read_after_a_call_count_through_ebp() {
+        // push ebp; mov ebp, esp; push [ebp+8]; call $+5; add esp, 4; mov eax, [ebp+10h]; pop ebp; ret
+        // (argument 2 read only after the call)
+        let code = [
+            0x55, 0x8b, 0xec, 0xff, 0x75, 0x08, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x83, 0xc4, 0x04,
+            0x8b, 0x45, 0x10, 0x5d, 0xc3,
+        ];
+        assert_eq!(inferred_args(&decode(&code)), 3);
+        // Without a frame, through the caller's cleanup of a __cdecl call:
+        // push [esp+4]; call $+5; add esp, 4; mov eax, [esp+0Ch]; ret   (argument 2 after the call)
+        let code = [
+            0xff, 0x74, 0x24, 0x04, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x83, 0xc4, 0x04, 0x8b, 0x44,
+            0x24, 0x0c, 0xc3,
+        ];
+        assert_eq!(inferred_args(&decode(&code)), 3);
+        // ... also with an instruction before the cleanup:
+        // push [esp+4]; call $+5; mov edx, [esp+10h]; add esp, 4; ret   (argument 2: one word still pushed)
+        let code = [
+            0xff, 0x74, 0x24, 0x04, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x8b, 0x54, 0x24, 0x10, 0x83,
+            0xc4, 0x04, 0xc3,
+        ];
+        assert_eq!(inferred_args(&decode(&code)), 3);
+        // Negative: with no cleanup, esp after a call is unknown (the callee may have popped): an esp-relative read
+        // there isn't placed. push [esp+4]; call $+5; mov eax, [esp+0Ch]; ret
+        let code = [
+            0xff, 0x74, 0x24, 0x04, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x8b, 0x44, 0x24, 0x0c, 0xc3,
+        ];
+        assert_eq!(inferred_args(&decode(&code)), 1);
+    }
+
+    #[test]
+    fn stack_arguments_after_an_early_return_are_placed_from_the_branch() {
+        // push ebx; mov eax, [esp+8]; test eax, eax; jz L; pop ebx; ret; L: mov eax, [esp+0Ch]; pop ebx; ret
+        // (argument 0, then argument 1 on the path after the early return, esp as at the jz)
+        let code = [
+            0x53, 0x8b, 0x44, 0x24, 0x08, 0x85, 0xc0, 0x74, 0x02, 0x5b, 0xc3, 0x8b, 0x44, 0x24,
+            0x0c, 0x5b, 0xc3,
+        ];
+        assert_eq!(inferred_args(&decode(&code)), 2);
+        // Negative: code after a return that no branch reaches isn't placed.
+        // mov eax, [esp+4]; ret; mov eax, [esp+0Ch]; ret
+        let code = [0x8b, 0x44, 0x24, 0x04, 0xc3, 0x8b, 0x44, 0x24, 0x0c, 0xc3];
         assert_eq!(inferred_args(&decode(&code)), 1);
     }
 

@@ -1,10 +1,40 @@
-# Status — where we left off (2026-11-14)
+# Status — where we left off (2026-11-15)
 
 **M1 (spikes) is done**, M2 (corpus) is done, M3's matching depth is done apart from the SQLite store (deferred), and **M4
 (repair loop) is done**, recording harness included. 0 wrong matches on every corpus variant, 0 wrong relocations in
-the hook loop.
+the hook loop (x64 and x86).
 
-Latest work (2026-11-14, latest): **the recorder on x86** (design §7.3), so x86 test cases can be recorded.
+Latest work (2026-11-15): **the hook loop on x86** (`corpus/build-hooks.ps1 -Arch x86 -Run -Replay`), run for the
+first time; it found five problems, all fixed.
+- **Linker maps** (`pbeta-corpus`, answer key only): x86 maps have 8-digit addresses (none were read) and decorated
+  C names (`_f`, `_f@8`, `@f@12`), now undecorated to the PDB's names. Tests, with a negative: x64 names are never
+  undecorated.
+- **Detours on a low image:** ASLR loaded the 32-bit app at 0x50000, below 0x80000, the lowest address Detours'
+  x86 code searches for trampolines. Its first allocation lands at 0x70000, below that floor, and is rejected:
+  `DetourAttach` fails with error 8 (`ERROR_NOT_ENOUGH_MEMORY`), and only the first hook. The rejected region stays
+  allocated, so a retry skips it (found with Detours' trace build). The hook DLL and the hook host retry an attach
+  that fails so, up to 8 times (at most seven such regions from 0x10000).
+- **`pbeta replay --old-analysis`** now replays only cases recorded in that build (repair already did): the loop
+  hands it v1's and v2's recordings, and at x86 /Od v1's `apply_discount` sits at v2's `price_lookup` RVA, so a
+  correct hook **failed** replay on another function's cases. The loop passes the analysis of the hook's own build
+  (`from_build`). Engine test with negatives (`cases_at`).
+- **x86 inferred arguments** (analysis; features version `native-4-x86.2`, x64's stays `native-4`): two false
+  `inferred-args` failures (`order_add`, same signature in v2 and v3) at /Od and /O2. A prologue `push ecx` (MSVC's
+  room for a local) was taken for a `this`; stack arguments were counted only up to the first call or return,
+  so a guard reading the last parameter first changed the count. Now stack reads after calls count (`esp` kept
+  through a `__cdecl` call's `add esp` cleanup, else only `ebp`-relative), and code after an early return is placed
+  from the branch that reaches it. Every hooked function's count is its parameter count now, `log_event`'s real
+  2 → 3 kept; across 330 functions with PDB signatures only `_allshl` (a CRT helper taking registers, as before)
+  reads more than it declares. Tests with negatives for each rule.
+- **Shim check:** the stub declares `Order`, so a proposed shim compiles on its own.
+- **Results (x86):** 0 wrong relocations; every applied hook's trace identical; 20 of 22 resolved hooks have cases
+  replay, all matching (`ship_order` v1-v2 inconclusive, as on x64); negative controls fail (answer key, trace diff,
+  replay); redaction holds. Resolved: as x64, except /O2 `apply_discount` (its only candidate unconfirmed), so
+  x86-o2 is 6 and 5. Baselines in `expected.toml` as `x86-o2`/`x86-od`.
+- x64 after these changes: hook loop passed, unchanged (22 of 24 resolved hooks replay, all matching). Hook host
+  `test.ps1` passes for x64 and x86. Fixture scorecards not rerun: they're x64, and the analysis change is x86's only.
+
+Before that (2026-11-14, latest): **the recorder on x86** (design §7.3), so x86 test cases can be recorded.
 - `corpus/hooks/hookdll` builds for x86 with `record_thunk32.asm` (modelled on the host's: entry stubs push N, an
   ebp frame, 32 stack words copied, the original's pops measured and removed on return; `fxam` tells whether the
   original left st(0), which is saved as float, double and in full and loaded back after the DLL runs, so import
@@ -13,8 +43,7 @@ Latest work (2026-11-14, latest): **the recorder on x86** (design §7.3), so x86
   as the declared return type; 4-byte pointer words for pointees and import memory; 12 stack words per import
   call. The DLL refuses a spec of the other ABI. Recorder version `permanent-beta-hookdll 0.3`.
 - `corpus/build-hooks.ps1 -Arch x86` (vcvars32, Detours `lib.X86`, `target/hooks-x86`); `Import-VsDevEnvironment
-  -Arch` in `corpus/lib/msvc.ps1`. **Not run** (corpus rule): the x86 hook loop is unverified, and `expected.toml`
-  was measured on x64.
+  -Arch` in `corpus/lib/msvc.ps1`. (Run since: above.)
 - Checked by hand, outside the corpus: the hook host's test app (`harness/host/test/hosttest.cpp`, /MD) built
   x86 /O2 and /Od, recorded with a `pbeta harness-spec` spec under the DLL (output identical to a plain run), every
   hook's cases replayed on the same binary: `add3`, `store`, `fib` pass; `sum12`, `mix`, `scalef`, `area`

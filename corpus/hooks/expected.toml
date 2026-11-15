@@ -41,3 +41,31 @@ name = "v2-v3"
 flags = "od"
 min_resolved = 5
 held = ["log_event", "apply_discount", "checksum"]
+
+# x86 builds (build-hooks.ps1 -Arch x86), first measured 2026-11-15. As x64, except at /O2 apply_discount: its
+# only candidate is unconfirmed (a caller's call-position suggestion with different code), so it stays in review
+# and v2-v3 repairs it from v1 (the same review).
+
+[[step]]
+name = "v1-v2"
+flags = "x86-o2"
+min_resolved = 6
+held = ["log_event", "apply_discount"]
+
+[[step]]
+name = "v2-v3"
+flags = "x86-o2"
+min_resolved = 5
+held = ["log_event", "apply_discount", "checksum"]
+
+[[step]]
+name = "v1-v2"
+flags = "x86-od"
+min_resolved = 6
+held = ["log_event", "apply_discount"]
+
+[[step]]
+name = "v2-v3"
+flags = "x86-od"
+min_resolved = 5
+held = ["log_event", "apply_discount", "checksum"]

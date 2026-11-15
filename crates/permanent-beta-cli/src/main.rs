@@ -360,7 +360,9 @@ enum Command {
         #[arg(long)]
         new_analysis: Option<PathBuf>,
         /// Analysis of the recorded build with `--pdb`: addresses into its image held in recorded memory are mapped
-        /// to the new image (data symbols by name, functions through the accepted matches).
+        /// to the new image (data symbols by name, functions through the accepted matches), and only cases
+        /// recorded in that build are replayed (in another build, --old-rva is usually another function). Without
+        /// it, cases at --old-rva in every recording given.
         #[arg(long)]
         old_analysis: Option<PathBuf>,
         /// Also replay the cases on every other function of --new-analysis, as a control for replay itself: they
@@ -745,6 +747,7 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
         }
     };
     let mut runner = recorded_runner(a.cases, a.binary, &new)?;
+    let mut old_build = None;
     if let Some(p) = a.old_analysis {
         anyhow::ensure!(
             a.new_analysis.is_some(),
@@ -752,11 +755,12 @@ fn cmd_replay(a: ReplayArgs) -> Result<u8> {
         );
         let old = export::load(p)?;
         runner = runner.with_addresses(&old, &new, &accepted_pairs(&old, &new)?);
+        old_build = Some(old.build.id);
     }
-    let j = runner.judge(None, a.old_rva, a.new_rva);
+    let j = runner.judge(old_build.as_ref(), a.old_rva, a.new_rva);
     let others = a
         .others
-        .then(|| runner.judge_others(None, a.old_rva, a.new_rva, &new));
+        .then(|| runner.judge_others(old_build.as_ref(), a.old_rva, a.new_rva, &new));
     if a.json {
         let mut v = serde_json::to_value(&j)?;
         if let Some(o) = &others {
